@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- `configfile.read` reads TOML files (`.toml`, read-only), with `tomllib` (Python >= 3.11) or `tomli`.
 - Labels:
   - `labels.lut`: RGBA lookup table (`uint8`, shape `(max index + 1, 4)`), e.g. `rgba = labels.lut[labelmap]`.
   - `Labels.from_volume(labelmap, names=None)`: labels from the values of a label map, with automatic colors.

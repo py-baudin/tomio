@@ -1,5 +1,5 @@
 # coding=utf-8
-""" config file i/o (JSON, YAML) """
+""" config file i/o (JSON, YAML; TOML: read only) """
 import re
 import json
 import math
@@ -10,11 +10,11 @@ from pathlib import Path
 import numpy as np
 
 
-KINDS = {"json": "json", "yaml": "yaml", "yml": "yaml"}
+KINDS = {"json": "json", "yaml": "yaml", "yml": "yaml", "toml": "toml"}
 
 
 def get_kind(path):
-    """config file type ("json" or "yaml") from path suffix"""
+    """config file type ("json", "yaml" or "toml") from path suffix"""
     ext = path.suffix[1:].lower()
     if ext not in KINDS:
         raise ValueError(f"Unknown config file type: {path}")
@@ -22,11 +22,16 @@ def get_kind(path):
 
 
 def read(path):
-    """read config file (.json, .yaml or .yml; no suffix: .json)"""
+    """read config file (.json, .yaml, .yml or .toml; no suffix: .json)"""
     path = Path(path)
     if not path.suffix:
         path = path.with_suffix(".json")
     kind = get_kind(path)
+
+    if kind == "toml":
+        tomllib = import_tomllib()
+        with open(path, "rb") as fp:
+            return untame(tomllib.load(fp))
 
     with open(path, "r", encoding="utf-8") as fp:
         if kind == "json":
@@ -36,16 +41,30 @@ def read(path):
             return untame(yaml.safe_load(fp))
 
 
+def import_tomllib():
+    """TOML parser: tomllib (Python >= 3.11), or tomli (same API)"""
+    try:
+        import tomllib
+    except ImportError:
+        try:
+            import tomli as tomllib
+        except ImportError:
+            raise ImportError("Reading TOML files requires Python >= 3.11, or `tomli` (pip install tomli)") from None
+    return tomllib
+
+
 def write(path, config, kind="json"):
     """write config file
 
-    The file type is set by the path suffix (.json, .yaml or .yml).
+    The file type is set by the path suffix (.json, .yaml or .yml; .toml is read-only).
     If the path has no suffix, `kind` is used and added as suffix.
     """
     path = Path(path)
     if not path.suffix:
         path = path.with_suffix(f".{kind}")
     kind = get_kind(path)
+    if kind == "toml":
+        raise ValueError(f"Writing TOML files is not supported (read-only): {path}")
     config = tame(config)
 
     with open(path, "w", encoding="utf-8") as fp:

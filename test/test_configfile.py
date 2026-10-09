@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 import numpy as np
 import pytest
@@ -146,6 +147,51 @@ def test_config_unknown_type(tmp_path):
     with pytest.raises(ValueError):
         configfile.read(tmp_path / "c.txt")
     assert not (tmp_path / "c").exists()
+
+
+TOML_CONFIG = """\
+name = "test"
+flag = true
+values = [1, 2.5, 3]
+impedance = "3 + 4i"
+
+[nested]
+path = "a/b"
+matrix = [[1, 0], [0, 1]]
+"""
+
+
+def test_toml_read(tmp_path):
+    pytest.importorskip("tomllib" if sys.version_info >= (3, 11) else "tomli")
+    for name in ["c.toml", "c.TOML"]:
+        path = tmp_path / name
+        path.write_text(TOML_CONFIG, encoding="utf-8")
+        cfg = configfile.read(path)
+        assert cfg == {
+            "name": "test",
+            "flag": True,
+            "values": [1, 2.5, 3],
+            "impedance": 3 + 4j,  # complex numbers, as in JSON/YAML files
+            "nested": {"path": "a/b", "matrix": [[1, 0], [0, 1]]},
+        }
+        path.unlink()
+
+
+def test_toml_write(tmp_path):
+    # read-only: error, no file
+    with pytest.raises(ValueError, match="read-only"):
+        configfile.write(tmp_path / "c.toml", {"a": 1})
+    with pytest.raises(ValueError, match="read-only"):
+        configfile.write(tmp_path / "c", {"a": 1}, kind="toml")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_toml_missing_parser(monkeypatch):
+    # neither tomllib nor tomli: clear error
+    monkeypatch.setitem(sys.modules, "tomllib", None)
+    monkeypatch.setitem(sys.modules, "tomli", None)
+    with pytest.raises(ImportError, match="tomli"):
+        configfile.import_tomllib()
 
 
 def test_yaml_unsafe(tmp_path):

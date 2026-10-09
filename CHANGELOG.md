@@ -18,7 +18,10 @@
 - `Labels(other)` makes an independent copy (modifying it changed `other`), and keeps `allow_duplicates`.
 - `Labels`: an invalid update (bad or duplicate description...) no longer deletes the existing label.
 - Label visibility (VIS, MSH) is read from label files (was reset to 1).
+- Label files: errors give the file name and line number (`labelfile.LabelFileError`, a subclass of `ValueError` and `RuntimeError`); duplicate indices are rejected; alpha accepts any decimal format (`.5`, `1.`, `1e-1`).
+- `Labels.palette` raises an error for indices > 255 (they were silently dropped).
 
 ### Changed (breaking)
 - `Labels.pop(index)` returns the label description (was: the full info dict), consistent with `labels[index]`.
+- `Labels` validates its input: indices must be non-negative integers (numpy integers accepted), RGB values integers in 0..255, alpha in 0..1, a description (LABEL) is required, and unknown fields are rejected.
 - Label files are read and written as UTF-8 (was: the system default encoding). Files with non-ASCII labels saved by earlier versions on Windows must be re-encoded.

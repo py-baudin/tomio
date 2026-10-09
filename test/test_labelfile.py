@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """ test io.Labels """
 
-from iomed import labelfile
+import numpy as np
 import pytest
+
+from iomed import labelfile
 
 Labels = labelfile.Labels
 
@@ -122,6 +124,78 @@ def test_labels_visibility_roundtrip(tmp_path):
     labelfile.write(filename, labels)
     assert labelfile.read(filename).data[1]["VIS"] == 0
     assert labelfile.read(filename).data[1]["MSH"] == 0
+
+
+LINE = '1   250  255  228        1  1  1    "a"\n'
+
+
+@pytest.mark.parametrize("alpha", ["0", "1", "0.5", ".5", "1.", "1e-1"])
+def test_labels_load_alpha(tmp_path, alpha):
+    filename = tmp_path / "labels.txt"
+    filename.write_text(f'1  250  255  228  {alpha}  1  1  "a"\n')
+    assert labelfile.read(filename).colors[1][3] == float(alpha)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '1   250  255  228        1  |  1    "a"\n',  # invalid visibility
+        LINE + LINE.replace('"a"', '"b"'),  # duplicate index
+        '1   256  255  228        1  1  1    "a"\n',  # invalid color
+    ],
+)
+def test_labels_load_errors(tmp_path, content):
+    filename = tmp_path / "labels.txt"
+    filename.write_text("# header\n" + content)
+    with pytest.raises(labelfile.LabelFileError, match="line 2"):
+        labelfile.read(filename)
+
+
+def test_labels_load_error_types():
+    # backward compatible: was RuntimeError
+    assert issubclass(labelfile.LabelFileError, RuntimeError)
+    assert issubclass(labelfile.LabelFileError, ValueError)
+
+
+@pytest.mark.parametrize("index", ["1", -1, 1.5, True, None])
+def test_labels_invalid_index(index):
+    with pytest.raises(ValueError):
+        Labels({}).set(index, "a")
+
+
+def test_labels_numpy_values():
+    labels = Labels({np.int64(3): {"LABEL": "a", "RGBA": np.array([1, 2, 3, 1.0])}})
+    assert labels.indices == [3]
+    assert type(labels.indices[0]) is int
+    assert labels.colors[3] == (1, 2, 3, 1.0)
+    assert all(type(v) is int for v in labels.colors[3][:3])
+
+
+@pytest.mark.parametrize(
+    "info",
+    [
+        {"LABEL": "a", "RGBA": (256, 0, 0, 1)},
+        {"LABEL": "a", "RGBA": (-1, 0, 0, 1)},
+        {"LABEL": "a", "RGBA": (0.5, 0, 0, 1)},
+        {"LABEL": "a", "RGBA": (True, 0, 0, 1)},
+        {"LABEL": "a", "RGBA": (0, 0, 0, 1.5)},
+        {"LABEL": "a", "RGBA": (0, 0, 0, -0.1)},
+        {"LABEL": "a", "RGBA": (0, 0, 0)},
+        {"LABEL": "a", "RGBA": "red"},
+        {"LABEL": "a", "VIS": 2},
+        {"LABEL": "a", "rgba": (0, 0, 0, 1)},  # unknown field
+        {"RGBA": (0, 0, 0, 1)},  # missing description
+    ],
+)
+def test_labels_invalid_info(info):
+    with pytest.raises(ValueError):
+        Labels({1: info})
+
+
+def test_labels_palette():
+    assert len(Labels({1: "a", 255: "b"}).palette) == 256 * 3
+    with pytest.raises(ValueError):
+        Labels({256: "a"}).palette
 
 
 def test_labels_pop():

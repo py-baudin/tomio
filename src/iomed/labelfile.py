@@ -2,8 +2,13 @@
 """ i/o for ITKSnap-like labels """
 
 import re
+import numbers
 import itertools
 from collections import abc
+
+
+class LabelFileError(ValueError, RuntimeError):
+    """invalid label file (also a RuntimeError, for backward compatibility)"""
 
 COLOR_MAP = [
     [228, 26, 28],
@@ -77,9 +82,9 @@ class Labels(abc.Mapping):
             r"\s+(?P<R>\d+)"
             r"\s+(?P<G>\d+)"
             r"\s+(?P<B>\d+)"
-            r"\s+(?P<A>\d|(\d\.\d+))"
-            r"\s+(?P<vis>[0|1])"
-            r"\s+(?P<meshvis>[0|1])"
+            r"\s+(?P<A>(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?)"
+            r"\s+(?P<vis>[01])"
+            r"\s+(?P<meshvis>[01])"
             r"\s+\"" + label_re_syntax + r"\"\s*$"
         )
     )
@@ -87,39 +92,45 @@ class Labels(abc.Mapping):
     @classmethod
     def load(cls, filename, **kwargs):
         """load label file"""
-        labels = {}
+        labels = cls({}, **kwargs)
         with open(filename, "r", encoding="utf-8") as fp:
             lines = fp.read().splitlines()
 
-            for line in lines:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    # empty line or comment
-                    continue
+        for num, line in enumerate(lines, start=1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                # empty line or comment
+                continue
 
-                # parse line
-                match = cls.re_parse_line.match(line)
-                if not match:
-                    raise RuntimeError(f"Could not parse line: {line}")
+            # parse line
+            match = cls.re_parse_line.match(line)
+            if not match:
+                raise LabelFileError(f"{filename}, line {num}: could not parse: {line}")
 
-                # index is the first number
-                index = int(match.group("index"))
+            # index is the first number
+            index = int(match.group("index"))
+            if index in labels:
+                raise LabelFileError(f"{filename}, line {num}: duplicate index: {index}")
 
-                # color, including alpha
-                rgba = (
-                    int(match.group("R")),
-                    int(match.group("G")),
-                    int(match.group("B")),
-                    float(match.group("A")),
-                )
-                labels[index] = {
-                    "LABEL": match.group("name"),
-                    "RGBA": rgba,
-                    "VIS": int(match.group("vis")),
-                    "MSH": int(match.group("meshvis")),
-                }
+            # color, including alpha
+            rgba = (
+                int(match.group("R")),
+                int(match.group("G")),
+                int(match.group("B")),
+                float(match.group("A")),
+            )
+            info = {
+                "LABEL": match.group("name"),
+                "RGBA": rgba,
+                "VIS": int(match.group("vis")),
+                "MSH": int(match.group("meshvis")),
+            }
+            try:
+                labels.set(index, info)
+            except ValueError as exc:
+                raise LabelFileError(f"{filename}, line {num}: {exc}") from None
 
-        return cls(labels, **kwargs)
+        return labels
 
     @classmethod
     def save(cls, filename, labels, **kwargs):
@@ -180,6 +191,8 @@ class Labels(abc.Mapping):
     @property
     def palette(self):
         """return RBG palette (eg. for using with PIL)"""
+        if self.data and max(self.data) > 255:
+            raise ValueError("Cannot make a 256-color palette with label indices > 255")
         palette = []
         for i in range(256):
             if i in self:
@@ -224,15 +237,29 @@ class Labels(abc.Mapping):
             return default
         
     def set(self, index, value):
-        """ add or update label """
+        """ add or update label
+
+        index: non-negative integer
+        value: description (str), or dict with keys:
+            LABEL (description, required), RGBA, VIS, MSH
+        """
+        if not is_integer(index) or index < 0:
+            raise ValueError("Invalid label index: %r" % (index,))
+        index = int(index)
 
         if isinstance(value, str):
             # label description only: keep existing info (copy, validated below)
             info = dict(self.data.get(index, {}), LABEL=value)
-        elif isinstance(value, dict):
+        elif isinstance(value, abc.Mapping):
             info = value
         else:
             raise ValueError("Invalid label info: %s" % value)
+
+        unknown = info.keys() - {"LABEL", "RGBA", "VIS", "MSH"}
+        if unknown:
+            raise ValueError("Unknown label fields: %s" % sorted(unknown))
+        elif "LABEL" not in info:
+            raise ValueError("Missing label description (LABEL): %s" % info)
 
         # full description
         descr = info["LABEL"]
@@ -250,20 +277,15 @@ class Labels(abc.Mapping):
         if rgba is None:
             rgba = (0, 0, 0, 0.0) if index == 0 else self.newcolor()
 
-        if (
-            len(rgba) != 4
-            or not all(isinstance(v, int) for v in rgba[:3])
-            or not float(rgba[-1]) <= 1
-        ):
-            raise ValueError("Invalid RGBA format: %s" % str(rgba))
+        rgba = check_rgba(rgba)
 
-        if not (vis in [0, 1] and meshvis in [0, 1]):
+        if not all(isinstance(v, numbers.Integral) and v in (0, 1) for v in (vis, meshvis)):
             raise ValueError("Invalid visibility values: %s" % str(info))
         self.data[index] = {
             "LABEL": descr,
-            "RGBA": tuple(rgba),
-            "VIS": vis,
-            "MSH": meshvis,
+            "RGBA": rgba,
+            "VIS": int(vis),
+            "MSH": int(meshvis),
         }
         
     def pop(self, index, *default):
@@ -281,3 +303,30 @@ class Labels(abc.Mapping):
     def newcolor(self, alpha=1.0):
         """return a different color every time"""
         return next(self.color_gen) + [alpha]
+
+
+def is_integer(value):
+    """integer, including numpy integers, excluding bool"""
+    return isinstance(value, numbers.Integral) and not isinstance(value, bool)
+
+
+def is_real(value):
+    """real number, including numpy floats, excluding bool"""
+    return isinstance(value, numbers.Real) and not isinstance(value, bool)
+
+
+def check_rgba(rgba):
+    """validate RGBA color: RGB integers in 0..255, alpha in 0..1"""
+    try:
+        *rgb, alpha = rgba
+    except (TypeError, ValueError):
+        rgb, alpha = [], None
+    valid = (
+        len(rgb) == 3
+        and all(is_real(v) and float(v).is_integer() and 0 <= v <= 255 for v in rgb)
+        and is_real(alpha)
+        and 0 <= alpha <= 1
+    )
+    if not valid:
+        raise ValueError("Invalid RGBA color: %s" % (rgba,))
+    return (*(int(v) for v in rgb), float(alpha))

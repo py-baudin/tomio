@@ -158,6 +158,59 @@ def test_volume_read_direction(tmp_path, ext):
         assert vol[idx] == im.GetPixel(idx)
 
 
+GEOMETRY = dict(spacing=[1, 2, 3], origin=[4, 5, 6], transform=DIRECTIONS["oblique"].T)
+
+
+@pytest.mark.parametrize("ext", [".mha", ".nii.gz"])
+@pytest.mark.parametrize("dtype", [np.complex64, np.complex128])
+@pytest.mark.parametrize("shape", [(3, 4, 5), (3, 4, 5, 6)])
+def test_volume_io_complex(tmp_path, ext, dtype, shape):
+    import SimpleITK as sitk
+
+    arr = (np.random.rand(*shape) + 1j * np.random.rand(*shape)).astype(dtype)
+    vol = Volume(arr, **GEOMETRY)
+    filename = str(tmp_path / f"vol{ext}")
+    volume.write(filename, vol)
+
+    # stored as a 2-component vector image
+    im = sitk.ReadImage(filename)
+    assert im.GetNumberOfComponentsPerPixel() == 2
+    assert im.GetSize() == shape
+    idx = (1, 2, 3) + (0,) * (len(shape) - 3)
+    assert np.allclose(im.GetPixel(idx), (arr[idx].real, arr[idx].imag))
+
+    vol2 = volume.read(filename, as_complex=True)
+    assert vol2.dtype == dtype
+    assert np.array_equal(vol2, arr)
+    assert np.allclose(vol2.affine, vol.affine, atol=1e-4)
+
+    # without as_complex: components in the last axis
+    vol3 = volume.read(filename)
+    assert vol3.shape == shape + (2,)
+    assert np.array_equal(vol3[..., 1], arr.imag)
+
+
+@pytest.mark.parametrize("ext", [".mha", ".nii.gz"])
+def test_volume_io_4d(tmp_path, ext):
+    import SimpleITK as sitk
+
+    arr = np.random.rand(3, 4, 5, 6).astype(np.float32)
+    vol = Volume(arr, **GEOMETRY)
+    filename = str(tmp_path / f"vol{ext}")
+    volume.write(filename, vol)
+
+    im = sitk.ReadImage(filename)
+    assert im.GetSize() == (3, 4, 5, 6)
+    assert im.GetSpacing()[3] == 1
+    for idx in INDICES:
+        assert np.allclose(im.TransformIndexToPhysicalPoint(idx + (0,))[:3], vol.get_coords(idx), atol=1e-4)
+
+    vol2 = volume.read(filename)
+    assert np.array_equal(vol2, arr)
+    assert np.allclose(vol2.spacing, vol.spacing)
+    assert np.allclose(vol2.affine, vol.affine, atol=1e-4)
+
+
 def test_volume_io_metadata(tmp_path):
     vol = Volume(np.zeros((3, 4, 5)), metadata={"PatientName": "foo", "Count": 3})
     volume.write(tmp_path / "vol.mha", vol)

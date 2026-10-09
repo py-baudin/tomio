@@ -18,24 +18,28 @@ def write(filename, vol, *, nan_as=None, geometry=None, use_compression=True):
         # copy: do not modify the input
         vol = Volume(np.where(np.isnan(vol), nan_as, vol), **vol.header)
 
-    if np.iscomplexobj(vol):
-        vol = np.stack([vol.real, vol.imag])
+    # complex: vector image with 2 components (real, imaginary)
+    is_complex = np.iscomplexobj(vol)
+    data = np.stack([vol.real, vol.imag], axis=-1) if is_complex else vol
 
     filename = pathlib.Path(filename)
     if not filename.suffix:
         filename = filename.with_suffix(DEFAULT_EXT)
 
     wrtopts = dict(spacing=vol.spacing, origin=vol.origin, transform=vol.transform, metadata=vol.metadata, use_compression=use_compression)
-    iovolume.write_volume(filename, vol, **wrtopts)
+    iovolume.write_volume(filename, data, is_vector=is_complex, **wrtopts)
 
 
 def read(filename, *, nan_as=None, as_complex=False):
-    """ read Volume """
+    """ read Volume
+
+    as_complex: combine a last axis of size 2 (real, imaginary) into complex values
+    """
     array, header = iovolume.read_image(filename)
     if nan_as is not None:
         array[array==nan_as] = np.nan
-    if as_complex and array.ndim > 3 and array.shape[0] == 2:
-        array = array[0] + 1j * array[1]
+    if as_complex and array.ndim > 3 and array.shape[-1] == 2:
+        array = array[..., 0] + 1j * array[..., 1]
     return Volume(array, **header)
 
 

@@ -22,6 +22,7 @@
 - `Labels(other)` makes an independent copy (modifying it changed `other`), and keeps `allow_duplicates`.
 - `Labels`: an invalid update (bad or duplicate description...) no longer deletes the existing label.
 - Label visibility (VIS, MSH) is read from label files (was reset to 1).
+- `config.read` accepts `.yaml` files (and upper-case extensions).
 - `config.tame` and config files: booleans stay booleans (`True` became `1`, `np.True_` became `"True"`), complex numbers are saved as `"3 + 4i"` (writing them crashed), 0-d arrays become scalars.
 - Label files: errors give the file name and line number (`labelfile.LabelFileError`, a subclass of `ValueError` and `RuntimeError`); duplicate indices are rejected; alpha accepts any decimal format (`.5`, `1.`, `1e-1`).
 - `Labels.palette` raises an error for indices > 255 (they were silently dropped).
@@ -32,5 +33,7 @@
 - `Labels(...)` and `Labels.save(...)` raise `TypeError` (was `ValueError`) when the input is not a mapping. `Labels.re_parse_label` is removed.
 - YAML config files are loaded safely (`yaml.safe_load`): Python-specific tags (`!!python/...`) are rejected.
 - Config files: strings of the form `"3 + 4i"` are read as complex numbers.
+- `config.write` keeps the given file extension (`c.yaml` was written as `c.yml`); without extension, `kind` is used as extension (`kind="yaml"` gives `.yaml`, was `.yml`).
+- Config files are read and written as UTF-8.
 - Importing iomed no longer registers the `!ndarray` tag in PyYAML's default dumper/loader.
 - Label files are read and written as UTF-8 (was: the system default encoding). Files with non-ASCII labels saved by earlier versions on Windows must be re-encoded.

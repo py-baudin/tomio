@@ -10,42 +10,49 @@ from pathlib import Path
 import numpy as np
 
 
-def read(path):
-    """read config file"""
-    path = Path(path)
-    if not path.suffix or path.suffix == ".json":
-        # json
-        path = path.with_suffix(".json")
-        with open(path, "r") as fp:
-            return untame(json.load(fp))
+KINDS = {"json": "json", "yaml": "yaml", "yml": "yaml"}
 
-    elif path.suffix == ".yml":
-        # yaml (safe: no Python-specific tags)
-        with open(path, "r") as fp:
-            return untame(yaml.safe_load(fp))
-    else:
+
+def get_kind(path):
+    """config file type ("json" or "yaml") from path suffix"""
+    ext = path.suffix[1:].lower()
+    if ext not in KINDS:
         raise ValueError(f"Unknown config file type: {path}")
+    return KINDS[ext]
+
+
+def read(path):
+    """read config file (.json, .yaml or .yml; no suffix: .json)"""
+    path = Path(path)
+    if not path.suffix:
+        path = path.with_suffix(".json")
+    kind = get_kind(path)
+
+    with open(path, "r", encoding="utf-8") as fp:
+        if kind == "json":
+            return untame(json.load(fp))
+        else:
+            # safe: no Python-specific tags
+            return untame(yaml.safe_load(fp))
 
 
 def write(path, config, kind="json"):
-    """write config file"""
+    """write config file
+
+    The file type is set by the path suffix (.json, .yaml or .yml).
+    If the path has no suffix, `kind` is used and added as suffix.
+    """
     path = Path(path)
+    if not path.suffix:
+        path = path.with_suffix(f".{kind}")
+    kind = get_kind(path)
     config = tame(config)
-    if path.suffix:
-        kind = path.suffix[1:]
 
-    if kind == "json":
-        path = path.with_suffix(".json")
-        with open(path, "w") as fp:
+    with open(path, "w", encoding="utf-8") as fp:
+        if kind == "json":
             json.dump(config, fp)
-
-    elif kind in ["yaml", "yml"]:
-        path = path.with_suffix(".yml")
-        with open(path, "w") as fp:
+        else:
             yaml.safe_dump(config, fp, default_flow_style=False)
-
-    else:
-        raise ValueError(f"Unknown config file type: {kind}")
 
 
 def tame(element):

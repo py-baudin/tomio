@@ -103,6 +103,41 @@ def test_complex_parse_formats():
     assert config.parse_complex(" -1.5e2 - .5i ") == complex(-150, -0.5)
 
 
+@pytest.mark.parametrize(
+    "name, kind, expected",
+    [
+        ("c.json", "json", "c.json"),
+        ("c.yml", "json", "c.yml"),  # suffix wins over kind
+        ("c.yaml", "json", "c.yaml"),
+        ("c.YAML", "json", "c.YAML"),
+        ("c", "json", "c.json"),
+        ("c", "yaml", "c.yaml"),
+        ("c", "yml", "c.yml"),
+    ],
+)
+def test_config_extensions(tmp_path, name, kind, expected):
+    config.write(tmp_path / name, {"a": 1}, kind=kind)
+    assert [p.name for p in tmp_path.iterdir()] == [expected]
+    assert config.read(tmp_path / expected) == {"a": 1}
+
+
+def test_config_read_no_suffix(tmp_path):
+    # no suffix: json
+    config.write(tmp_path / "c.json", {"a": 1})
+    assert config.read(tmp_path / "c") == {"a": 1}
+
+
+def test_config_unknown_type(tmp_path):
+    with pytest.raises(ValueError):
+        config.write(tmp_path / "c.txt", {"a": 1})
+    with pytest.raises(ValueError):
+        config.write(tmp_path / "c", {"a": 1}, kind="txt")
+    (tmp_path / "c.txt").write_text("a: 1")
+    with pytest.raises(ValueError):
+        config.read(tmp_path / "c.txt")
+    assert not (tmp_path / "c").exists()
+
+
 def test_yaml_unsafe(tmp_path):
     path = tmp_path / "c.yml"
     path.write_text("a: !!python/object/apply:os.system ['echo unsafe']\n")

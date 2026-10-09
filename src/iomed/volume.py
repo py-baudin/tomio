@@ -25,7 +25,7 @@ def write(filename, vol, *, nan_as=None, geometry=None, use_compression=True):
     if not filename.suffix:
         filename = filename.with_suffix(DEFAULT_EXT)
 
-    wrtopts = dict(spacing=vol.spacing, origin=vol.origin, transform=vol.transform, use_compression=use_compression)
+    wrtopts = dict(spacing=vol.spacing, origin=vol.origin, transform=vol.transform, metadata=vol.metadata, use_compression=use_compression)
     iovolume.write_volume(filename, vol, **wrtopts)
 
 

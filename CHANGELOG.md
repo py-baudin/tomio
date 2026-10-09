@@ -16,6 +16,7 @@
 - `interp.interpolate_to` no longer crashes (`KeyError: 'shape'`).
 - Interpolation no longer replaces NaNs with 0 in the input arrays.
 - `volume.write(nan_as=...)` no longer replaces NaNs in the input array.
+- `volume.write` writes `vol.metadata` to the file (it was ignored). Which keys are kept depends on the format: MetaImage (`.mha`) keeps all keys, NIfTI only its own header fields.
 - Label descriptions can contain any character except `"` and line breaks (which are now rejected), and are read back correctly.
 - `Labels.pop(index, default)` accepts a default value, like `dict.pop`.
 - `Labels`: `indices`, `keys()` and `values()` are sorted by index, like iteration and `descriptions` (they could be out of sync after an update).

@@ -158,6 +158,29 @@ def test_volume_read_direction(tmp_path, ext):
         assert vol[idx] == im.GetPixel(idx)
 
 
+def test_volume_io_metadata(tmp_path):
+    vol = Volume(np.zeros((3, 4, 5)), metadata={"PatientName": "foo", "Count": 3})
+    volume.write(tmp_path / "vol.mha", vol)
+    vol2 = volume.read(tmp_path / "vol.mha")
+    # MetaImage keeps arbitrary keys (values are strings)
+    assert vol2.metadata["PatientName"] == "foo"
+    assert vol2.metadata["Count"] == "3"
+
+
+def test_volume_io_nifti_rewrite(tmp_path):
+    """volume read from NIfTI (with NIfTI-specific metadata) can be written again unchanged"""
+    arr = np.random.rand(3, 4, 5).astype(np.float32)
+    vol = Volume(arr, spacing=[1, 2, 3], origin=[4, 5, 6], transform=DIRECTIONS["oblique"].T)
+    volume.write(tmp_path / "vol1.nii.gz", vol)
+    vol1 = volume.read(tmp_path / "vol1.nii.gz")
+    assert vol1.metadata  # NIfTI header fields
+
+    volume.write(tmp_path / "vol2.nii.gz", vol1)
+    vol2 = volume.read(tmp_path / "vol2.nii.gz")
+    assert np.array_equal(vol2, arr)
+    assert np.allclose(vol2.affine, vol.affine, atol=1e-4)
+
+
 def test_volume_write_nan_as(monkeypatch, tmp_path):
     written = {}
     def write_volume(filename, array, **kwargs):

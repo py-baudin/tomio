@@ -15,7 +15,7 @@ def write_volume(filename, array, *, spacing=None, origin=None, transform=None, 
         im.SetDirection(np.asarray(transform).ravel(order='F'))
     if metadata is not None:
         for key, value in metadata.items():
-            im.SetMetaData(key, value)    
+            im.SetMetaData(str(key), str(value))
     sitk.WriteImage(im, filename, useCompression=use_compression)
 
 

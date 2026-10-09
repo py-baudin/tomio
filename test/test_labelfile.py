@@ -88,6 +88,42 @@ def test_labels_roundtrip(tmp_path, descr):
     assert labelfile.read(filename) == labels
 
 
+def test_labels_order():
+    labels = Labels({1: "a", 2: "b"})
+    labels[1] = "x"
+    assert labels.indices == [1, 2]
+    assert labels.descriptions == ["x", "b"]
+    assert list(labels.keys()) == [1, 2]
+    assert list(labels.values()) == ["x", "b"]
+    assert list(labels.items()) == [(1, "x"), (2, "b")]
+
+
+def test_labels_copy():
+    labels = Labels({1: "a"}, allow_duplicates=True)
+    copy = Labels(labels)
+    copy[1] = "new"
+    assert labels[1] == "a"
+    assert copy.allow_duplicates
+
+
+def test_labels_invalid_update_keeps_label():
+    labels = Labels({1: "a", 2: "b"})
+    color = labels.colors[1]
+    for descr in ['a"b', "b"]:  # invalid, duplicate
+        with pytest.raises(ValueError):
+            labels[1] = descr
+        assert labels[1] == "a"
+        assert labels.colors[1] == color
+
+
+def test_labels_visibility_roundtrip(tmp_path):
+    labels = Labels({1: {"LABEL": "a", "VIS": 0, "MSH": 0}})
+    filename = tmp_path / "labels.txt"
+    labelfile.write(filename, labels)
+    assert labelfile.read(filename).data[1]["VIS"] == 0
+    assert labelfile.read(filename).data[1]["MSH"] == 0
+
+
 def test_labels_pop():
     labels = Labels({1: "a", 2: "b"})
     assert labels.pop(99, None) is None

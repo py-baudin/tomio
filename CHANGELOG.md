@@ -14,6 +14,10 @@
 - `volume.write(nan_as=...)` no longer replaces NaNs in the input array.
 - Label descriptions can contain any character except `"` and line breaks (which are now rejected), and are read back correctly.
 - `Labels.pop(index, default)` accepts a default value, like `dict.pop`.
+- `Labels`: `indices`, `keys()` and `values()` are sorted by index, like iteration and `descriptions` (they could be out of sync after an update).
+- `Labels(other)` makes an independent copy (modifying it changed `other`), and keeps `allow_duplicates`.
+- `Labels`: an invalid update (bad or duplicate description...) no longer deletes the existing label.
+- Label visibility (VIS, MSH) is read from label files (was reset to 1).
 
 ### Changed (breaking)
 - `Labels.pop(index)` returns the label description (was: the full info dict), consistent with `labels[index]`.

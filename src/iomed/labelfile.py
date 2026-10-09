@@ -112,8 +112,12 @@ class Labels(abc.Mapping):
                     int(match.group("B")),
                     float(match.group("A")),
                 )
-                desc = match.group("name")
-                labels[index] = {"LABEL": desc, "RGBA": rgba}
+                labels[index] = {
+                    "LABEL": match.group("name"),
+                    "RGBA": rgba,
+                    "VIS": int(match.group("vis")),
+                    "MSH": int(match.group("meshvis")),
+                }
 
         return cls(labels, **kwargs)
 
@@ -140,14 +144,18 @@ class Labels(abc.Mapping):
                 )
                 f.write(line)
 
-    def __init__(self, labels, *, allow_duplicates=False):
-        """init label object"""
+    def __init__(self, labels, *, allow_duplicates=None):
+        """init label object
 
+        allow_duplicates: default False (or copied from `labels` if it is a Labels object)
+        """
+        if allow_duplicates is None:
+            allow_duplicates = getattr(labels, "allow_duplicates", False)
         self.allow_duplicates = allow_duplicates
         self.color_gen = itertools.cycle(COLOR_MAP)
 
         if isinstance(labels, Labels):
-            self.data = labels.data.copy()
+            self.data = {index: dict(info) for index, info in labels.data.items()}
             return
         elif not isinstance(labels, dict):
             raise ValueError("A dict is required")
@@ -158,7 +166,7 @@ class Labels(abc.Mapping):
 
     @property
     def indices(self):
-        return list(self.data)
+        return list(self)
     
     @property
     def descriptions(self):
@@ -184,16 +192,17 @@ class Labels(abc.Mapping):
         return str(self.data)
 
     def __len__(self):
-        return len(self.indices)
+        return len(self.data)
 
     def __iter__(self):
-        return iter(sorted(self.indices))
+        # all accessors (keys, values, items, indices...) use this order
+        return iter(sorted(self.data))
 
     def __eq__(self, other):
         return self.data == other.data
 
     def __contains__(self, index):
-        return index in self.indices
+        return index in self.data
 
     def __getitem__(self, index):
         """return label description for given index"""
@@ -207,12 +216,6 @@ class Labels(abc.Mapping):
     def __delitem__(self, index):
         del self.data[index]
 
-    def keys(self):
-        return self.data.keys()
-
-    def values(self):
-        return (item["LABEL"] for item in self.data.values())
-
     def get(self, index, default=None):
         """get label description"""
         try:
@@ -224,26 +227,28 @@ class Labels(abc.Mapping):
         """ add or update label """
 
         if isinstance(value, str):
-            # label description only
-            info = self.data.get(index, {})
-            info["LABEL"] = value
+            # label description only: keep existing info (copy, validated below)
+            info = dict(self.data.get(index, {}), LABEL=value)
         elif isinstance(value, dict):
             info = value
         else:
             raise ValueError("Invalid label info: %s" % value)
-        # remove existing
-        self.data.pop(index, None)
-        
+
         # full description
         descr = info["LABEL"]
-        rgba = info.get("RGBA", (0, 0, 0, 0.0) if index == 0 else self.newcolor())
         vis = info.get("VIS", 1)
         meshvis = info.get("MSH", 1)
 
         if not isinstance(descr, str) or any(c in descr for c in '"\n\r'):
             raise ValueError("Invalid label description: %r" % descr)
-        elif not self.allow_duplicates and descr in self.descriptions:
+        elif not self.allow_duplicates and any(
+            other == descr for i, other in self.items() if i != index
+        ):
             raise ValueError("Duplicate description: %s" % descr)
+
+        rgba = info.get("RGBA")
+        if rgba is None:
+            rgba = (0, 0, 0, 0.0) if index == 0 else self.newcolor()
 
         if (
             len(rgba) != 4

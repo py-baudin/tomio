@@ -11,3 +11,4 @@
 - Writing boolean volumes no longer uses the removed `np.bool` alias.
 - `interp.interpolate_to` no longer crashes (`KeyError: 'shape'`).
 - Interpolation no longer replaces NaNs with 0 in the input arrays.
+- `volume.write(nan_as=...)` no longer replaces NaNs in the input array.

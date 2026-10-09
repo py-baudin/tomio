@@ -15,7 +15,8 @@ def write(filename, vol, *, nan_as=None, geometry=None, use_compression=True):
     vol = Volume(vol, **(geometry or {}))
 
     if nan_as is not None:
-        vol[np.isnan(vol)] = nan_as
+        # copy: do not modify the input
+        vol = Volume(np.where(np.isnan(vol), nan_as, vol), **vol.header)
 
     if np.iscomplexobj(vol):
         vol = np.stack([vol.real, vol.imag])

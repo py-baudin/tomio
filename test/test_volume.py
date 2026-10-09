@@ -93,6 +93,24 @@ def test_volume_io(tmpdir):
     assert ((tmp / 'vol').with_suffix(volume.DEFAULT_EXT)).is_file()
 
 
+def test_volume_write_nan_as(monkeypatch, tmp_path):
+    written = {}
+    def write_volume(filename, array, **kwargs):
+        written.update(kwargs, array=np.array(array))
+    monkeypatch.setattr(volume.iovolume, 'write_volume', write_volume)
+
+    arr = np.array([[[np.nan, 1.0]]])
+    vol = Volume(arr, spacing=[1, 2, 3])
+    volume.write(tmp_path / 'vol.mha', vol, nan_as=-1)
+
+    # input unchanged
+    assert np.isnan(arr[0, 0, 0])
+    assert np.isnan(vol[0, 0, 0])
+    # NaNs replaced in written data, geometry kept
+    assert np.array_equal(written['array'], [[[-1.0, 1.0]]])
+    assert written['spacing'] == (1.0, 2.0, 3.0)
+
+
 
 
 

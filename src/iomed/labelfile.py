@@ -88,7 +88,7 @@ class Labels(abc.Mapping):
     def load(cls, filename, **kwargs):
         """load label file"""
         labels = {}
-        with open(filename, "r") as fp:
+        with open(filename, "r", encoding="utf-8") as fp:
             lines = fp.read().splitlines()
 
             for line in lines:
@@ -125,7 +125,7 @@ class Labels(abc.Mapping):
         elif not isinstance(labels, cls):
             raise ValueError("Invalid type for labels: %s" % labels)
 
-        with open(filename, "w") as f:
+        with open(filename, "w", encoding="utf-8") as f:
             # write preamble
             f.write(PREAMBLE)
             for index in labels:

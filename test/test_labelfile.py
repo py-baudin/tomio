@@ -100,6 +100,8 @@ def test_labels_load_comments(tmp_path):
         "# comment\n"
         '  # indented comment "with quotes"\n'
         '1   250  255  228        1  1  1    "label #1"\n'
+        '2   250  255  228        1  1  1    "Côté"\n',
+        encoding="utf-8",
     )
     labels = labelfile.read(filename)
-    assert labels.descriptions == ["label #1"]
+    assert labels.descriptions == ["label #1", "Côté"]

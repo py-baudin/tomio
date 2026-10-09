@@ -21,10 +21,11 @@ def test_volume_class():
     assert vol.metadata == {'foo': 'bar'}
 
     # view/ufunc
-    assert vol[0].spacing == (1.0, 2.0, 3.0)
-    assert vol[0].origin == (4.0, 5.0, 6.0)
-    assert vol[0].transform == ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0,  0.0))
-    assert vol[0].metadata == {'foo': 'bar'}
+    assert vol[:1].spacing == (1.0, 2.0, 3.0)
+    assert vol[:1].origin == (4.0, 5.0, 6.0)
+    assert vol[:1].transform == ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0,  0.0))
+    assert vol[:1].metadata == {'foo': 'bar'}
+    assert type(vol[0]) is np.ndarray  # integer index: no geometry
 
     assert (vol**2).spacing == (1.0, 2.0, 3.0)
     assert (vol**2).origin == (4.0, 5.0, 6.0)
@@ -38,6 +39,91 @@ def test_volume_class():
     assert vol.anatomical_orientation == 'RIA'
     assert vol.reorient('RAI').transform == ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0,  1.0))
 
+
+
+def check_slice(vol, key):
+    """the sliced volume has the data of the slice, and its voxels keep their world coordinates"""
+    out = vol[key]
+    assert isinstance(out, Volume)
+    assert np.array_equal(out.A, vol.A[key])
+    assert out.metadata == vol.metadata
+    if out.size == 0:
+        return out
+    # original indices of each voxel of the slice
+    key = key if isinstance(key, tuple) else (key,)
+    orig = np.indices(vol.shape)[(slice(None),) + key].reshape(vol.ndim, -1).T
+    new = np.indices(out.shape).reshape(out.ndim, -1).T
+    assert np.allclose(out.get_coords(new[:, :3]), vol.get_coords(orig[:, :3]))
+    return out
+
+
+SLICES = [
+    np.s_[2:],
+    np.s_[::2],
+    np.s_[:, 5:15, ::3],
+    np.s_[::-1],
+    np.s_[3:8:2, ::-2, -1:0:-3],
+    np.s_[..., ::-1],
+    np.s_[..., 2:4],
+    np.s_[8:2],  # empty
+]
+
+
+@pytest.mark.parametrize("key", SLICES)
+def test_volume_slicing(key):
+    tr = np.array([[0.8, 0.6, 0], [-0.6, 0.8, 0], [0, 0, 1]])
+    vol = Volume(np.random.rand(10, 12, 14), spacing=[1, 2, 3], origin=[4, 5, 6], transform=tr, metadata={"a": "b"})
+    check_slice(vol, key)
+
+
+def test_volume_slicing_values():
+    vol = Volume(np.zeros((10, 20, 30)), spacing=[1, 2, 3])
+    assert vol[2:].origin == (2, 0, 0)
+    assert vol[::2].spacing == (2, 2, 3)
+    out = vol[:, 5:15, ::3]
+    assert out.origin == (0, 10, 0)
+    assert out.spacing == (1, 2, 9)
+    out = vol[::-1]
+    assert out.origin == (9, 0, 0)
+    assert out.transform == ((-1, 0, 0), (0, 1, 0), (0, 0, 1))
+    assert out.anatomical_orientation == "LAI"
+
+
+@pytest.mark.parametrize("key", [np.s_[0], np.s_[:, 3], np.s_[..., 2], np.s_[[1, 2]], np.s_[None], np.s_[:, None]])
+def test_volume_indexing_plain_array(key):
+    vol = Volume(np.random.rand(10, 12, 14), spacing=[1, 2, 3])
+    out = vol[key]
+    assert type(out) is np.ndarray
+    assert np.array_equal(out, vol.A[key])
+
+
+def test_volume_indexing_mask_scalar():
+    vol = Volume(np.random.rand(10, 12, 14))
+    assert type(vol[vol > 0.5]) is np.ndarray
+    assert not isinstance(vol[1, 2, 3], Volume)
+    assert vol[1, 2, 3] == vol.A[1, 2, 3]
+
+
+@pytest.mark.parametrize("key", [np.s_[..., 0], np.s_[1:, ..., 2], np.s_[::-1, :, 2:, 1:3]])
+def test_volume_slicing_4d(key):
+    # integer index on non-spatial axes: geometry unchanged
+    vol = Volume(np.random.rand(4, 5, 6, 7), spacing=[1, 2, 3], origin=[4, 5, 6])
+    check_slice(vol, key)
+
+
+def test_volume_flip():
+    vol = Volume(np.random.rand(4, 5, 6), spacing=[1, 2, 3], origin=[4, 5, 6])
+    flipped = np.flip(vol, axis=(0, 2))
+    assert isinstance(flipped, Volume)
+    assert np.allclose(flipped.get_coords([0, 0, 0]), vol.get_coords([3, 0, 5]))
+
+    # reorient: each voxel keeps its value at the same world position
+    for orientation in ["LAI", "RPS", "AIR", "SPL"]:
+        out = vol.reorient(orientation)
+        assert out.anatomical_orientation == orientation
+        new = np.indices(out.shape).reshape(3, -1).T
+        orig = np.round(vol.get_indices(out.get_coords(new))).astype(int)
+        assert np.array_equal(out.A[tuple(new.T)], vol.A[tuple(orig.T)])
 
 
 def test_volume_utils():

@@ -148,6 +148,25 @@ class Volume(np.ndarray):
         # copy metadata
         self._set_volume_attrs(self, self._get_volume_attrs(obj))
     
+    def __getitem__(self, key):
+        """ geometry-aware slicing
+
+        slices (incl. negative steps) on the spatial axes: geometry updated
+        other indexing on the spatial axes (integer, array, mask, None): plain ndarray
+        integer index on the non-spatial axes (>= 3): geometry unchanged
+        """
+        result = super().__getitem__(key)
+        if not isinstance(result, Volume) or self.ndim < 3:
+            return result
+        index = get_spatial_slices(key, self.shape)
+        if index is None:
+            return result.view(np.ndarray)
+        starts, steps = index
+        result.origin = self.get_coords(starts)
+        result.spacing = [spacing * abs(step) for spacing, step in zip(self.spacing, steps)]
+        result.transform = [[v * np.sign(step) for v in vec] for vec, step in zip(self.transform, steps)]
+        return result
+
     # for pickle
     def __reduce__(self):
         """store info"""
@@ -254,6 +273,39 @@ class Volume(np.ndarray):
         return indices[:3, 0] if is_flat else indices[:3].T    
     
 
+
+
+def get_spatial_slices(key, shape):
+    """ start index and step of each spatial axis (0, 1, 2) for an indexing key
+
+    returns None if the key is not made of slices on the spatial axes
+    (or slices / integers on the other axes)
+    """
+    key = key if isinstance(key, tuple) else (key,)
+    num_ellipsis = sum(item is Ellipsis for item in key)
+    if num_ellipsis > 1:
+        return None
+    expanded = []
+    for item in key:
+        if item is Ellipsis:
+            expanded.extend([slice(None)] * (len(shape) - len(key) + 1))
+        else:
+            expanded.append(item)
+    expanded.extend([slice(None)] * (len(shape) - len(expanded)))
+
+    starts, steps = [], []
+    for axis, item in enumerate(expanded):
+        if isinstance(item, slice):
+            start, _, step = item.indices(shape[axis])
+            if axis < 3:
+                starts.append(start)
+                steps.append(step)
+        elif axis >= 3 and isinstance(item, (int, np.integer)) and not isinstance(item, bool):
+            continue
+        else:
+            # integer on a spatial axis, array, mask, None...
+            return None
+    return starts, steps
 
 
 # affine transform

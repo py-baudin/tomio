@@ -45,6 +45,7 @@
 - `Labels(...)` and `Labels.save(...)` raise `TypeError` (was `ValueError`) when the input is not a mapping. `Labels.re_parse_label` is removed.
 - YAML config files are loaded safely (`yaml.safe_load`): Python-specific tags (`!!python/...`) are rejected.
 - Config files: strings of the form `"3 + 4i"` are read as complex numbers.
+- Geometry-aware slicing of `Volume`: slices on the spatial axes update origin and spacing (e.g. `vol[2:]`, `vol[::2]`), and negative steps flip the axis direction (`vol[::-1]`, `np.flip(vol)`). Other indexing on the spatial axes returns a plain `np.ndarray`: integer index (`vol[0]` was a 2D `Volume` with the 3D header), arrays and masks (`vol[mask]`), `None`. Integer indices on the non-spatial axes (e.g. `vol[..., 0]` for a time series) keep the geometry.
 - Interpolation: the default method is `nearest` for integer and bool data (label maps; `spline3` created labels that do not exist), `spline3` for other data. The output has the dtype of the input (bool input is now supported).
 - `volume.read` returned the transposed direction matrix (only visible with non-symmetric directions, e.g. oblique or permuted axes): `vol.transform`, `vol.affine` and `vol.get_coords` were wrong. Code that compensated for it must be updated.
 - Module `config` renamed `configfile` (consistent with `labelfile` and `imagefile`). `iomed.config` and `from iomed import config` still work (alias); `import iomed.config` does not.

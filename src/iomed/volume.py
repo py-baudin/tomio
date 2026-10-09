@@ -111,13 +111,13 @@ def read_header(filename) -> dict:
 # utilities
 
 def resample(vol, **kwargs) -> Volume:
-    """ resample volume to a new geometry (see `interp.resample`, requires scipy)
+    """ resample volume to a new geometry (see `interp.resample`)
 
     resample(vol, like=ref)
     resample(vol, spacing=(1, 1, 1))
     resample(vol, geometry={...}, method="linear", fill=np.nan)
     """
-    from . import interp  # lazy import: scipy is optional
+    from . import interp  # lazy import (circular import)
     return interp.resample(vol, **kwargs)
 
 

@@ -1,10 +1,12 @@
+import importlib.util
 import numpy as np
 import pytest
 
-pytest.importorskip("scipy")
-
 from iomed import volume, interp
 Volume = volume.Volume
+
+# scipy: optional (scipy backend, and fallback of the default backend)
+needs_scipy = pytest.mark.skipif(importlib.util.find_spec("scipy") is None, reason="scipy not installed")
 
 
 @pytest.mark.parametrize("method", ["nearest", "spline3"])
@@ -164,6 +166,114 @@ def test_interp_geometry_objects():
     assert np.array_equal(interp.resample(roi, like=geom, method="labels"), interp.resample(roi, like=SHIFTED, method="labels"))
 
 
+# SimpleITK backend
+
+def interior_target(src, margin, rotation_deg=0.0):
+    """target grid inside `src`, at >= `margin` voxels from its border, shifted by a fraction of voxel"""
+    angle = np.radians(rotation_deg)
+    rot = np.array([[np.cos(angle), -np.sin(angle), 0], [np.sin(angle), np.cos(angle), 0], [0, 0, 1]])
+    n = np.array(src.shape)
+    # half size: stays inside the margin when rotated
+    shape = tuple((n - 2 * margin) // 2)
+    center = src.get_coords((n - 1) / 2 + 0.3)
+    tgt = Volume(np.zeros(shape), spacing=src.spacing, transform=rot.T)
+    tgt.origin = center - (tgt.get_coords((np.array(shape) - 1) / 2) - np.array(tgt.origin))
+    return tgt
+
+
+@needs_scipy
+@pytest.mark.parametrize("method, margin, atol", [("nearest", 2, 0), ("linear", 2, 1e-6), ("spline3", 8, 1e-3)])
+def test_sitk_backend_matches_scipy(method, margin, atol):
+    rng = np.random.default_rng(0)
+    src = Volume(rng.random((32, 30, 28)), spacing=[1, 1.5, 2], origin=[1, 2, 3])
+    tgt = interior_target(src, margin, rotation_deg=10 if method != "spline3" else 0)
+    out_scipy = interp.interpolate_like(tgt, src, method=method, backend="scipy")
+    out_sitk = interp.interpolate_like(tgt, src, method=method, backend="sitk")
+    assert out_sitk.dtype == src.dtype
+    assert out_sitk.geometry == tgt.geometry
+    assert np.allclose(out_sitk, out_scipy, atol=atol, rtol=0)
+
+
+def test_sitk_backend_outside():
+    src = Volume(np.random.rand(10, 10, 10))
+    tgt = Volume(np.zeros((10, 10, 10)), origin=(-5, 0, 0))
+    out = interp.interpolate_like(tgt, src, method="linear", cval=-1, backend="sitk")
+    assert np.all(out[:4] == -1)  # >= 1 voxel outside the source
+    assert np.allclose(out[5:], src[:5])
+    nearest = interp.interpolate_like(tgt, src, method="linear", mode="nearest", backend="sitk")
+    assert np.allclose(nearest[:4], src[:1])  # edge values extended
+
+
+@pytest.mark.parametrize("method", ["nearest", "linear", "spline3"])
+def test_sitk_backend_single_slice(method):
+    src = Volume(np.random.rand(6, 7, 1), spacing=[1, 1, 3])
+    tgt = Volume(np.zeros((6, 7, 1)), spacing=[1, 1, 3], origin=[0, 0, 1])
+    out = interp.interpolate_like(tgt, src, method=method, backend="sitk")
+    assert np.allclose(out, src)
+
+
+def test_sitk_backend_dtypes_nan():
+    lab = Volume(np.random.randint(0, 4, (10, 10, 10)).astype(np.uint8))
+    out = interp.interpolate_like(SHIFTED, lab, backend="sitk")
+    assert out.dtype == np.uint8 and set(np.unique(out)) <= {0, 1, 2, 3}
+    mask = Volume(np.random.rand(10, 10, 10) > 0.5)
+    assert interp.interpolate_like(SHIFTED, mask, backend="sitk").dtype == bool
+    src = Volume(np.random.rand(10, 10, 10))
+    src[5, 5, 5] = np.nan
+    out = interp.interpolate_like(src, src, method="spline3", backend="sitk")
+    assert np.isnan(out[5, 5, 5])
+    assert np.sum(np.isnan(out)) == 1  # NaN not spread by the B-spline
+
+
+def test_sitk_backend_labels_resample():
+    roi = Volume(np.random.randint(0, 3, (10, 10, 10)).astype(np.uint8))
+    ref = Volume(np.zeros((20, 20, 20)), spacing=[0.5, 0.5, 0.5])
+    out = interp.resample(roi, like=ref, method="labels", backend="sitk")
+    assert set(np.unique(out)) <= {0, 1, 2}
+    assert interp.interpolate_roi(ref, roi, method="spline1", disjoint=False, backend="sitk").shape == ref.shape
+
+
+def test_default_backend():
+    assert interp.DEFAULT_BACKEND == "sitk"
+    src = Volume(np.random.rand(10, 10, 10))
+    assert np.array_equal(interp.interpolate_like(SHIFTED, src), interp.interpolate_like(SHIFTED, src, backend="sitk"))
+    # border: inside up to half a voxel beyond the border voxel centers
+    tgt = Volume(np.zeros((1, 10, 10)), origin=(9.4, 0, 0))
+    assert np.allclose(interp.interpolate_like(tgt, src, method="linear"), src[-1:])
+
+
+@needs_scipy
+def test_default_backend_fallback():
+    # not supported by SimpleITK: scipy is used
+    src = Volume(np.random.rand(10, 10, 10))
+    out = interp.interpolate_like(SHIFTED, src, mode="mirror")
+    assert np.array_equal(out, interp.interpolate_like(SHIFTED, src, mode="mirror", backend="scipy"))
+    roi = Volume(np.random.randint(0, 3, (8, 8, 4)).astype(np.uint8), spacing=[1, 1, 4])
+    ref = Volume(np.zeros((8, 8, 13)))
+    out = interp.interpolate_roi(ref, roi, method="spline1", axis=2, disjoint=True)
+    assert np.array_equal(out, interp.interpolate_roi(ref, roi, method="spline1", axis=2, disjoint=True, backend="scipy"))
+
+
+def test_default_backend_fallback_without_scipy(monkeypatch):
+    monkeypatch.setattr(interp, "ndimage", None)
+    src = Volume(np.random.rand(10, 10, 10))
+    interp.interpolate_like(SHIFTED, src)  # sitk: no scipy needed
+    with pytest.raises(ImportError, match="mirror"):
+        interp.interpolate_like(SHIFTED, src, mode="mirror")
+    with pytest.raises(ImportError, match="scipy backend"):
+        interp.interpolate_like(SHIFTED, src, backend="scipy")
+
+
+def test_sitk_backend_errors():
+    src = Volume(np.random.rand(10, 10, 10))
+    with pytest.raises(ValueError):
+        interp.interpolate_like(SHIFTED, src, mode="mirror", backend="sitk")
+    with pytest.raises(ValueError):
+        interp.interpolate_like(SHIFTED, src, backend="unknown")
+    with pytest.raises(NotImplementedError):
+        interp.interpolate_roi(src, src > 0.5, method="spline1", disjoint=True, backend="sitk")
+
+
 def test_resample_exports():
     import iomed
     src = Volume(np.random.rand(10, 10, 10))
@@ -197,6 +307,7 @@ def test_interpolate_roi_upsampling_quality(method):
     assert np.sum(smooth != truth) < np.sum(default != truth)
 
 
+@needs_scipy
 def test_interpolate_roi_upsampling_disjoint():
     # thick slices: with disjoint=True, labels are not interpolated across slices
     rng = np.random.default_rng(0)

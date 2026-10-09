@@ -5,6 +5,9 @@
 ### Added
 - `configfile.read` reads TOML files (`.toml`, read-only), with `tomllib` (Python >= 3.11) or `tomli`.
 - Labels:
+  - `Labels(["a", "b"])`: from a sequence of descriptions (indices 0, 1...); `indices=` and `colors=` arguments.
+  - Setters `labels.indices`, `labels.descriptions`, `labels.colors` (sequence in index order; `colors` also accepts a dict): validated like `set()`, labels unchanged on error.
+  - `labels.getindex(name)` returns the first index with that name (when duplicates are allowed).
   - `labels.lut`: RGBA lookup table (`uint8`, shape `(max index + 1, 4)`), e.g. `rgba = labels.lut[labelmap]`.
   - `Labels.from_volume(labelmap, names=None)`: labels from the values of a label map, with automatic colors.
   - `labels.reindex()`: consecutive indices 1..N, returns the new labels and the mapping `{old: new}`; `labelfile.apply_mapping(labelmap, mapping)` (also `Labels.apply_mapping`) applies it to a label map.
@@ -20,10 +23,13 @@
 - `interp.interpolate_roi(..., method="spline1")` (or any interpolation method): higher quality upsampling of label maps. Each label is interpolated separately as a binary mask, and each voxel gets the label with the highest value. Also available as `interp.interpolate_labels`.
 
 ### Changed
-- Interpolation uses `scipy.ndimage.affine_transform`: faster, and only the output is allocated (it allocated ~90 bytes per target voxel for coordinates). Single-slice sources still use `map_coordinates`.
+- Interpolation backends (`backend=` argument of the interpolation functions and `resample`):
+  - `"sitk"` (default): SimpleITK, multithreaded (~1.5-2x faster than scipy), no scipy needed. Voxels are inside the source up to half a voxel beyond the border voxel centers (scipy: up to the border voxel centers), so border voxels can differ from previous versions; inside the volume, results are identical.
+  - `"scipy"`: `scipy.ndimage.affine_transform` (was: `map_coordinates` with all target coordinates, ~90 bytes per target voxel); single-slice sources use `map_coordinates`.
+  - Default backend: scipy is used automatically (if installed) for what SimpleITK does not support: modes `"mirror"`, `"wrap"`, and `disjoint=True` with `interpolate_roi(..., method=...)`.
 - Require Python >= 3.10 and numpy >= 1.24.
-- scipy is now an optional extra: `pip install iomed[interp]` (also included in the `test` extra).
-- `iomed.interp` is available as an attribute of the package (imported lazily).
+- scipy is now an optional extra: `pip install iomed[interp]` (also included in the `test` extra); interpolation works without it (SimpleITK backend).
+- `iomed.interp` is available as an attribute of the package.
 
 - `Labels` is a full mutable mapping (`update`, `setdefault`, `clear`, `popitem`...); `Labels()` creates an empty object and any mapping is accepted as input.
 - `labels.save(filename)` works on an instance (it raised `TypeError`); `Labels.save(filename, labels)` still works.

@@ -119,7 +119,7 @@ def complete_geometry(geometry, src):
     return tgt_geom
 
 
-def interpolate_roi(ref, roi, *, disjoint=True, axis="auto", method=None):
+def interpolate_roi(ref, roi, *, disjoint=True, axis="auto", method=None, backend=None):
     """Interpolate mask/ROI into `ref` geometry
 
     when downsampling: use nearest nonzero slice
@@ -130,6 +130,7 @@ def interpolate_roi(ref, roi, *, disjoint=True, axis="auto", method=None):
             interpolation method (e.g. "spline1", "spline3"): higher quality upsampling
             each label (incl. background) is interpolated separately as a binary mask,
             and each voxel gets the label with the highest interpolated value
+        backend: interpolation backend with `method` (see `make_resampler`)
     """
     roi = volume.asvolume(roi)
     ref = volume.asvolume(ref)
@@ -162,7 +163,7 @@ def interpolate_roi(ref, roi, *, disjoint=True, axis="auto", method=None):
         assert axis in list(range(ndim))
 
     if method is not None:
-        return interpolate_labels(ref, roi, method=method, round_axes=[axis] if disjoint else [])
+        return interpolate_labels(ref, roi, method=method, round_axes=[axis] if disjoint else [], backend=backend)
 
     if np.any(np.array(roi.spacing) > np.array(ref.spacing)):
         # fix upsampling 'gaps'
@@ -195,7 +196,7 @@ def interpolate_roi(ref, roi, *, disjoint=True, axis="auto", method=None):
     return new
 
 
-def interpolate_labels(ref, labelmap, *, method="spline1", round_axes=()):
+def interpolate_labels(ref, labelmap, *, method="spline1", round_axes=(), backend=None):
     """Interpolate label map into `ref` geometry, label by label
 
     Each label (incl. background: 0) is interpolated separately as a binary mask;
@@ -205,13 +206,12 @@ def interpolate_labels(ref, labelmap, *, method="spline1", round_axes=()):
     args:
         method: interpolation method (e.g. "spline1", "spline3")
         round_axes: label map axes in which coordinates are rounded (no interpolation)
+        backend: interpolation backend (see `make_resampler`)
     """
-    if ndimage is None:
-        raise ImportError('`scipy` is required for interpolation')
     ref = volume.asvolume(ref)
     labelmap = volume.asvolume(labelmap)
     order = get_order(method)
-    resample = make_resampler(get_geometry(ref), get_geometry(labelmap), round_axes=round_axes)
+    resample = make_resampler(get_geometry(ref), get_geometry(labelmap), round_axes=round_axes, backend=backend)
 
     new = np.zeros(ref.shape, dtype=labelmap.dtype)
     best = np.full(ref.shape, -np.inf, dtype=np.float32)
@@ -235,6 +235,7 @@ def interpolate(
     order=None,
     mode=None,
     cval=0,
+    backend=None,
 ):
     """Interpolate a series of volume based on the target
     and source tags (see Volume in crisio)
@@ -256,6 +257,9 @@ def interpolate(
         mode: [None], 'nearest', any float number
             How values outside the box defined by the coordinates
             should be filled. Default: constant 0
+        backend: [None], 'sitk', 'scipy' (see `make_resampler`)
+            default: SimpleITK; voxels are considered inside the source up to half a voxel
+            beyond the border voxel centers
 
     Returns
     ---
@@ -263,9 +267,6 @@ def interpolate(
             Interpolated array, with the same dtype as the source
 
     """
-    if ndimage is None:
-        raise ImportError('`scipy` is required for interpolation')
-
     # extend mode
     try:
         const_value = float(mode)
@@ -279,7 +280,7 @@ def interpolate(
     elif not mode in ["constant", "nearest", "mirror", "wrap"]:
         raise ValueError('Invalid value for `mode`: "%s"' % mode)
 
-    resample = make_resampler(target_geom, source_geom)
+    resample = make_resampler(target_geom, source_geom, backend=backend)
 
     # do the interpolation
     results = []
@@ -354,13 +355,93 @@ def get_geometry(obj, shape=True):
     return geom
 
 
-def make_resampler(target_geom, source_geom, round_axes=()):
-    """return function resample(array, **kwargs) from source to target geometry
+BACKENDS = ("scipy", "sitk")
+DEFAULT_BACKEND = "sitk"
+SITK_MODES = ("constant", "nearest")
 
-    kwargs: passed to scipy.ndimage (order, mode, cval, prefilter)
+
+def make_resampler(target_geom, source_geom, round_axes=(), backend=None):
+    """return function resample(array, order, mode, cval, prefilter) from source to target geometry
+
     round_axes: source axes in which coordinates are rounded (no interpolation);
-        always includes single-slice axes
+        always includes single-slice axes (scipy backend)
+    backend: "sitk" (SimpleITK, multithreaded) or "scipy" (scipy.ndimage)
+        default (None): DEFAULT_BACKEND ("sitk"), with scipy for what SimpleITK does not support:
+        modes other than "constant" and "nearest", and `round_axes`
     """
+    auto = backend is None
+    backend = backend or DEFAULT_BACKEND
+    if backend == "sitk":
+        if len(round_axes):
+            if auto:
+                return _make_scipy_resampler(target_geom, source_geom, round_axes, reason="rounding axes (e.g. disjoint=True)")
+            raise NotImplementedError("Rounding axes (e.g. disjoint=True) is not supported by the sitk backend")
+        sitk_resample = _make_sitk_resampler(target_geom, source_geom)
+        if not auto:
+            return sitk_resample
+
+        def resample(array, **kwargs):
+            if kwargs.get("mode", "constant") in SITK_MODES:
+                return sitk_resample(array, **kwargs)
+            reason = f'mode="{kwargs["mode"]}"'
+            return _make_scipy_resampler(target_geom, source_geom, reason=reason)(array, **kwargs)
+
+        return resample
+    elif backend == "scipy":
+        return _make_scipy_resampler(target_geom, source_geom, round_axes)
+    raise ValueError(f"Unknown interpolation backend: {backend} (expected one of {BACKENDS})")
+
+
+def _make_sitk_resampler(target_geom, source_geom):
+    """SimpleITK resampling (multithreaded)"""
+    import SimpleITK as sitk
+    from . import imagefile
+
+    geom_t = volume.as_geometry(get_geometry(target_geom))
+    geom_s = volume.as_geometry(get_geometry(source_geom))
+
+    def resample(array, order=3, mode="constant", cval=0.0, prefilter=True):
+        # prefilter: done by SimpleITK's B-spline interpolator
+        if mode not in ("constant", "nearest"):
+            raise ValueError(f'Mode "{mode}" is not supported by the sitk backend (only "constant", "nearest")')
+        image = imagefile.to_image(array, spacing=geom_s.spacing, origin=geom_s.origin, transform=geom_s.transform)
+        resampler = sitk.ResampleImageFilter()
+        resampler.SetSize([int(n) for n in geom_t.shape])
+        resampler.SetOutputSpacing(geom_t.spacing)
+        resampler.SetOutputOrigin(geom_t.origin)
+        # transform: columns of the direction matrix
+        resampler.SetOutputDirection(np.asarray(geom_t.transform).T.ravel().tolist())
+        resampler.SetInterpolator(get_sitk_interpolator(order))
+        resampler.SetDefaultPixelValue(float(cval))
+        resampler.SetOutputPixelType(image.GetPixelID())
+        if mode == "nearest":
+            resampler.SetUseNearestNeighborExtrapolator(True)
+        return sitk.GetArrayFromImage(resampler.Execute(image)).T
+
+    return resample
+
+
+def get_sitk_interpolator(order):
+    """SimpleITK interpolator for a spline order"""
+    import SimpleITK as sitk
+
+    if order == 0:
+        return sitk.sitkNearestNeighbor
+    elif order == 1:
+        return sitk.sitkLinear
+    elif order == 3:
+        return sitk.sitkBSpline
+    name = f"sitkBSpline{order}"
+    if hasattr(sitk, name):
+        return getattr(sitk, name)
+    raise ValueError(f"Spline order {order} is not supported by the installed SimpleITK")
+
+
+def _make_scipy_resampler(target_geom, source_geom, round_axes=(), reason=None):
+    """scipy.ndimage resampling"""
+    if ndimage is None:
+        needed = f" for {reason}" if reason else " with the scipy backend"
+        raise ImportError(f"`scipy` is required for interpolation{needed} (pip install iomed[interp])")
     target_geom = get_geometry(target_geom)
     source_geom = get_geometry(source_geom)
     shape_t = target_geom["shape"]

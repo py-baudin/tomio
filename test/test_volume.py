@@ -126,6 +126,108 @@ def test_volume_flip():
         assert np.array_equal(out.A[tuple(new.T)], vol.A[tuple(orig.T)])
 
 
+def oblique_volume(shape):
+    tr = np.array([[0.8, 0.6, 0], [-0.6, 0.8, 0], [0, 0, 1]])
+    return Volume(np.random.rand(*shape), spacing=[1, 2, 3], origin=[4, 5, 6], transform=tr, metadata={"a": "b"})
+
+
+@pytest.mark.parametrize(
+    "func",
+    [
+        lambda v: v.sum(axis=0),
+        lambda v: v.mean(axis=(0, 1)),
+        lambda v: v.max(axis=2, keepdims=True),
+        lambda v: np.std(v, axis=1),
+        lambda v: np.add.reduce(v),  # default axis: 0
+        lambda v: np.median(v, axis=0),
+    ],
+)
+def test_volume_reduction_spatial(func):
+    vol = oblique_volume((4, 5, 6))
+    out = func(vol)
+    assert type(out) is np.ndarray
+    assert np.allclose(out, func(vol.A))
+
+
+def test_volume_reduction_all():
+    vol = oblique_volume((4, 5, 6))
+    for out in [vol.sum(), vol.mean(), np.max(vol), vol.std()]:
+        assert not isinstance(out, Volume)
+        assert np.ndim(out) == 0
+
+
+@pytest.mark.parametrize("func", [lambda v: v.mean(axis=3), lambda v: v.sum(axis=-1), lambda v: np.max(v, axis=3)])
+def test_volume_reduction_non_spatial(func):
+    # reduction over non-spatial axes: geometry kept
+    vol = oblique_volume((4, 5, 6, 7))
+    out = func(vol)
+    assert isinstance(out, Volume)
+    assert out.shape == (4, 5, 6)
+    assert out.header == vol.header
+    assert np.allclose(out, func(vol.A))
+    assert type(vol.sum(axis=(2, 3))) is np.ndarray
+
+
+def test_volume_ufunc_header():
+    vol = oblique_volume((4, 5, 6))
+    other = Volume(np.ones((4, 5, 6)))
+    # elementwise: header of the first Volume input with the shape of the result
+    assert (vol + 1).header == vol.header
+    assert (1 + vol).header == vol.header
+    assert (vol[:1] + vol).header == vol.header  # broadcast: header of `vol`
+    assert (vol + other).header == vol.header
+    assert (other + vol).header == other.header
+    assert np.cumsum(vol, axis=0).header == vol.header
+    q, r = np.divmod(vol, 0.3)
+    assert q.header == r.header == vol.header
+    # shape changed: plain array
+    assert type(np.matmul(vol, np.ones((6, 2)))) is np.ndarray
+    assert type(np.multiply.outer(vol, [1, 2])) is np.ndarray
+    # out argument: modified in place
+    out = np.add(vol, 1, out=vol)
+    assert out is vol
+    assert out.origin == (4, 5, 6)
+
+
+def check_permutation(vol, func):
+    """the permuted volume has permuted data, and its voxels keep their world coordinates"""
+    out = func(vol)
+    assert isinstance(out, Volume)
+    assert np.array_equal(out.A, func(vol.A))
+    # original indices of each voxel
+    orig = np.stack([func(idx) for idx in np.indices(vol.shape)]).reshape(vol.ndim, -1).T
+    new = np.indices(out.shape).reshape(out.ndim, -1).T
+    assert np.allclose(out.get_coords(new[:, :3]), vol.get_coords(orig[:, :3]))
+
+
+PERMUTATIONS = [
+    lambda v: v.T,
+    lambda v: v.transpose(),
+    lambda v: v.transpose(1, 0, 2),
+    lambda v: v.transpose((2, 0, 1)),
+    lambda v: np.transpose(v, (2, 0, 1)),
+    lambda v: np.moveaxis(v, 0, -1),
+    lambda v: np.swapaxes(v, 0, 2),
+    lambda v: v.swapaxes(-1, 1),
+    lambda v: np.rollaxis(v, 2),
+    lambda v: v.T[::-1, 2:],  # with slicing
+]
+
+
+@pytest.mark.parametrize("func", PERMUTATIONS)
+def test_volume_permutation(func):
+    check_permutation(oblique_volume((4, 5, 6)), func)
+
+
+def test_volume_permutation_4d():
+    vol = oblique_volume((4, 5, 6, 7))
+    check_permutation(vol, lambda v: v.transpose(1, 0, 2, 3))
+    check_permutation(vol, lambda v: np.swapaxes(v, 0, 2))
+    # spatial axis moved beyond the first 3 axes: plain array
+    for func in [lambda v: v.T, lambda v: np.moveaxis(v, 3, 0), lambda v: v.swapaxes(2, 3)]:
+        assert type(func(vol)) is np.ndarray
+
+
 def test_volume_utils():
     arr = np.arange(3*4*5).reshape(3,4,5)
     vol = Volume(arr, spacing=[1,2,3], origin=[4,5,6], metadata={'foo': 'bar'})

@@ -167,6 +167,79 @@ class Volume(np.ndarray):
         result.transform = [[v * np.sign(step) for v in vec] for vec, step in zip(self.transform, steps)]
         return result
 
+    def __array_ufunc__(self, ufunc, method, *inputs, out=None, **kwargs):
+        """ numpy ufuncs: compute on plain arrays, then set the header of the result
+
+        elementwise (incl. accumulate): header of the first Volume input with the same shape
+        reductions over non-spatial axes only (>= 3): header of the input
+        other cases (reductions over spatial axes, shape changes): plain ndarray
+        """
+        args = [x.view(np.ndarray) if isinstance(x, Volume) else x for x in inputs]
+        if out is not None:
+            kwargs["out"] = tuple(x.view(np.ndarray) if isinstance(x, Volume) else x for x in out)
+        results = getattr(ufunc, method)(*args, **kwargs)
+
+        if method == "at":
+            return None
+        elif out is not None:
+            # results written in `out`
+            return out[0] if len(out) == 1 else out
+        elif ufunc.nout == 1:
+            return self._wrap_ufunc_result(results, method, inputs, kwargs)
+        return tuple(self._wrap_ufunc_result(res, method, inputs, kwargs) for res in results)
+
+    @staticmethod
+    def _wrap_ufunc_result(result, method, inputs, kwargs):
+        if not isinstance(result, np.ndarray) or result.ndim == 0:
+            return result
+        if method == "reduce":
+            vol = inputs[0]
+            axis = kwargs.get("axis", 0)
+            axes = range(vol.ndim) if axis is None else np.atleast_1d(axis) % vol.ndim
+            if vol.ndim < 3 or any(ax < 3 for ax in axes):
+                return result
+            return Volume(result, **vol.header)
+        elif method in ("__call__", "accumulate"):
+            for vol in inputs:
+                if isinstance(vol, Volume) and vol.shape == result.shape:
+                    return Volume(result, **vol.header)
+        return result
+
+    # axis permutations
+
+    def transpose(self, *axes):
+        result = super().transpose(*axes)
+        if not axes or axes == (None,):
+            order = tuple(reversed(range(self.ndim)))
+        elif len(axes) == 1 and not isinstance(axes[0], (int, np.integer)):
+            order = tuple(axes[0])
+        else:
+            order = axes
+        return self._permute_header(result, order)
+
+    @property
+    def T(self):
+        return self.transpose()
+
+    def swapaxes(self, axis1, axis2):
+        result = super().swapaxes(axis1, axis2)
+        order = list(range(self.ndim))
+        axis1, axis2 = axis1 % self.ndim, axis2 % self.ndim
+        order[axis1], order[axis2] = order[axis2], order[axis1]
+        return self._permute_header(result, order)
+
+    def _permute_header(self, result, order):
+        """ permute spacing and transform: axis i of result is axis order[i] of self """
+        if self.ndim < 3:
+            return result
+        order = [ax % self.ndim for ax in order]
+        if sorted(order[:3]) != [0, 1, 2]:
+            # spatial axes moved beyond the first 3 axes
+            return result.view(np.ndarray)
+        result.spacing = [self.spacing[ax] for ax in order[:3]]
+        result.transform = [self.transform[ax] for ax in order[:3]]
+        return result
+
     # for pickle
     def __reduce__(self):
         """store info"""

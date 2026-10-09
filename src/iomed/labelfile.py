@@ -218,41 +218,86 @@ class Labels(abc.MutableMapping):
                 )
                 f.write(line)
 
-    def __init__(self, labels=None, *, allow_duplicates=None):
+    def __init__(self, labels=None, *, indices=None, colors=None, allow_duplicates=None):
         """init label object
 
-        labels: mapping {index: description or info dict}, or Labels object (copied)
+        labels:
+            mapping {index: description or info dict}
+            sequence of descriptions (or info dicts): indices 0, 1, 2...
+            Labels object (copied)
+        indices: new indices, in the order of the labels (see `indices` setter)
+        colors: new colors (see `colors` setter)
         allow_duplicates: default False (or copied from `labels` if it is a Labels object)
         """
         if allow_duplicates is None:
             allow_duplicates = getattr(labels, "allow_duplicates", False)
         self.allow_duplicates = allow_duplicates
         self.color_gen = itertools.cycle(COLOR_MAP)
+        self.data = {}
 
         if isinstance(labels, Labels):
             self.data = {index: dict(info) for index, info in labels.data.items()}
-            return
         elif labels is None:
-            labels = {}
-        elif not isinstance(labels, abc.Mapping):
-            raise TypeError("A mapping {index: description} is required, not: %r" % (labels,))
-        self.data = {}
+            pass
+        elif isinstance(labels, abc.Mapping):
+            for index in sorted(labels):
+                self.set(index, labels[index])
+        elif isinstance(labels, abc.Sequence) and not isinstance(labels, str):
+            for index, value in enumerate(labels):
+                self.set(index, value)
+        else:
+            raise TypeError("A mapping {index: description} or a sequence of descriptions is required, not: %r" % (labels,))
 
-        for index in sorted(labels):
-            self.set(index, labels[index])
+        if indices is not None:
+            self.indices = indices
+        if colors is not None:
+            self.colors = colors
+
+    def _replace(self, items):
+        """ replace all labels with validated (index, info) items """
+        new = type(self)(allow_duplicates=self.allow_duplicates)
+        for index, info in items:
+            if index in new:
+                raise ValueError(f"Duplicate index: {index}")
+            new.set(index, info)
+        self.data = new.data
 
     @property
     def indices(self):
         return list(self)
-    
+
+    @indices.setter
+    def indices(self, indices):
+        """ renumber the labels: new indices, in the order of the current indices """
+        self._replace(zip(indices, (self.data[old] for old in self), strict=True))
+
     @property
     def descriptions(self):
         return list(self.data[index]['LABEL'] for index in self)
-    
+
+    @descriptions.setter
+    def descriptions(self, descriptions):
+        """ new descriptions, in the order of the indices """
+        if isinstance(descriptions, str):
+            raise ValueError("A sequence of descriptions is required")
+        items = zip(self, descriptions, strict=True)
+        self._replace((index, dict(self.data[index], LABEL=descr)) for index, descr in items)
+
     @property
     def colors(self):
         """return dict of colors"""
         return dict((idx, self.data[idx]["RGBA"]) for idx in self)
+
+    @colors.setter
+    def colors(self, colors):
+        """ new colors: dict {index: RGBA}, or sequence of RGBA in the order of the indices """
+        if isinstance(colors, abc.Mapping):
+            unknown = set(colors) - set(self.data)
+            if unknown:
+                raise KeyError(f"Unknown label indices: {sorted(unknown)}")
+            colors = [colors.get(index, self.data[index]["RGBA"]) for index in self]
+        items = zip(self, colors, strict=True)
+        self._replace((index, dict(self.data[index], RGBA=rgba)) for index, rgba in items)
 
     @property
     def palette(self):
@@ -280,7 +325,7 @@ class Labels(abc.MutableMapping):
         return lut
 
     def __repr__(self):
-        return str(self.data)
+        return str(dict(zip(self.indices, self.descriptions)))
 
     def __len__(self):
         return len(self.data)
@@ -329,7 +374,7 @@ class Labels(abc.MutableMapping):
         elif isinstance(value, abc.Mapping):
             info = value
         else:
-            raise ValueError("Invalid label info: %s" % value)
+            raise ValueError("Invalid label info: %r" % (value,))
 
         unknown = info.keys() - {"LABEL", "RGBA", "VIS", "MSH"}
         if unknown:
@@ -363,7 +408,7 @@ class Labels(abc.MutableMapping):
             "VIS": int(vis),
             "MSH": int(meshvis),
         }
-        
+
     def reindex(self):
         """ renumber labels with consecutive indices 1..N (0 is kept), in index order
 
@@ -381,8 +426,11 @@ class Labels(abc.MutableMapping):
         return apply_mapping(labelmap, mapping)
 
     def getindex(self, name):
-        """return index of given name (reverse of .__getitem__)"""
-        return {self.data[index]["LABEL"]: index for index in self.indices}[name]
+        """return first index of given name (reverse of .__getitem__)"""
+        for index in self:
+            if self.data[index]["LABEL"] == name:
+                return index
+        raise KeyError(name)
 
     def newcolor(self, alpha=1.0):
         """return a different color every time"""

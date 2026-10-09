@@ -203,7 +203,63 @@ def test_labels_init():
     assert len(Labels()) == 0
     assert Labels(types.MappingProxyType({1: "a"}))[1] == "a"
     with pytest.raises(TypeError):
-        Labels([(1, "a")])
+        Labels(3)
+    with pytest.raises(TypeError):
+        Labels("abc")
+    with pytest.raises(ValueError):
+        Labels([(1, "a")])  # invalid label info
+
+
+def test_labels_init_sequence():
+    labels = Labels(["background", "a", {"LABEL": "b", "RGBA": (1, 2, 3, 1.0)}])
+    assert dict(labels) == {0: "background", 1: "a", 2: "b"}
+    assert labels.colors[2] == (1, 2, 3, 1.0)
+    # indices and colors arguments
+    labels = Labels(["a", "b"], indices=[3, 7], colors=[(1, 2, 3, 1.0), (4, 5, 6, 0.5)])
+    assert dict(labels) == {3: "a", 7: "b"}
+    assert labels.colors == {3: (1, 2, 3, 1.0), 7: (4, 5, 6, 0.5)}
+
+
+def test_labels_setters():
+    labels = Labels({1: "a", 2: "b", 5: "c"})
+    colors = labels.colors
+
+    labels.indices = [10, 20, 30]
+    assert dict(labels) == {10: "a", 20: "b", 30: "c"}
+    assert list(labels.colors.values()) == list(colors.values())
+
+    labels.descriptions = ["b", "a", "c"]  # swap
+    assert labels.descriptions == ["b", "a", "c"]
+
+    labels.colors = {20: (1, 2, 3, 1.0)}  # partial dict
+    assert labels.colors[20] == (1, 2, 3, 1.0)
+    assert labels.colors[10] == colors[1]
+    labels.colors = [(1, 1, 1, 1.0)] * 3
+    assert set(labels.colors.values()) == {(1, 1, 1, 1.0)}
+
+    # invalid values: error, labels unchanged
+    before = Labels(labels)
+    invalid = [
+        ("indices", [1, 1, 2]),  # duplicate
+        ("indices", [1, -2, 3]),
+        ("indices", [1, 2]),  # length
+        ("descriptions", ["x", "x", "y"]),  # duplicate
+        ("descriptions", ['x"', "y", "z"]),
+        ("descriptions", "xyz"),
+        ("colors", [(256, 0, 0, 1.0)] * 3),
+        ("colors", {99: (0, 0, 0, 1.0)}),
+    ]
+    for name, value in invalid:
+        with pytest.raises((ValueError, KeyError)):
+            setattr(labels, name, value)
+        assert labels == before
+
+
+def test_labels_getindex_first():
+    labels = Labels({1: "a", 2: "b", 3: "a"}, allow_duplicates=True)
+    assert labels.getindex("a") == 1
+    with pytest.raises(KeyError):
+        labels.getindex("z")
 
 
 def test_labels_mutable_mapping():
@@ -237,7 +293,8 @@ def test_labels_save(tmp_path):
     for i in range(1, 5):
         assert labelfile.read(tmp_path / f"{i}.txt") == labels
     with pytest.raises(TypeError):
-        Labels.save(tmp_path / "5.txt", [(1, "a")])
+        Labels.save(tmp_path / "5.txt", 3)
+    assert not (tmp_path / "5.txt").exists()
 
 
 def test_labels_lut():

@@ -238,7 +238,7 @@ def interpolate(
     results = []
     for vol in sources:
         isnan = np.isnan(vol)
-        vol[isnan] = 0
+        vol = np.where(isnan, 0, vol)  # copy: do not modify the input
         res = ndimage.map_coordinates(
             vol, coords, order=order, mode=mode, cval=const_value, prefilter=True
         ).reshape(shape_t)

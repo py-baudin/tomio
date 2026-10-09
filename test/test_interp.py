@@ -39,3 +39,13 @@ def test_interpolate_to_rotated():
     assert np.allclose(out.origin, (3, 0, 0))
     # out[i, j, k] is at world (3 - j, i, k)
     assert np.allclose(out, arr[::-1].transpose(1, 0, 2))
+
+
+def test_interpolate_keeps_input_nans():
+    src = Volume(np.where(np.random.rand(8, 8, 8) > 0.9, np.nan, 1.0))
+    isnan = np.isnan(src)
+    out = interp.interpolate_like(src, src)
+    # input unchanged
+    assert np.array_equal(np.isnan(src), isnan)
+    # NaNs propagated to the output
+    assert np.array_equal(np.isnan(out), isnan)

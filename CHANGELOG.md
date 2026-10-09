@@ -16,4 +16,5 @@
 - `Labels.pop(index, default)` accepts a default value, like `dict.pop`.
 
 ### Changed (breaking)
+- `Labels.pop(index)` returns the label description (was: the full info dict), consistent with `labels[index]`.
 - Label files are read and written as UTF-8 (was: the system default encoding). Files with non-ASCII labels saved by earlier versions on Windows must be re-encoded.

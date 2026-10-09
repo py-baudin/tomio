@@ -93,7 +93,7 @@ def test_labels_pop():
     assert labels.pop(99, None) is None
     with pytest.raises(KeyError):
         labels.pop(99)
-    assert labels.pop(1)["LABEL"] == "a"
+    assert labels.pop(1) == "a"
     assert list(labels) == [2]
 
 

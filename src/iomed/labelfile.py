@@ -262,8 +262,12 @@ class Labels(abc.Mapping):
         }
         
     def pop(self, index, *default):
-        """remove label and return its info (same signature as dict.pop)"""
-        return self.data.pop(index, *default)
+        """remove label and return its description (same signature as dict.pop)"""
+        if len(default) > 1:
+            raise TypeError(f"pop expected at most 2 arguments, got {1 + len(default)}")
+        if index not in self.data and default:
+            return default[0]
+        return self.data.pop(index)["LABEL"]
 
     def getindex(self, name):
         """return index of given name (reverse of .__getitem__)"""

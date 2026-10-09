@@ -19,43 +19,92 @@ class InterpolationError(Exception):
 
 
 
+def resample(vol, *, like=None, spacing=None, geometry=None, method=None, fill=0, **kwargs):
+    """Resample volume to a new geometry
+
+    target geometry (one of):
+        like: Volume, use its geometry
+        spacing: new spacing, same extent
+        geometry: dict with origin/spacing/transform/shape (missing values: from `vol`;
+            missing shape: the target covers `vol`)
+
+    method:
+        None: 'nearest' for integer and bool data, 'spline3' otherwise
+        'nearest', 'linear', 'spline1', 'spline3'...: see `interpolate`
+        'roi': mask/ROI interpolation (see `interpolate_roi`)
+        'labels': label map interpolation, label by label (see `interpolate_labels`)
+    fill: value outside `vol` (not used with 'roi' and 'labels': 0)
+    kwargs: passed to `interpolate` (e.g. mode, order) or `interpolate_roi`
+
+    examples:
+        resample(vol, like=ref)
+        resample(vol, spacing=(1, 1, 1))
+        resample(vol, like=ref, method="linear", fill=np.nan)
+        resample(roi, like=ref, method="roi")
+    """
+    if sum(arg is not None for arg in (like, spacing, geometry)) != 1:
+        raise ValueError("Exactly one of `like`, `spacing` or `geometry` is required")
+    vol = volume.asvolume(vol)
+
+    if like is not None:
+        target = get_geometry(volume.asvolume(like))
+    elif spacing is not None:
+        target = complete_geometry({"spacing": spacing}, vol)
+    else:
+        target = complete_geometry(geometry, vol)
+
+    if method in ("roi", "labels"):
+        # light reference volume (no data allocated)
+        shape, header = target["shape"], get_geometry(target, shape=False)
+        ref = volume.Volume(np.broadcast_to(np.uint8(0), shape), **header)
+        if method == "roi":
+            return interpolate_roi(ref, vol, **kwargs)
+        return interpolate_labels(ref, vol, **kwargs)
+
+    if np.isnan(fill) and not np.issubdtype(vol.dtype, np.inexact):
+        raise ValueError(f"Cannot fill {vol.dtype} data with NaN")
+    return interpolate(target, get_geometry(vol), vol, method=method, cval=fill, **kwargs)
+
+
 def interpolate_like(target, source, **kwargs):
     """interpolate source volume to match target volume"""
     target = volume.asvolume(target)
     source = volume.asvolume(source)
-    target_geom = {'origin': target.origin, 'spacing': target.spacing, 'transform': target.transform, 'shape': target.shape}
-    source_geom = {'origin': source.origin, 'spacing': source.spacing, 'transform': source.transform, 'shape': source.shape}
-    return interpolate(target_geom, source_geom, source, **kwargs)
-
+    return interpolate(get_geometry(target), get_geometry(source), source, **kwargs)
 
 
 def interpolate_to(geometry, src, **kwargs):
     """interpolate source volume to target geometry
-    {'origin': ..., 'spacing': ..., 'transform': ...}
+    {'origin': ..., 'spacing': ..., 'transform': ..., 'shape': ...}
+    missing values are taken from `src`; missing shape: the target covers `src`
     """
     src = volume.asvolume(src)
-    ndim = src.ndim
+    return interpolate(complete_geometry(geometry, src), get_geometry(src), src, **kwargs)
+
+
+def complete_geometry(geometry, src):
+    """complete target geometry dict with values from volume `src`
+
+    missing shape: the target covers `src` (bounding box of the voxel centers),
+    and its origin is moved to the first corner of the box
+    """
+    src = volume.asvolume(src)
+    ndim = 3
     tgt_geom = dict(geometry)
-    src_geom = {
-        "origin": src.origin,
-        "spacing": src.spacing,
-        "transform": src.transform,
-        "shape": src.shape,
-    }
 
     if not "origin" in tgt_geom:
-        tgt_geom["origin"] = src_geom["origin"]
+        tgt_geom["origin"] = src.origin
     if not "spacing" in tgt_geom:
-        tgt_geom["spacing"] = src_geom["spacing"]
+        tgt_geom["spacing"] = src.spacing
     if not "transform" in tgt_geom:
-        tgt_geom["transform"] = src_geom["transform"]
+        tgt_geom["transform"] = src.transform
     if not "shape" in tgt_geom:
         # bounding box of the source voxel centers, in target indices
         Ts = volume.make_affine_transform(src.origin, src.spacing, src.transform)
         Tt = volume.make_affine_transform(
             tgt_geom["origin"], tgt_geom["spacing"], tgt_geom["transform"]
         )
-        idx = np.indices((2,) * ndim).reshape(ndim, -1).T * (np.array(src.shape) - 1)
+        idx = np.indices((2,) * ndim).reshape(ndim, -1).T * (np.array(src.shape[:3]) - 1)
         loc = np.linalg.solve(
             Tt, Ts @ np.concatenate([idx, np.ones((2**ndim, 1))], axis=1).T
         )[:3]
@@ -65,7 +114,7 @@ def interpolate_to(geometry, src, **kwargs):
         tgt_geom["shape"] = tuple((upper - lower).astype(int) + 1)
         tgt_geom["origin"] = tuple((Tt @ np.r_[lower, 1])[:3])
 
-    return interpolate(tgt_geom, src_geom, src, **kwargs)
+    return tgt_geom
 
 
 def interpolate_roi(ref, roi, *, disjoint=True, axis="auto", method=None):
@@ -277,6 +326,8 @@ def get_order(method, order=None):
         return order
     elif method == "nearest":
         return 0
+    elif method == "linear":
+        return 1
     elif method[:-1] == "spline" and method[-1].isdigit():
         return int(method[-1])
     raise ValueError(f"Invalid interpolation method: {method}")

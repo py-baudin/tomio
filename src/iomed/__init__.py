@@ -9,6 +9,7 @@ read_volume = volume.read
 write_volume = volume.write
 tovolume = volume.tovolume
 asvolume = volume.asvolume
+resample = volume.resample
 
 read_config = configfile.read
 write_config = configfile.write

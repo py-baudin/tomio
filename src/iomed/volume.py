@@ -61,6 +61,17 @@ def read_header(filename) -> dict:
 
 # utilities
 
+def resample(vol, **kwargs) -> Volume:
+    """ resample volume to a new geometry (see `interp.resample`, requires scipy)
+
+    resample(vol, like=ref)
+    resample(vol, spacing=(1, 1, 1))
+    resample(vol, geometry={...}, method="linear", fill=np.nan)
+    """
+    from . import interp  # lazy import: scipy is optional
+    return interp.resample(vol, **kwargs)
+
+
 def asvolume(obj, ref=None, **kwargs) -> Volume:
     if ref is not None:
         ref = asvolume(ref, **kwargs)

@@ -86,6 +86,78 @@ def test_interpolate_default_mixed_sources():
     assert np.array_equal(out_lab, interp.interpolate_like(SHIFTED, lab, method="nearest"))
 
 
+def test_resample_like():
+    src = Volume(np.random.rand(10, 10, 10), spacing=[1, 2, 3])
+    out = interp.resample(src, like=SHIFTED)
+    assert out.shape == SHIFTED.shape
+    assert out.origin == SHIFTED.origin
+    assert np.array_equal(out, interp.interpolate_like(SHIFTED, src))
+
+
+def test_resample_spacing():
+    src = Volume(np.random.rand(10, 12, 14), spacing=[1, 2, 3], origin=[4, 5, 6])
+    out = interp.resample(src, spacing=(0.5, 1, 1.5))
+    assert out.shape == (19, 23, 27)
+    assert out.spacing == (0.5, 1.0, 1.5)
+    assert np.array_equal(out, interp.interpolate_to({"spacing": (0.5, 1, 1.5)}, src))
+
+
+def test_resample_geometry():
+    src = Volume(np.random.rand(10, 10, 10))
+    geometry = {"origin": (1, 1, 1), "spacing": (2, 2, 2), "shape": (3, 4, 5)}
+    out = interp.resample(src, geometry=geometry)
+    assert out.shape == (3, 4, 5)
+    assert out.origin == (1, 1, 1)
+    # missing shape: target covers the source
+    out = interp.resample(src, geometry={"spacing": (2, 2, 2)})
+    assert out.origin == src.origin
+    assert out.shape == (5, 5, 5)
+
+
+def test_resample_methods():
+    src = Volume(np.random.rand(10, 10, 10))
+    assert np.array_equal(
+        interp.resample(src, like=SHIFTED, method="linear"),
+        interp.interpolate_like(SHIFTED, src, method="spline1"),
+    )
+    roi = Volume(np.random.randint(0, 3, (10, 10, 10)).astype(np.uint8))
+    ref = Volume(np.zeros((20, 20, 20)), spacing=[0.5, 0.5, 0.5])
+    assert np.array_equal(interp.resample(roi, like=ref, method="roi"), interp.interpolate_roi(ref, roi))
+    labels = interp.resample(roi, like=ref, method="labels")
+    assert np.array_equal(labels, interp.interpolate_labels(ref, roi))
+    assert labels.dtype == np.uint8
+    assert labels.spacing == ref.spacing
+    # spacing only, with roi method
+    assert interp.resample(roi, spacing=(0.5, 0.5, 0.5), method="roi").shape == (19, 19, 19)
+
+
+def test_resample_fill():
+    src = Volume(np.random.rand(10, 10, 10))
+    out = interp.resample(src, like=Volume(np.zeros((10, 10, 10)), origin=(-2, 0, 0)), method="linear", fill=np.nan)
+    assert np.all(np.isnan(out[:2]))
+    assert not np.any(np.isnan(out[2:]))
+    with pytest.raises(ValueError):
+        interp.resample(src.astype(int), like=SHIFTED, fill=np.nan)
+
+
+def test_resample_errors():
+    src = Volume(np.random.rand(10, 10, 10))
+    with pytest.raises(ValueError):
+        interp.resample(src)
+    with pytest.raises(ValueError):
+        interp.resample(src, like=src, spacing=(1, 1, 1))
+    with pytest.raises(ValueError):
+        interp.resample(src, like=src, method="cubic")
+
+
+def test_resample_exports():
+    import iomed
+    src = Volume(np.random.rand(10, 10, 10))
+    expected = interp.resample(src, like=SHIFTED)
+    assert np.array_equal(volume.resample(src, like=SHIFTED), expected)
+    assert np.array_equal(iomed.resample(src, like=SHIFTED), expected)
+
+
 def concentric_spheres(vol, center, radii):
     """label map: label i+1 for radius in [radii[i-1], radii[i]["""
     dist = np.linalg.norm(vol.get_coords(np.indices(vol.shape).reshape(3, -1).T) - center, axis=1)

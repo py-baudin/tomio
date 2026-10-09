@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- `resample(vol, like=ref | spacing=... | geometry={...}, method=..., fill=...)`: single entry point for interpolation, in `interp`, `volume` and `iomed`. Methods: `nearest`, `linear`, `splineN`, `roi`, `labels`. The `interpolate*` functions are unchanged.
 - `volume.read_header(filename)`: shape, geometry and metadata, without reading the pixel data.
 - `volume.read(..., dtype=...)`: cast the data.
 - `volume.write(..., compression_level=...)`: compression level (e.g. 1-9 for `.nii.gz`).

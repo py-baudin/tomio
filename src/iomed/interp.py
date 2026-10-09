@@ -68,12 +68,17 @@ def interpolate_to(geometry, src, **kwargs):
     return interpolate(tgt_geom, src_geom, src, **kwargs)
 
 
-def interpolate_roi(ref, roi, *, disjoint=True, axis="auto"):
+def interpolate_roi(ref, roi, *, disjoint=True, axis="auto", method=None):
     """Interpolate mask/ROI into `ref` geometry
 
     when downsampling: use nearest nonzero slice
     args:
         disjoint: if upsampling, keep slices disjoint (no interpolation in the slice axis)
+        axis: slice axis ("auto": guessed from the ROI)
+        method: None: each ROI voxel is copied to the nearest `ref` voxel(s)
+            interpolation method (e.g. "spline1", "spline3"): higher quality upsampling
+            each label (incl. background) is interpolated separately as a binary mask,
+            and each voxel gets the label with the highest interpolated value
     """
     roi = volume.asvolume(roi)
     ref = volume.asvolume(ref)
@@ -105,6 +110,9 @@ def interpolate_roi(ref, roi, *, disjoint=True, axis="auto"):
     else:
         assert axis in list(range(ndim))
 
+    if method is not None:
+        return interpolate_labels(ref, roi, method=method, round_axes=[axis] if disjoint else [])
+
     if np.any(np.array(roi.spacing) > np.array(ref.spacing)):
         # fix upsampling 'gaps'
         pixcoords = apply_transform(Tref, np.ones(3)) - apply_transform(
@@ -134,6 +142,38 @@ def interpolate_roi(ref, roi, *, disjoint=True, axis="auto"):
     new[tuple(indices)] = roi[tuple(nonzero[:, keep])]
 
     return new
+
+
+def interpolate_labels(ref, labelmap, *, method="spline1", round_axes=()):
+    """Interpolate label map into `ref` geometry, label by label
+
+    Each label (incl. background: 0) is interpolated separately as a binary mask;
+    each voxel gets the label with the highest interpolated value.
+    Outside the label map: background.
+
+    args:
+        method: interpolation method (e.g. "spline1", "spline3")
+        round_axes: label map axes in which coordinates are rounded (no interpolation)
+    """
+    if ndimage is None:
+        raise ImportError('`scipy` is required for interpolation')
+    ref = volume.asvolume(ref)
+    labelmap = volume.asvolume(labelmap)
+    order = get_order(method)
+    resample = make_resampler(get_geometry(ref), get_geometry(labelmap), round_axes=round_axes)
+
+    new = np.zeros(ref.shape, dtype=labelmap.dtype)
+    best = np.full(ref.shape, -np.inf, dtype=np.float32)
+    for label in np.union1d([0], labelmap):
+        mask = (labelmap.A == label).astype(np.float32)
+        # outside the label map: background
+        cval = 1.0 if label == 0 else 0.0
+        value = resample(mask, order=order, mode="constant", cval=cval, prefilter=order > 1)
+        update = value > best
+        new[update] = label
+        best[update] = value[update]
+
+    return volume.Volume(new, spacing=ref.spacing, origin=ref.origin, transform=ref.transform)
 
 
 def interpolate(
@@ -174,12 +214,7 @@ def interpolate(
         raise ImportError('`scipy` is required for interpolation')
 
     # interpolation method
-    if order is not None:
-        pass
-    elif method[:-1] == "spline":
-        order = int(method[-1])
-    elif method == "nearest":
-        order = 0
+    order = get_order(method, order)
 
     # extend mode
     try:
@@ -194,49 +229,7 @@ def interpolate(
     elif not mode in ["constant", "nearest", "mirror", "wrap"]:
         raise ValueError('Invalid value for `mode`: "%s"' % mode)
 
-    # target geometry
-    geomt = target_geom
-    shape_t = geomt["shape"]
-
-    offset_t = geomt.get("origin", (0, 0, 0))
-    tmatrix_t = geomt.get("transform", (1, 0, 0, 0, 1, 0, 0, 0, 1))
-    spacing_t = geomt.get("spacing", (1, 1, 1))
-
-    # affine transform
-    Tt = volume.make_affine_transform(offset_t, spacing_t, tmatrix_t)
-
-    # source geometry
-    geoms = source_geom
-    shape_s = geoms["shape"]
-    offset_s = geoms.get("origin", (0, 0, 0))
-    tmatrix_s = geoms.get("transform", (1, 0, 0, 0, 1, 0, 0, 0, 1))
-    spacing_s = geoms.get("spacing", (1, 1, 1))
-
-    # affine transform
-    Ts = volume.make_affine_transform(offset_s, spacing_s, tmatrix_s)
-
-    # transform from target indices to source indices
-    try:
-        M = np.linalg.inv(Ts) @ Tt
-    except np.linalg.LinAlgError as exc:
-        raise InterpolationError(f"Could not inverse transform: {Ts}")
-
-    is_single = np.array(shape_s) == 1
-    if np.any(is_single):
-        # single slice: round coordinates in the slice axis, which cannot
-        # be expressed as an affine transform: compute all coordinates
-        indices = np.indices(shape_t).reshape(3, -1)
-        coords = apply_transform(M, indices)
-        coords[is_single] = np.round(coords[is_single])
-
-        def resample(array, **kwargs):
-            return ndimage.map_coordinates(array, coords, **kwargs).reshape(shape_t)
-    else:
-        # affine transform: only the output is allocated
-        def resample(array, **kwargs):
-            return ndimage.affine_transform(
-                array, M[:3, :3], offset=M[:3, 3], output_shape=tuple(shape_t), **kwargs
-            )
+    resample = make_resampler(target_geom, source_geom)
 
     # do the interpolation
     results = []
@@ -249,7 +242,7 @@ def interpolate(
             mask = resample(isnan.astype(np.uint8), order=0, mode="nearest", prefilter=False)
             res[mask > 0] = np.nan
 
-        results.append(volume.Volume(res, spacing=spacing_t, origin=offset_t, transform=tmatrix_t))
+        results.append(volume.Volume(res, **get_geometry(target_geom, shape=False)))
 
     # return
     if len(sources) == 1:
@@ -257,6 +250,73 @@ def interpolate(
     else:
         return results
 
+
+# utilities
+
+def get_order(method, order=None):
+    """spline order of interpolation method ('nearest', 'spline1', 'spline3'...)"""
+    if order is not None:
+        return order
+    elif method == "nearest":
+        return 0
+    elif method[:-1] == "spline" and method[-1].isdigit():
+        return int(method[-1])
+    raise ValueError(f"Invalid interpolation method: {method}")
+
+
+def get_geometry(obj, shape=True):
+    """geometry dict (origin, spacing, transform, [shape]) of a Volume or dict, with defaults"""
+    if isinstance(obj, dict):
+        geom = {
+            "origin": obj.get("origin", (0, 0, 0)),
+            "spacing": obj.get("spacing", (1, 1, 1)),
+            "transform": obj.get("transform", np.eye(3)),
+        }
+        if shape:
+            geom["shape"] = tuple(obj["shape"])
+    else:
+        geom = {"origin": obj.origin, "spacing": obj.spacing, "transform": obj.transform}
+        if shape:
+            geom["shape"] = obj.shape
+    return geom
+
+
+def make_resampler(target_geom, source_geom, round_axes=()):
+    """return function resample(array, **kwargs) from source to target geometry
+
+    kwargs: passed to scipy.ndimage (order, mode, cval, prefilter)
+    round_axes: source axes in which coordinates are rounded (no interpolation);
+        always includes single-slice axes
+    """
+    target_geom = get_geometry(target_geom)
+    source_geom = get_geometry(source_geom)
+    shape_t = target_geom["shape"]
+
+    # transform from target indices to source indices
+    Tt = volume.make_affine_transform(target_geom["origin"], target_geom["spacing"], target_geom["transform"])
+    Ts = volume.make_affine_transform(source_geom["origin"], source_geom["spacing"], source_geom["transform"])
+    try:
+        M = np.linalg.inv(Ts) @ Tt
+    except np.linalg.LinAlgError as exc:
+        raise InterpolationError(f"Could not inverse transform: {Ts}")
+
+    rounded = np.array(source_geom["shape"][:3]) == 1
+    rounded[list(round_axes)] = True
+    if np.any(rounded):
+        # rounding cannot be expressed as an affine transform: compute all coordinates
+        indices = np.indices(shape_t).reshape(3, -1)
+        coords = apply_transform(M, indices)
+        coords[rounded] = np.round(coords[rounded])
+
+        def resample(array, **kwargs):
+            return ndimage.map_coordinates(array, coords, **kwargs).reshape(shape_t)
+    else:
+        # affine transform: only the output is allocated
+        def resample(array, **kwargs):
+            return ndimage.affine_transform(
+                array, M[:3, :3], offset=M[:3, 3], output_shape=shape_t, **kwargs
+            )
+    return resample
 
 
 def apply_transform(T, coords):

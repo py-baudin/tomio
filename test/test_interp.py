@@ -41,6 +41,50 @@ def test_interpolate_roi_sparse_slices_downsampling():
     assert set(np.unique(nearest)) == {0, 2}
 
 
+def concentric_spheres(vol, center, radii):
+    """label map: label i+1 for radius in [radii[i-1], radii[i]["""
+    dist = np.linalg.norm(vol.get_coords(np.indices(vol.shape).reshape(3, -1).T) - center, axis=1)
+    labels = np.searchsorted(radii, dist, side="right") + 1
+    labels[labels > len(radii)] = 0
+    return Volume(labels.reshape(vol.shape).astype(np.uint8), **vol.header)
+
+
+@pytest.mark.parametrize("method", ["spline1", "spline3"])
+def test_interpolate_roi_upsampling_quality(method):
+    # low resolution label map of concentric spheres, upsampled x2
+    center, radii = (11, 11, 11), [3.5, 6.5, 9]
+    roi = concentric_spheres(Volume(np.zeros((12, 12, 12)), spacing=[2, 2, 2]), center, radii)
+    ref = Volume(np.zeros((23, 23, 23)))
+    truth = concentric_spheres(ref, center, radii)
+
+    default = interp.interpolate_roi(ref, roi, disjoint=False)
+    smooth = interp.interpolate_roi(ref, roi, method=method, disjoint=False)
+    assert smooth.dtype == roi.dtype
+    assert smooth.spacing == ref.spacing
+    assert set(np.unique(smooth)) == {0, 1, 2, 3}  # no intermediate labels
+    # fewer misclassified voxels than the default method
+    assert np.sum(smooth != truth) < np.sum(default != truth)
+
+
+def test_interpolate_roi_upsampling_disjoint():
+    # thick slices: with disjoint=True, labels are not interpolated across slices
+    rng = np.random.default_rng(0)
+    roi = Volume(rng.integers(0, 3, (8, 8, 4)).astype(np.uint8), spacing=[1, 1, 4])
+    ref = Volume(np.zeros((8, 8, 13)))
+    out = interp.interpolate_roi(ref, roi, method="spline1", axis=2, disjoint=True)
+    for z in range(13):
+        assert np.array_equal(out[..., z], roi[..., int(np.round(z / 4))])
+
+
+def test_interpolate_labels_outside():
+    # outside the label map: background
+    labelmap = Volume(np.ones((5, 5, 5), dtype=np.uint8))
+    ref = Volume(np.zeros((9, 9, 9)), origin=[-2, -2, -2])
+    out = interp.interpolate_labels(ref, labelmap, method="spline1")
+    assert np.all(out[2:7, 2:7, 2:7] == 1)
+    assert np.sum(out) == 5**3
+
+
 def last_voxel(vol):
     return vol.get_coords(np.array(vol.shape) - 1)
 

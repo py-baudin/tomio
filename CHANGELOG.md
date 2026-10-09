@@ -7,6 +7,8 @@
 - `volume.read(..., dtype=...)`: cast the data.
 - `volume.write(..., compression_level=...)`: compression level (e.g. 1-9 for `.nii.gz`).
 
+- `interp.interpolate_roi(..., method="spline1")` (or any interpolation method): higher quality upsampling of label maps. Each label is interpolated separately as a binary mask, and each voxel gets the label with the highest value. Also available as `interp.interpolate_labels`.
+
 ### Changed
 - Interpolation uses `scipy.ndimage.affine_transform`: faster, and only the output is allocated (it allocated ~90 bytes per target voxel for coordinates). Single-slice sources still use `map_coordinates`.
 - Require Python >= 3.10 and numpy >= 1.24.

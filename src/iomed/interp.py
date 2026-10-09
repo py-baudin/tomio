@@ -40,6 +40,7 @@ def interpolate_to(geometry, src, **kwargs):
         "origin": src.origin,
         "spacing": src.spacing,
         "transform": src.transform,
+        "shape": src.shape,
     }
 
     if not "origin" in tgt_geom:
@@ -49,22 +50,20 @@ def interpolate_to(geometry, src, **kwargs):
     if not "transform" in tgt_geom:
         tgt_geom["transform"] = src_geom["transform"]
     if not "shape" in tgt_geom:
-        # compute target shape
+        # bounding box of the source voxel centers, in target indices
         Ts = volume.make_affine_transform(src.origin, src.spacing, src.transform)
         Tt = volume.make_affine_transform(
             tgt_geom["origin"], tgt_geom["spacing"], tgt_geom["transform"]
         )
-        idx = np.indices((2,) * ndim).reshape(ndim, -1).T * np.array(src.shape)
+        idx = np.indices((2,) * ndim).reshape(ndim, -1).T * (np.array(src.shape) - 1)
         loc = np.linalg.solve(
             Tt, Ts @ np.concatenate([idx, np.ones((2**ndim, 1))], axis=1).T
         )[:3]
-        shape = np.round(np.max(loc, axis=1) - np.min(loc, axis=1)).astype(int)
-        tgt_geom["shape"] = shape
-        if np.any(np.min(loc, axis=1) < 0):
-            # pad source and shift origin
-            pad = [int(-l + 0.5) if l < 0 else 0 for l in np.min(loc, axis=1)]
-            shift = (Tt @ (-np.array(pad + [-1])))[:3]
-            tgt_geom["origin"] = shift
+        # snap the box to the target grid, and move the origin to its first corner
+        lower = np.round(np.min(loc, axis=1))
+        upper = np.round(np.max(loc, axis=1))
+        tgt_geom["shape"] = tuple((upper - lower).astype(int) + 1)
+        tgt_geom["origin"] = tuple((Tt @ np.r_[lower, 1])[:3])
 
     return interpolate(tgt_geom, src_geom, src, **kwargs)
 

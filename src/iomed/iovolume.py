@@ -4,7 +4,7 @@ import numpy as np
 
 def write_volume(filename, array, *, spacing=None, origin=None, transform=None, metadata=None, use_compression=True):
     array = np.asarray(array)
-    if np.issubdtype(array.dtype, np.bool):
+    if np.issubdtype(array.dtype, np.bool_):
         array = array.astype('uint8')
     im = sitk.GetImageFromArray(array.T)
     if spacing is not None:

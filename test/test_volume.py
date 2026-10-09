@@ -1,4 +1,5 @@
 import pathlib
+import dataclasses
 import numpy as np
 import pytest
 
@@ -249,6 +250,76 @@ def test_volume_permutation_4d():
     # spatial axis moved beyond the first 3 axes: plain array
     for func in [lambda v: v.T, lambda v: np.moveaxis(v, 3, 0), lambda v: v.swapaxes(2, 3)]:
         assert type(func(vol)) is np.ndarray
+
+
+def test_geometry_class():
+    geom = volume.Geometry(shape=(3, 5, 7))
+    assert geom.spacing == (1.0, 1.0, 1.0)
+    assert geom.origin == (0.0, 0.0, 0.0)
+    assert geom.transform == ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+    assert np.allclose(geom.center, (1, 2, 3))
+    assert geom.extent == (3.0, 5.0, 7.0)
+    assert geom.voxel_volume == 1.0
+
+    # normalized values
+    geom = volume.Geometry(shape=np.array([3, 5, 7]), spacing=[1, 2, 3], origin=np.zeros(3), transform=np.diag([2, 1, 1]))
+    assert geom.shape == (3, 5, 7) and type(geom.shape[0]) is int
+    assert geom.spacing == (1.0, 2.0, 3.0)
+    assert geom.transform == ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+    assert geom.extent == (3.0, 10.0, 21.0)
+    assert geom.voxel_volume == 6.0
+    assert np.allclose(geom.center, (1, 4, 9))
+
+    # immutable, hashable
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        geom.spacing = (1, 1, 1)
+    assert geom == volume.Geometry((3, 5, 7), (1, 2, 3))
+    assert len({geom, volume.Geometry((3, 5, 7), (1, 2, 3))}) == 1
+
+    # invalid values
+    for kwargs in [dict(shape=(3, 5)), dict(shape=(3, 5, 7), spacing=(1, 2)), dict(shape=(3, 5, 7), transform=np.eye(2))]:
+        with pytest.raises(ValueError):
+            volume.Geometry(**kwargs)
+
+    # dict
+    assert volume.Geometry.from_dict(geom.to_dict()) == geom
+    assert volume.Geometry.from_dict({"shape": (3, 5, 7), "spacing": (1, 2, 3)}) == geom
+
+
+def test_volume_geometry():
+    vol = oblique_volume((4, 5, 6))
+    geom = vol.geometry
+    assert geom.shape == vol.shape
+    assert (geom.spacing, geom.origin, geom.transform) == (vol.spacing, vol.origin, vol.transform)
+    assert np.allclose(geom.affine, vol.affine)
+    idx = [(0, 0, 0), (1, 2, 3), (3, 4, 5)]
+    assert np.allclose(geom.get_coords(idx), vol.get_coords(idx))
+    assert np.allclose(geom.get_indices(vol.get_coords(idx)), idx)
+    assert np.allclose(geom.center, vol.get_coords([1.5, 2, 2.5]))
+
+    # 4d: geometry of the first 3 axes
+    assert Volume(np.zeros((4, 5, 6, 7)), **vol.header).geometry == geom
+
+    # create volume from geometry
+    vol2 = Volume(np.zeros((4, 5, 6)), geometry=geom)
+    assert vol2.geometry == geom
+    assert Volume(np.zeros((4, 5, 6, 2)), geometry=geom).geometry == geom
+    assert Volume(np.zeros((4, 5, 6)), geometry=geom, spacing=(1, 1, 1)).spacing == (1, 1, 1)  # override
+    assert Volume(np.zeros((4, 5, 6)), geometry=geom.to_dict()).geometry == geom
+    with pytest.raises(ValueError):
+        Volume(np.zeros((4, 5, 5)), geometry=geom)
+
+
+def test_geometry_same_as():
+    vol = oblique_volume((4, 5, 6))
+    geom = vol.geometry
+    assert geom.same_as(vol)
+    assert geom.same_as(geom.to_dict())
+    assert geom.same_as(dataclasses.replace(geom, origin=np.add(geom.origin, 1e-5)))
+    assert not geom.same_as(dataclasses.replace(geom, origin=np.add(geom.origin, 1e-3)))
+    assert geom.same_as(dataclasses.replace(geom, origin=np.add(geom.origin, 1e-3)), tol=1e-2)
+    assert not geom.same_as(dataclasses.replace(geom, shape=(4, 5, 7)))
+    assert not geom.same_as(vol[::-1])
 
 
 def test_volume_utils():

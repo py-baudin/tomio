@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import pathlib
+import dataclasses
 import numpy as np
 import numpy.typing as npt
 from . import imagefile
@@ -96,6 +97,115 @@ def tovolume(values, mask=None, *, ref=None, **kwargs) -> Volume:
     return vol
 
 
+@dataclasses.dataclass(frozen=True)
+class Geometry:
+    """ geometry of a 3d volume (or of the first 3 axes of a N-d volume)
+
+    shape: spatial shape (x, y, z)
+    spacing: voxel size
+    origin: world coordinates of voxel (0, 0, 0)
+    transform: world directions of the array axes (columns of the ITK direction matrix)
+    """
+    shape: tuple[int, int, int]
+    spacing: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    origin: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    transform: tuple[tuple[float, float, float], ...] = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+
+    def __post_init__(self):
+        # validate and normalize (same rules as Volume)
+        shape = tuple(int(n) for n in self.shape)
+        if len(shape) != 3:
+            raise ValueError(f"Invalid shape (3 values expected): {self.shape}")
+        values = dict(shape=shape, spacing=_check_vector(self.spacing, "spacing"), origin=_check_vector(self.origin, "origin"))
+        values["transform"] = _check_transform(self.transform)
+        for name, value in values.items():
+            object.__setattr__(self, name, value)
+
+    @classmethod
+    def from_dict(cls, dct):
+        """ geometry from a dict with keys: shape, [spacing, origin, transform] """
+        return cls(**{key: dct[key] for key in ("shape", "spacing", "origin", "transform") if key in dct})
+
+    def to_dict(self):
+        return dataclasses.asdict(self)
+
+    @property
+    def affine(self):
+        return make_affine_transform(self.origin, self.spacing, self.transform)
+
+    @property
+    def extent(self) -> tuple[float, float, float]:
+        """ size covered by the voxels along each axis (shape * spacing) """
+        return tuple(float(n * s) for n, s in zip(self.shape, self.spacing))
+
+    @property
+    def center(self) -> npt.NDArray[np.floating]:
+        """ world coordinates of the volume center """
+        return self.get_coords((np.array(self.shape) - 1) / 2)
+
+    @property
+    def voxel_volume(self) -> float:
+        return float(np.prod(self.spacing))
+
+    def get_coords(self, indices):
+        """compute real-world coordinates of a sequence of pixels"""
+        return get_coords(self.affine, indices)
+
+    def get_indices(self, coords):
+        """compute pixel indices of a sequence of real-world coordinates"""
+        return get_indices(self.affine, coords)
+
+    def same_as(self, other, tol=1e-4) -> bool:
+        """ same shape, and same spacing, origin and transform up to `tol` """
+        other = as_geometry(other)
+        return self.shape == other.shape and all(
+            np.allclose(getattr(self, name), getattr(other, name), rtol=0, atol=tol)
+            for name in ("spacing", "origin", "transform")
+        )
+
+
+def as_geometry(obj) -> Geometry:
+    """ Geometry from a Geometry, a Volume or a dict """
+    if isinstance(obj, Geometry):
+        return obj
+    elif isinstance(obj, dict):
+        return Geometry.from_dict(obj)
+    return asvolume(obj).geometry
+
+
+def _check_vector(values, name):
+    values = list(values)
+    if len(values) != 3:
+        raise ValueError(f"Invalid {name} (3 values expected): {values}")
+    return tuple(float(v) for v in values)
+
+
+def _check_transform(transform):
+    """ normalized transform: tuple of 3 axis directions """
+    if np.size(transform) != 9:
+        raise ValueError(f"Invalid transform (9 values expected): {transform}")
+    transform = np.array(transform, dtype=float).reshape(3, 3)
+    norm = np.linalg.norm(transform, axis=1, keepdims=True)
+    norm[np.isclose(norm, 0)] = 1
+    return tuple(tuple(map(float, vec)) for vec in (transform / norm))
+
+
+def get_coords(affine, indices):
+    """compute real-world coordinates of a sequence of pixels"""
+    is_flat = np.isscalar(indices[0])
+    indices = np.atleast_2d(indices)
+    coords = affine @ np.c_[indices, np.ones(len(indices))].T
+    return coords[:3, 0] if is_flat else coords[:3].T
+
+
+def get_indices(affine, coords):
+    """compute pixel indices of a sequence of real-world coordinates"""
+    is_flat = np.isscalar(coords[0])
+    coords = np.atleast_2d(coords)
+    indices = np.linalg.solve(affine, np.c_[coords, np.ones(len(coords))].T)
+    return indices[:3, 0] if is_flat else indices[:3].T
+
+
 class Volume(np.ndarray):
     """ 3D Volume class
 
@@ -112,10 +222,17 @@ class Volume(np.ndarray):
         origin: npt.NDArray[np.floating] | None = None,
         transform: npt.NDArray[np.floating] | None = None,
         metadata: dict[str, str] | None = None,
-        **kwargs, 
+        geometry: Geometry | None = None,
+        **kwargs,
     ) -> Volume:
-        
+
         array = np.asanyarray(data, **kwargs).view(cls)
+        if geometry is not None:
+            # explicit spacing/origin/transform override the geometry
+            geometry = as_geometry(geometry)
+            if array.shape[:3] != geometry.shape:
+                raise ValueError(f"Shape mismatch: data {array.shape}, geometry {geometry.shape}")
+            array.spacing, array.origin, array.transform = geometry.spacing, geometry.origin, geometry.transform
         if spacing is not None:
             array.spacing = spacing
         if origin is not None:
@@ -279,13 +396,7 @@ class Volume(np.ndarray):
 
     @spacing.setter
     def spacing(self, spacing: tuple[float] | None) -> None:
-        if spacing is None:
-            spacing = [1.0] * 3
-        else:
-            spacing = list(spacing)
-            if len(spacing) != 3:
-                raise ValueError
-        self._spacing = tuple(float(v) for v in spacing)
+        self._spacing = _check_vector([1.0] * 3 if spacing is None else spacing, "spacing")
 
     @property
     def origin(self) -> tuple[float]:
@@ -293,13 +404,7 @@ class Volume(np.ndarray):
 
     @origin.setter
     def origin(self, origin: tuple[float] | None) -> None:
-        if origin is None:
-            origin = [0.0] * 3
-        else:
-            origin = list(origin)
-            if len(origin) != 3:
-                raise ValueError
-        self._origin = tuple(float(v) for v in origin)
+        self._origin = _check_vector([0.0] * 3 if origin is None else origin, "origin")
 
     @property
     def transform(self) -> tuple[tuple[float]]:
@@ -307,16 +412,8 @@ class Volume(np.ndarray):
 
     @transform.setter
     def transform(self, transform: tuple[tuple[float]] | None) -> None:
-        if transform is None:
-            transform = np.eye(3)
-        else:
-            if np.size(transform) != 9:
-                raise ValueError
-            transform = np.array(transform).reshape(3, 3)
-        norm = np.linalg.norm(transform, axis=1, keepdims=True)
-        norm[np.isclose(norm, 0)] = 1
-        # store in column major order
-        self._orientation = tuple(tuple(map(float, vec)) for vec in (transform / norm))
+        # store as a sequence of columns (axis directions)
+        self._orientation = _check_transform(np.eye(3) if transform is None else transform)
 
     @property
     def metadata(self) -> dict[str, str]:
@@ -337,6 +434,11 @@ class Volume(np.ndarray):
         return self._get_volume_attrs(self)
 
     @property
+    def geometry(self) -> Geometry:
+        """ geometry of the first 3 axes """
+        return Geometry(shape=self.shape[:3], spacing=self.spacing, origin=self.origin, transform=self.transform)
+
+    @property
     def anatomical_orientation(self) -> str:
         return get_orientation(self)
     
@@ -347,17 +449,11 @@ class Volume(np.ndarray):
         
     def get_coords(self, indices):
         """compute real-world coordinates of a sequence of pixels"""
-        is_flat = np.isscalar(indices[0])
-        indices = np.atleast_2d(indices)
-        coords = self.affine @ np.c_[indices, np.ones(len(indices))].T
-        return coords[:3, 0] if is_flat else coords[:3].T
+        return get_coords(self.affine, indices)
 
     def get_indices(self, coords):
-        """compute real-world coordinates of a sequence of pixels"""
-        is_flat = np.isscalar(coords[0])
-        coords = np.atleast_2d(coords)
-        indices = np.linalg.solve(self.affine, np.c_[coords, np.ones(len(coords))].T)
-        return indices[:3, 0] if is_flat else indices[:3].T    
+        """compute pixel indices of a sequence of real-world coordinates"""
+        return get_indices(self.affine, coords)
     
 
 

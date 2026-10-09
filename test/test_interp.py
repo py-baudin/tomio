@@ -150,6 +150,20 @@ def test_resample_errors():
         interp.resample(src, like=src, method="cubic")
 
 
+def test_interp_geometry_objects():
+    # Geometry objects are accepted in place of geometry dicts
+    src = Volume(np.random.rand(10, 10, 10), spacing=[1, 2, 3])
+    geom = SHIFTED.geometry
+    expected = interp.interpolate_like(SHIFTED, src)
+    assert np.array_equal(interp.interpolate(geom, src.geometry, src), expected)
+    assert np.array_equal(interp.interpolate_to(geom, src), expected)
+    assert np.array_equal(interp.resample(src, geometry=geom), expected)
+    assert np.array_equal(interp.resample(src, like=geom), expected)
+    assert interp.resample(src, like=geom).geometry == geom
+    roi = Volume(np.random.randint(0, 3, (10, 10, 10)).astype(np.uint8))
+    assert np.array_equal(interp.resample(roi, like=geom, method="labels"), interp.resample(roi, like=SHIFTED, method="labels"))
+
+
 def test_resample_exports():
     import iomed
     src = Volume(np.random.rand(10, 10, 10))

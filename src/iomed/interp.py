@@ -23,9 +23,9 @@ def resample(vol, *, like=None, spacing=None, geometry=None, method=None, fill=0
     """Resample volume to a new geometry
 
     target geometry (one of):
-        like: Volume, use its geometry
+        like: Volume or Geometry, use its geometry
         spacing: new spacing, same extent
-        geometry: dict with origin/spacing/transform/shape (missing values: from `vol`;
+        geometry: Geometry, or dict with origin/spacing/transform/shape (missing values: from `vol`;
             missing shape: the target covers `vol`)
 
     method:
@@ -47,7 +47,7 @@ def resample(vol, *, like=None, spacing=None, geometry=None, method=None, fill=0
     vol = volume.asvolume(vol)
 
     if like is not None:
-        target = get_geometry(volume.asvolume(like))
+        target = get_geometry(like if isinstance(like, volume.Geometry) else volume.asvolume(like))
     elif spacing is not None:
         target = complete_geometry({"spacing": spacing}, vol)
     else:
@@ -90,6 +90,8 @@ def complete_geometry(geometry, src):
     """
     src = volume.asvolume(src)
     ndim = 3
+    if isinstance(geometry, volume.Geometry):
+        return geometry.to_dict()
     tgt_geom = dict(geometry)
 
     if not "origin" in tgt_geom:
@@ -334,7 +336,9 @@ def get_order(method, order=None):
 
 
 def get_geometry(obj, shape=True):
-    """geometry dict (origin, spacing, transform, [shape]) of a Volume or dict, with defaults"""
+    """geometry dict (origin, spacing, transform, [shape]) of a Volume, Geometry or dict, with defaults"""
+    if isinstance(obj, volume.Geometry):
+        obj = obj.to_dict()
     if isinstance(obj, dict):
         geom = {
             "origin": obj.get("origin", (0, 0, 0)),

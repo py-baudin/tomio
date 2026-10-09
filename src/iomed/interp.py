@@ -215,41 +215,41 @@ def interpolate(
     # affine transform
     Ts = volume.make_affine_transform(offset_s, spacing_s, tmatrix_s)
 
-    # calculate coords
-    indi, indj, indk = np.indices(shape_t)
-
-    # locations in space of indices
-    pos = Tt.dot(
-        np.r_[[indi.ravel()], [indj.ravel()], [indk.ravel()], [np.ones(indi.size)]]
-    )
-
-    # coordinates in pixels
+    # transform from target indices to source indices
     try:
-        invTs = np.linalg.inv(Ts)
+        M = np.linalg.inv(Ts) @ Tt
     except np.linalg.LinAlgError as exc:
         raise InterpolationError(f"Could not inverse transform: {Ts}")
-    coords = invTs.dot(pos)[:3, :]
 
-    # single slice: round coordinates
     is_single = np.array(shape_s) == 1
-    coords[is_single] = np.round(coords[is_single])
+    if np.any(is_single):
+        # single slice: round coordinates in the slice axis, which cannot
+        # be expressed as an affine transform: compute all coordinates
+        indices = np.indices(shape_t).reshape(3, -1)
+        coords = apply_transform(M, indices)
+        coords[is_single] = np.round(coords[is_single])
+
+        def resample(array, **kwargs):
+            return ndimage.map_coordinates(array, coords, **kwargs).reshape(shape_t)
+    else:
+        # affine transform: only the output is allocated
+        def resample(array, **kwargs):
+            return ndimage.affine_transform(
+                array, M[:3, :3], offset=M[:3, 3], output_shape=tuple(shape_t), **kwargs
+            )
 
     # do the interpolation
     results = []
     for vol in sources:
         isnan = np.isnan(vol)
         vol = np.where(isnan, 0, vol)  # copy: do not modify the input
-        res = ndimage.map_coordinates(
-            vol, coords, order=order, mode=mode, cval=const_value, prefilter=True
-        ).reshape(shape_t)
+        res = resample(vol, order=order, mode=mode, cval=const_value, prefilter=order > 1)
 
         if np.any(isnan):
-            mask = ndimage.map_coordinates(
-                isnan, coords, order=0, mode="nearest", prefilter=False
-            )
-            res[mask.reshape(shape_t) > 0.5] = np.nan
+            mask = resample(isnan.astype(np.uint8), order=0, mode="nearest", prefilter=False)
+            res[mask > 0] = np.nan
 
-        results.append(volume.Volume(res, spacing=geomt['spacing'], origin=geomt['origin'], transform=geomt['transform']))
+        results.append(volume.Volume(res, spacing=spacing_t, origin=offset_t, transform=tmatrix_t))
 
     # return
     if len(sources) == 1:

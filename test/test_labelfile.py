@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """ test io.Labels """
 
+import types
 import numpy as np
 import pytest
 
@@ -137,17 +138,17 @@ def test_labels_load_alpha(tmp_path, alpha):
 
 
 @pytest.mark.parametrize(
-    "content",
+    "content, line",
     [
-        '1   250  255  228        1  |  1    "a"\n',  # invalid visibility
-        LINE + LINE.replace('"a"', '"b"'),  # duplicate index
-        '1   256  255  228        1  1  1    "a"\n',  # invalid color
+        ('1   250  255  228        1  |  1    "a"\n', 2),  # invalid visibility
+        (LINE + LINE.replace('"a"', '"b"'), 3),  # duplicate index
+        ('1   256  255  228        1  1  1    "a"\n', 2),  # invalid color
     ],
 )
-def test_labels_load_errors(tmp_path, content):
+def test_labels_load_errors(tmp_path, content, line):
     filename = tmp_path / "labels.txt"
     filename.write_text("# header\n" + content)
-    with pytest.raises(labelfile.LabelFileError, match="line 2"):
+    with pytest.raises(labelfile.LabelFileError, match=f"line {line}:"):
         labelfile.read(filename)
 
 
@@ -196,6 +197,47 @@ def test_labels_palette():
     assert len(Labels({1: "a", 255: "b"}).palette) == 256 * 3
     with pytest.raises(ValueError):
         Labels({256: "a"}).palette
+
+
+def test_labels_init():
+    assert len(Labels()) == 0
+    assert Labels(types.MappingProxyType({1: "a"}))[1] == "a"
+    with pytest.raises(TypeError):
+        Labels([(1, "a")])
+
+
+def test_labels_mutable_mapping():
+    labels = Labels()
+    labels.update({1: "a", 2: "b"})
+    assert dict(labels) == {1: "a", 2: "b"}
+    assert labels.setdefault(1, "z") == "a"
+    assert labels.get(3) is None
+    del labels[2]
+    assert list(labels) == [1]
+    labels.clear()
+    assert len(labels) == 0
+
+
+def test_labels_eq():
+    labels = Labels({1: "a"})
+    assert labels == Labels({1: "a"})
+    assert labels != Labels({1: {"LABEL": "a", "RGBA": (1, 2, 3, 1)}})  # colors differ
+    assert labels == {1: "a"}  # plain mapping: descriptions only
+    assert labels != {1: "b"}
+    assert labels != None
+    assert labels != 3
+
+
+def test_labels_save(tmp_path):
+    labels = Labels({1: "a", 2: "b"})
+    labels.save(tmp_path / "1.txt")
+    Labels.save(tmp_path / "2.txt", labels)
+    Labels.save(tmp_path / "3.txt", {1: "a", 2: "b"})
+    labelfile.write(tmp_path / "4.txt", labels)
+    for i in range(1, 5):
+        assert labelfile.read(tmp_path / f"{i}.txt") == labels
+    with pytest.raises(TypeError):
+        Labels.save(tmp_path / "5.txt", [(1, "a")])
 
 
 def test_labels_pop():

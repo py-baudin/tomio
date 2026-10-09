@@ -7,6 +7,10 @@
 - scipy is now an optional extra: `pip install iomed[interp]` (also included in the `test` extra).
 - `iomed.interp` is available as an attribute of the package (imported lazily).
 
+- `Labels` is a full mutable mapping (`update`, `setdefault`, `clear`, `popitem`...); `Labels()` creates an empty object and any mapping is accepted as input.
+- `labels.save(filename)` works on an instance (it raised `TypeError`); `Labels.save(filename, labels)` still works.
+- `Labels` can be compared with a plain mapping (descriptions only), e.g. `labels == {1: "a"}`.
+
 ### Fixed
 - Writing boolean volumes no longer uses the removed `np.bool` alias.
 - `interp.interpolate_to` no longer crashes (`KeyError: 'shape'`).
@@ -24,4 +28,5 @@
 ### Changed (breaking)
 - `Labels.pop(index)` returns the label description (was: the full info dict), consistent with `labels[index]`.
 - `Labels` validates its input: indices must be non-negative integers (numpy integers accepted), RGB values integers in 0..255, alpha in 0..1, a description (LABEL) is required, and unknown fields are rejected.
+- `Labels(...)` and `Labels.save(...)` raise `TypeError` (was `ValueError`) when the input is not a mapping. `Labels.re_parse_label` is removed.
 - Label files are read and written as UTF-8 (was: the system default encoding). Files with non-ASCII labels saved by earlier versions on Windows must be re-encoded.

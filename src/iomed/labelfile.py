@@ -3,12 +3,27 @@
 
 import re
 import numbers
+import functools
 import itertools
 from collections import abc
 
 
 class LabelFileError(ValueError, RuntimeError):
     """invalid label file (also a RuntimeError, for backward compatibility)"""
+
+
+class _hybridmethod:
+    """method callable on the class: `Cls.meth(cls, ..., labels)`,
+    or on an instance: `obj.meth(...)` (the instance is passed as `labels`)"""
+
+    def __init__(self, func):
+        self.func = func
+        functools.update_wrapper(self, func)
+
+    def __get__(self, obj, cls=None):
+        if obj is None:
+            return functools.partial(self.func, cls)
+        return functools.partial(self.func, type(obj), labels=obj)
 
 COLOR_MAP = [
     [228, 26, 28],
@@ -48,34 +63,34 @@ def write(filename, labels, **kwargs):
     return Labels.save(filename, labels, **kwargs)
 
 
-class Labels(abc.Mapping):
-    """dict-like class containing the ROI labels
+class Labels(abc.MutableMapping):
+    """dict-like class containing the ROI labels: {index: description}
+
+    Indices are non-negative integers; iteration is sorted by index.
+    Each label also has a color (RGBA) and visibility flags (VIS, MSH).
 
     # create
-    # using an (index, decsription) dict
-    labels = Labels({1: "label_1", 2: "label_2"})
-    labels = Labels.load(filename) # load a label file
+    labels = Labels({1: "label_1", 2: "label_2"})  # colors set automatically
+    labels = Labels({1: {"LABEL": "label_1", "RGBA": (255, 0, 0, 1.0)}})
+    labels = Labels.load(filename)  # or labelfile.read(filename)
 
     # save
-    labels.save(filename) # save labels to file
-    Labels.save(filename, labels) # save labels to file
+    labels.save(filename)  # or Labels.save(filename, labels), labelfile.write(filename, labels)
 
     # access
-    name = labels[1] # get description for index 1
+    name = labels[1]  # description of index 1
+    index = labels.getindex("label_1")  # index of a description
+    labels.indices, labels.descriptions  # sorted by index
+    rgba = labels.colors[1]  # (R, G, B, A) of index 1
 
-    name = labels.descriptions[0] # get first label description
-    index = labels.indices[0] # get first index value
-    rgba = labels.rgba[0] # get first label rgba tuple
-
-    # set
-    labels.name[1] = "another name"
-    etc.
-
+    # modify (same as a dict)
+    labels[1] = "another name"  # keeps color
+    labels.set(3, {"LABEL": "label_3", "RGBA": (0, 255, 0, 1.0)})
+    del labels[3]
     """
 
     # any character except double quotes
     label_re_syntax = r"(?P<name>[^\"]*)"
-    re_parse_label = re.compile(label_re_syntax)
     re_parse_line = re.compile(
         (
             r"^\s*(?P<index>\d+)"
@@ -132,13 +147,14 @@ class Labels(abc.Mapping):
 
         return labels
 
-    @classmethod
+    @_hybridmethod
     def save(cls, filename, labels, **kwargs):
-        """save labels to file"""
-        if isinstance(labels, dict):
+        """save labels to file
+
+        Labels.save(filename, labels) or labels.save(filename)
+        """
+        if not isinstance(labels, cls):
             labels = cls(labels, **kwargs)
-        elif not isinstance(labels, cls):
-            raise ValueError("Invalid type for labels: %s" % labels)
 
         with open(filename, "w", encoding="utf-8") as f:
             # write preamble
@@ -155,9 +171,10 @@ class Labels(abc.Mapping):
                 )
                 f.write(line)
 
-    def __init__(self, labels, *, allow_duplicates=None):
+    def __init__(self, labels=None, *, allow_duplicates=None):
         """init label object
 
+        labels: mapping {index: description or info dict}, or Labels object (copied)
         allow_duplicates: default False (or copied from `labels` if it is a Labels object)
         """
         if allow_duplicates is None:
@@ -168,10 +185,12 @@ class Labels(abc.Mapping):
         if isinstance(labels, Labels):
             self.data = {index: dict(info) for index, info in labels.data.items()}
             return
-        elif not isinstance(labels, dict):
-            raise ValueError("A dict is required")
+        elif labels is None:
+            labels = {}
+        elif not isinstance(labels, abc.Mapping):
+            raise TypeError("A mapping {index: description} is required, not: %r" % (labels,))
         self.data = {}
-        
+
         for index in sorted(labels):
             self.set(index, labels[index])
 
@@ -212,7 +231,13 @@ class Labels(abc.Mapping):
         return iter(sorted(self.data))
 
     def __eq__(self, other):
-        return self.data == other.data
+        if isinstance(other, Labels):
+            # compare everything (descriptions, colors, visibility)
+            return self.data == other.data
+        elif isinstance(other, abc.Mapping):
+            # compare descriptions only
+            return dict(self.items()) == dict(other.items())
+        return NotImplemented
 
     def __contains__(self, index):
         return index in self.data
@@ -224,18 +249,10 @@ class Labels(abc.Mapping):
     def __setitem__(self, index, descr):
         """set label description"""
         self.set(index, descr)
-        # self.data[index]["LABEL"] = descr
 
     def __delitem__(self, index):
         del self.data[index]
 
-    def get(self, index, default=None):
-        """get label description"""
-        try:
-            return self[index]
-        except KeyError:
-            return default
-        
     def set(self, index, value):
         """ add or update label
 
@@ -288,14 +305,6 @@ class Labels(abc.Mapping):
             "MSH": int(meshvis),
         }
         
-    def pop(self, index, *default):
-        """remove label and return its description (same signature as dict.pop)"""
-        if len(default) > 1:
-            raise TypeError(f"pop expected at most 2 arguments, got {1 + len(default)}")
-        if index not in self.data and default:
-            return default[0]
-        return self.data.pop(index)["LABEL"]
-
     def getindex(self, name):
         """return index of given name (reverse of .__getitem__)"""
         return {self.data[index]["LABEL"]: index for index in self.indices}[name]

@@ -88,6 +88,15 @@ def test_labels_roundtrip(tmp_path, descr):
     assert labelfile.read(filename) == labels
 
 
+def test_labels_pop():
+    labels = Labels({1: "a", 2: "b"})
+    assert labels.pop(99, None) is None
+    with pytest.raises(KeyError):
+        labels.pop(99)
+    assert labels.pop(1)["LABEL"] == "a"
+    assert list(labels) == [2]
+
+
 def test_labels_invalid_description():
     for descr in ['a"b', "a\nb", "a\rb"]:
         with pytest.raises(ValueError):

@@ -261,8 +261,9 @@ class Labels(abc.Mapping):
             "MSH": meshvis,
         }
         
-    def pop(self, index, **kwargs):
-        return self.data.pop(index, **kwargs)
+    def pop(self, index, *default):
+        """remove label and return its info (same signature as dict.pop)"""
+        return self.data.pop(index, *default)
 
     def getindex(self, name):
         """return index of given name (reverse of .__getitem__)"""

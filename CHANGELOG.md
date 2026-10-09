@@ -3,6 +3,12 @@
 ## Unreleased
 
 ### Added
+- Command-line interface `iomed` (also `python -m iomed`):
+  - `iomed convert IN OUT [--dtype DTYPE] [--compression-level N]`: convert image files (format from the extensions), keeping geometry, metadata, vector and complex pixels.
+  - `iomed resample IN OUT (--like REF | --spacing SX SY SZ) [--method nearest|linear|spline3|labels|roi] [--fill VALUE]`.
+  - `iomed info IN [--metadata]`: shape, pixel type and geometry (header only).
+  - Existing output files are not overwritten without `--force`; errors are reported without traceback (exit code 1; usage errors: 2).
+- `imagefile.convert_image` and `imagefile.read_info` (pixel type, number of components, dimension).
 - `configfile.read` reads TOML files (`.toml`, read-only), with `tomllib` (Python >= 3.11) or `tomli`.
 - Labels:
   - `Labels(["a", "b"])`: from a sequence of descriptions (indices 0, 1...); `indices=` and `colors=` arguments.
@@ -26,6 +32,7 @@
 - Interpolation backends (`backend=` argument of the interpolation functions and `resample`):
   - `"sitk"` (default): SimpleITK, multithreaded (~1.5-2x faster than scipy), no scipy needed. Voxels are inside the source up to half a voxel beyond the border voxel centers (scipy: up to the border voxel centers), so border voxels can differ from previous versions; inside the volume, results are identical.
   - `"scipy"`: `scipy.ndimage.affine_transform` (was: `map_coordinates` with all target coordinates, ~90 bytes per target voxel); single-slice sources use `map_coordinates`.
+  - Complex data: real and imaginary parts are interpolated separately (supported by both backends); the fill value applies to the real part.
   - Default backend: scipy is used automatically (if installed) for what SimpleITK does not support: modes `"mirror"`, `"wrap"`, and `disjoint=True` with `interpolate_roi(..., method=...)`.
 - Require Python >= 3.10 and numpy >= 1.24.
 - scipy is now an optional extra: `pip install iomed[interp]` (also included in the `test` extra); interpolation works without it (SimpleITK backend).

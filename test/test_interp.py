@@ -233,6 +233,19 @@ def test_sitk_backend_labels_resample():
     assert interp.interpolate_roi(ref, roi, method="spline1", disjoint=False, backend="sitk").shape == ref.shape
 
 
+@pytest.mark.parametrize("backend", ["sitk", pytest.param("scipy", marks=needs_scipy)])
+@pytest.mark.parametrize("dtype", [np.complex64, np.complex128])
+def test_interpolate_complex(backend, dtype):
+    src = Volume((np.random.rand(10, 10, 10) + 1j * np.random.rand(10, 10, 10)).astype(dtype))
+    tgt = Volume(np.zeros((10, 10, 10)), origin=(-2.5, 0.3, 0))
+    out = interp.interpolate_like(tgt, src, method="linear", cval=-1, backend=backend)
+    assert out.dtype == dtype
+    real = interp.interpolate_like(tgt, src.real, method="linear", cval=-1, backend=backend)
+    imag = interp.interpolate_like(tgt, src.imag, method="linear", cval=0, backend=backend)
+    assert np.allclose(out, real + 1j * imag)
+    assert np.all(out[0] == -1)  # outside: fill value (real part)
+
+
 def test_default_backend():
     assert interp.DEFAULT_BACKEND == "sitk"
     src = Volume(np.random.rand(10, 10, 10))

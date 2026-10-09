@@ -91,6 +91,39 @@ def read_header(filename):
     return dict(shape=shape, **get_header(reader))
 
 
+def convert_image(source, target, *, dtype=None, use_compression=True, compression_level=None):
+    """convert image file to another format (from the file extensions)
+
+    pixel data, geometry, metadata, vector and complex pixels are kept
+    dtype: cast pixel values (numpy dtype)
+    """
+    im = sitk.ReadImage(str(source))
+    if dtype is not None:
+        array = sitk.GetArrayFromImage(im).astype(dtype)
+        is_vector = im.GetNumberOfComponentsPerPixel() > 1 and array.ndim > im.GetDimension()
+        cast = sitk.GetImageFromArray(array, isVector=is_vector)
+        cast.CopyInformation(im)
+        for key in im.GetMetaDataKeys():
+            cast.SetMetaData(key, im.GetMetaData(key))
+        im = cast
+    if compression_level is None:
+        sitk.WriteImage(im, str(target), useCompression=use_compression)
+    else:
+        sitk.WriteImage(im, str(target), useCompression=True, compressionLevel=compression_level)
+
+
+def read_info(filename):
+    """pixel type (e.g. "32-bit float"), number of components and image dimension (header only)"""
+    reader = sitk.ImageFileReader()
+    reader.SetFileName(str(filename))
+    reader.ReadImageInformation()
+    return dict(
+        pixel_type=sitk.GetPixelIDValueAsString(reader.GetPixelID()),
+        components=reader.GetNumberOfComponents(),
+        dimension=reader.GetDimension(),
+    )
+
+
 def get_header(src):
     """3d geometry and metadata of a sitk Image or ImageFileReader"""
     ndim = src.GetDimension()

@@ -299,7 +299,14 @@ def interpolate(
         else:
             isnan = None
 
-        res = resample(vol, order=vol_order, mode=mode, cval=const_value, prefilter=vol_order > 1)
+        options = dict(order=vol_order, mode=mode, cval=const_value, prefilter=vol_order > 1)
+        if np.iscomplexobj(vol):
+            # real and imaginary parts separately (complex data: not supported by SimpleITK)
+            # fill value: real part (NaN: both parts)
+            imag_cval = const_value if np.isnan(const_value) else 0.0
+            res = resample(vol.real, **options) + 1j * resample(vol.imag, **dict(options, cval=imag_cval))
+        else:
+            res = resample(vol, **options)
         if isnan is not None:
             mask = resample(isnan.astype(np.uint8), order=0, mode="nearest", prefilter=False)
             res[mask > 0] = np.nan

@@ -193,17 +193,31 @@ class Volume(np.ndarray):
         if not isinstance(result, np.ndarray) or result.ndim == 0:
             return result
         if method == "reduce":
-            vol = inputs[0]
-            axis = kwargs.get("axis", 0)
-            axes = range(vol.ndim) if axis is None else np.atleast_1d(axis) % vol.ndim
-            if vol.ndim < 3 or any(ax < 3 for ax in axes):
-                return result
-            return Volume(result, **vol.header)
+            return inputs[0]._wrap_reduction(result, kwargs.get("axis", 0))
         elif method in ("__call__", "accumulate"):
             for vol in inputs:
                 if isinstance(vol, Volume) and vol.shape == result.shape:
                     return Volume(result, **vol.header)
         return result
+
+    def _wrap_reduction(self, result, axis):
+        """ result of a reduction of self over `axis`: Volume if only non-spatial axes are reduced """
+        if not isinstance(result, np.ndarray) or result.ndim == 0:
+            return result
+        axes = range(self.ndim) if axis is None else np.atleast_1d(axis) % self.ndim
+        if self.ndim < 3 or any(ax < 3 for ax in axes):
+            return result.view(np.ndarray)
+        return Volume(result, **self.header)
+
+    # reductions which are not ufuncs
+
+    def argmax(self, axis=None, out=None, **kwargs):
+        result = super().argmax(axis=axis, out=out, **kwargs)
+        return result if out is not None else self._wrap_reduction(result, axis)
+
+    def argmin(self, axis=None, out=None, **kwargs):
+        result = super().argmin(axis=axis, out=out, **kwargs)
+        return result if out is not None else self._wrap_reduction(result, axis)
 
     # axis permutations
 

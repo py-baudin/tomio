@@ -140,6 +140,12 @@ def oblique_volume(shape):
         lambda v: np.std(v, axis=1),
         lambda v: np.add.reduce(v),  # default axis: 0
         lambda v: np.median(v, axis=0),
+        # not ufuncs
+        lambda v: v.argmax(axis=0),
+        lambda v: np.argmin(v, axis=2),
+        lambda v: v.argmax(axis=1, keepdims=True),
+        lambda v: np.nanargmax(v, axis=0),
+        lambda v: np.percentile(v, 50, axis=0),
     ],
 )
 def test_volume_reduction_spatial(func):
@@ -151,12 +157,22 @@ def test_volume_reduction_spatial(func):
 
 def test_volume_reduction_all():
     vol = oblique_volume((4, 5, 6))
-    for out in [vol.sum(), vol.mean(), np.max(vol), vol.std()]:
+    for out in [vol.sum(), vol.mean(), np.max(vol), vol.std(), vol.argmax(), np.argmin(vol)]:
         assert not isinstance(out, Volume)
         assert np.ndim(out) == 0
 
 
-@pytest.mark.parametrize("func", [lambda v: v.mean(axis=3), lambda v: v.sum(axis=-1), lambda v: np.max(v, axis=3)])
+@pytest.mark.parametrize(
+    "func",
+    [
+        lambda v: v.mean(axis=3),
+        lambda v: v.sum(axis=-1),
+        lambda v: np.max(v, axis=3),
+        lambda v: v.argmax(axis=3),
+        lambda v: np.argmin(v, axis=-1),
+        lambda v: np.var(v, axis=3),
+    ],
+)
 def test_volume_reduction_non_spatial(func):
     # reduction over non-spatial axes: geometry kept
     vol = oblique_volume((4, 5, 6, 7))
@@ -166,6 +182,13 @@ def test_volume_reduction_non_spatial(func):
     assert out.header == vol.header
     assert np.allclose(out, func(vol.A))
     assert type(vol.sum(axis=(2, 3))) is np.ndarray
+
+
+def test_volume_argmax_out():
+    vol = oblique_volume((4, 5, 6))
+    out = np.empty((5, 6), dtype=np.intp)
+    assert vol.argmax(axis=0, out=out) is out
+    assert np.array_equal(out, vol.A.argmax(axis=0))
 
 
 def test_volume_ufunc_header():

@@ -76,3 +76,30 @@ def test_labels_class(tmpdir):
     with open(filename2, "r") as f:
         lines = f.read()
         assert '"FOOBAR"' in lines
+
+
+@pytest.mark.parametrize(
+    "descr", ["Left hippocampus (CA1)", "WM/GM", "a,b", "label #2", "Côté", ""]
+)
+def test_labels_roundtrip(tmp_path, descr):
+    labels = Labels({1: descr})
+    filename = tmp_path / "labels.txt"
+    labelfile.write(filename, labels)
+    assert labelfile.read(filename) == labels
+
+
+def test_labels_invalid_description():
+    for descr in ['a"b', "a\nb", "a\rb"]:
+        with pytest.raises(ValueError):
+            Labels({1: descr})
+
+
+def test_labels_load_comments(tmp_path):
+    filename = tmp_path / "labels.txt"
+    filename.write_text(
+        "# comment\n"
+        '  # indented comment "with quotes"\n'
+        '1   250  255  228        1  1  1    "label #1"\n'
+    )
+    labels = labelfile.read(filename)
+    assert labels.descriptions == ["label #1"]

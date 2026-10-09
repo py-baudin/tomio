@@ -12,3 +12,4 @@
 - `interp.interpolate_to` no longer crashes (`KeyError: 'shape'`).
 - Interpolation no longer replaces NaNs with 0 in the input arrays.
 - `volume.write(nan_as=...)` no longer replaces NaNs in the input array.
+- Label descriptions can contain any character except `"` and line breaks (which are now rejected), and are read back correctly.

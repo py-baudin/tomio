@@ -68,7 +68,8 @@ class Labels(abc.Mapping):
 
     """
 
-    label_re_syntax = r"(?P<name>[\w\.\+\- ]*)"
+    # any character except double quotes
+    label_re_syntax = r"(?P<name>[^\"]*)"
     re_parse_label = re.compile(label_re_syntax)
     re_parse_line = re.compile(
         (
@@ -91,10 +92,9 @@ class Labels(abc.Mapping):
             lines = fp.read().splitlines()
 
             for line in lines:
-                if "#" in line:
-                    line = line[: line.find("#")].strip()
-                if not line:
-                    # empty line
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    # empty line or comment
                     continue
 
                 # parse line
@@ -240,9 +240,8 @@ class Labels(abc.Mapping):
         vis = info.get("VIS", 1)
         meshvis = info.get("MSH", 1)
 
-        # if not isinstance(descr, str):
-        if not self.re_parse_label.match(descr):
-            raise ValueError("Invalid label description: %s" % descr)
+        if not isinstance(descr, str) or any(c in descr for c in '"\n\r'):
+            raise ValueError("Invalid label description: %r" % descr)
         elif not self.allow_duplicates and descr in self.descriptions:
             raise ValueError("Duplicate description: %s" % descr)
 

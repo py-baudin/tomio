@@ -3,11 +3,21 @@ import numpy as np
 import pytest
 import yaml
 
-from iomed import config
+import iomed
+from iomed import configfile
+
+
+def test_config_alias():
+    # backward compatible name
+    from iomed import config
+    assert config is configfile
+    assert iomed.config is configfile
+    assert iomed.read_config is configfile.read
+    assert iomed.write_config is configfile.write
 
 
 def test_tame():
-    tamed = config.tame(
+    tamed = configfile.tame(
         {
             "flag": True,
             "np": np.True_,
@@ -47,8 +57,8 @@ def test_config_roundtrip(tmp_path, ext):
         "carr": np.array([1 + 1j, 2]),
     }
     path = tmp_path / f"config{ext}"
-    config.write(path, cfg)
-    out = config.read(path)
+    configfile.write(path, cfg)
+    out = configfile.read(path)
 
     assert out["flag"] is True
     assert out["np"] is True
@@ -67,8 +77,8 @@ def test_config_roundtrip(tmp_path, ext):
 def test_config_complex_ndarray(tmp_path, ext, dtype):
     arr = np.array([[1 + 1j, 2], [-3.5j, 0.1 - 4j]], dtype=dtype)
     path = tmp_path / f"config{ext}"
-    config.write(path, {"arr": arr, "scalar": arr[0, 0], "zero_d": np.array(2j, dtype=dtype)})
-    out = config.read(path)
+    configfile.write(path, {"arr": arr, "scalar": arr[0, 0], "zero_d": np.array(2j, dtype=dtype)})
+    out = configfile.read(path)
 
     assert out["arr"][1][0] == -3.5j
     assert all(type(v) is complex for row in out["arr"] for v in row)
@@ -88,19 +98,19 @@ def test_config_complex_ndarray(tmp_path, ext, dtype):
     ],
 )
 def test_complex_format(value, string):
-    assert config.format_complex(value) == string
-    assert config.parse_complex(string) == value
+    assert configfile.format_complex(value) == string
+    assert configfile.parse_complex(string) == value
 
 
 @pytest.mark.parametrize("string", ["hello", "3+4", "3 + 4j", "i", "1 + 2i + 3i", "a + 2i"])
 def test_complex_parse_other_strings(string):
-    assert config.parse_complex(string) is None
-    assert config.untame({"s": string}) == {"s": string}
+    assert configfile.parse_complex(string) is None
+    assert configfile.untame({"s": string}) == {"s": string}
 
 
 def test_complex_parse_formats():
-    assert config.parse_complex("3+4i") == 3 + 4j
-    assert config.parse_complex(" -1.5e2 - .5i ") == complex(-150, -0.5)
+    assert configfile.parse_complex("3+4i") == 3 + 4j
+    assert configfile.parse_complex(" -1.5e2 - .5i ") == complex(-150, -0.5)
 
 
 @pytest.mark.parametrize(
@@ -116,25 +126,25 @@ def test_complex_parse_formats():
     ],
 )
 def test_config_extensions(tmp_path, name, kind, expected):
-    config.write(tmp_path / name, {"a": 1}, kind=kind)
+    configfile.write(tmp_path / name, {"a": 1}, kind=kind)
     assert [p.name for p in tmp_path.iterdir()] == [expected]
-    assert config.read(tmp_path / expected) == {"a": 1}
+    assert configfile.read(tmp_path / expected) == {"a": 1}
 
 
 def test_config_read_no_suffix(tmp_path):
     # no suffix: json
-    config.write(tmp_path / "c.json", {"a": 1})
-    assert config.read(tmp_path / "c") == {"a": 1}
+    configfile.write(tmp_path / "c.json", {"a": 1})
+    assert configfile.read(tmp_path / "c") == {"a": 1}
 
 
 def test_config_unknown_type(tmp_path):
     with pytest.raises(ValueError):
-        config.write(tmp_path / "c.txt", {"a": 1})
+        configfile.write(tmp_path / "c.txt", {"a": 1})
     with pytest.raises(ValueError):
-        config.write(tmp_path / "c", {"a": 1}, kind="txt")
+        configfile.write(tmp_path / "c", {"a": 1}, kind="txt")
     (tmp_path / "c.txt").write_text("a: 1")
     with pytest.raises(ValueError):
-        config.read(tmp_path / "c.txt")
+        configfile.read(tmp_path / "c.txt")
     assert not (tmp_path / "c").exists()
 
 
@@ -142,9 +152,9 @@ def test_yaml_unsafe(tmp_path):
     path = tmp_path / "c.yml"
     path.write_text("a: !!python/object/apply:os.system ['echo unsafe']\n")
     with pytest.raises(yaml.YAMLError):
-        config.read(path)
+        configfile.read(path)
 
 
 def test_yaml_globals_unchanged():
-    # importing iomed.config does not register tags in PyYAML's default classes
+    # importing iomed.configfile does not register tags in PyYAML's default classes
     assert "!ndarray" not in yaml.dump(np.arange(3))

@@ -42,6 +42,7 @@
 - YAML config files are loaded safely (`yaml.safe_load`): Python-specific tags (`!!python/...`) are rejected.
 - Config files: strings of the form `"3 + 4i"` are read as complex numbers.
 - `volume.read` returned the transposed direction matrix (only visible with non-symmetric directions, e.g. oblique or permuted axes): `vol.transform`, `vol.affine` and `vol.get_coords` were wrong. Code that compensated for it must be updated.
+- Module `config` renamed `configfile` (consistent with `labelfile` and `imagefile`). `iomed.config` and `from iomed import config` still work (alias); `import iomed.config` does not.
 - Internal module `iovolume` renamed `imagefile`, and `iovolume.write_volume` renamed `imagefile.write_image` (`read_image` unchanged).
 - `volume.read` of vector images (e.g. RGB, vector fields): the components are in the last axis (x, y, z, c); they were in the first axis (c, x, y, z).
 - `config.write` keeps the given file extension (`c.yaml` was written as `c.yml`); without extension, `kind` is used as extension (`kind="yaml"` gives `.yaml`, was `.yml`).

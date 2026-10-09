@@ -57,13 +57,13 @@ vol2 = volume.tovolume(values, mask=mask)
 ## Config files
 
 ```python
-from iomed import config
+from iomed import configfile
 
 # read yaml / json files
-cfg = config.read('config.yml') # -> dict
+cfg = configfile.read('config.yml') # -> dict
 
 # write 
-config.write('config.yml', config)
+configfile.write('config.yml', cfg)
 
 ```
 

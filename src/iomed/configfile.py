@@ -1,5 +1,5 @@
 # coding=utf-8
-""" module defining config file i/o """
+""" config file i/o (JSON, YAML) """
 import re
 import json
 import math

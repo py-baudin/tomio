@@ -1,4 +1,7 @@
-from . import volume, config, labelfile
+from . import volume, configfile, labelfile
+
+# backward compatible name
+config = configfile
 
 volread = volume.read
 volwrite = volume.write
@@ -7,8 +10,8 @@ write_volume = volume.write
 tovolume = volume.tovolume
 asvolume = volume.asvolume
 
-read_config = config.read
-write_config = config.write
+read_config = configfile.read
+write_config = configfile.write
 
 read_labels = labelfile.read
 write_labels = labelfile.write

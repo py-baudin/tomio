@@ -1,12 +1,17 @@
+""" image file i/o with SimpleITK
+
+arrays are in ITK index order (x, y, z, ...); vector images have the components in the last axis
+"""
 import SimpleITK as sitk
 import numpy as np
 
 
-def write_volume(filename, array, *, spacing=None, origin=None, transform=None, metadata=None, use_compression=True, is_vector=False):
-    """write array (x, y, z, ...) to file
+def write_image(filename, array, *, spacing=None, origin=None, transform=None, metadata=None, use_compression=True, compression_level=None, is_vector=False):
+    """write array (x, y, z, ...) to image file
 
     is_vector: the last axis of `array` contains the components of a vector image
     spacing, origin, transform: 3d geometry (identity for the extra dimensions)
+    compression_level: if set (format-dependent, e.g. 1-9 for gzip), implies use_compression
     """
     array = np.asarray(array)
     if np.issubdtype(array.dtype, np.bool_):
@@ -31,15 +36,18 @@ def write_volume(filename, array, *, spacing=None, origin=None, transform=None, 
     if metadata is not None:
         for key, value in metadata.items():
             im.SetMetaData(str(key), str(value))
-    sitk.WriteImage(im, filename, useCompression=use_compression)
+    if compression_level is None:
+        sitk.WriteImage(im, str(filename), useCompression=use_compression)
+    else:
+        sitk.WriteImage(im, str(filename), useCompression=True, compressionLevel=compression_level)
 
 
 def read_image(filename):
-    """read file, return array (x, y, z, ...) and 3d geometry
+    """read image file, return array (x, y, z, ...) and header (3d geometry and metadata)
 
     vector images: components are in the last axis
     """
-    im = sitk.ReadImage(filename)
+    im = sitk.ReadImage(str(filename))
     ndim = im.GetDimension()
 
     array = sitk.GetArrayFromImage(im)
@@ -49,15 +57,33 @@ def read_image(filename):
     else:
         array = array.T
 
-    # 3d geometry
-    spacing = im.GetSpacing()[:3]
-    origin = im.GetOrigin()[:3]
-    # GetDirection: direction matrix D, row-major; transform: columns of D
-    transform = np.reshape(im.GetDirection(), (ndim, ndim))[:3, :3].T
-    metadata = {key: im.GetMetaData(key) for key in im.GetMetaDataKeys()}
+    return array, get_header(im)
 
-    header = dict(spacing=spacing, origin=origin, transform=transform, metadata=metadata)
-    return array, header
+
+def read_header(filename):
+    """read image file header only (no pixel data)
+
+    returns: shape (x, y, z, ..., [components]), 3d geometry and metadata
+    """
+    reader = sitk.ImageFileReader()
+    reader.SetFileName(str(filename))
+    reader.ReadImageInformation()
+
+    shape = tuple(reader.GetSize())
+    if reader.GetNumberOfComponents() > 1:
+        shape += (reader.GetNumberOfComponents(),)
+    return dict(shape=shape, **get_header(reader))
+
+
+def get_header(src):
+    """3d geometry and metadata of a sitk Image or ImageFileReader"""
+    ndim = src.GetDimension()
+    spacing = src.GetSpacing()[:3]
+    origin = src.GetOrigin()[:3]
+    # GetDirection: direction matrix D, row-major; transform: columns of D
+    transform = np.reshape(src.GetDirection(), (ndim, ndim))[:3, :3].T
+    metadata = {key: src.GetMetaData(key) for key in src.GetMetaDataKeys()}
+    return dict(spacing=spacing, origin=origin, transform=transform, metadata=metadata)
 
 
 def pad(values, ndim, fill):

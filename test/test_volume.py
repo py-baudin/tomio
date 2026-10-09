@@ -211,6 +211,44 @@ def test_volume_io_4d(tmp_path, ext):
     assert np.allclose(vol2.affine, vol.affine, atol=1e-4)
 
 
+def test_volume_read_header(tmp_path):
+    vol = Volume(np.zeros((3, 4, 5)), metadata={"PatientName": "foo"}, **GEOMETRY)
+    volume.write(tmp_path / "vol.mha", vol)
+    header = volume.read_header(tmp_path / "vol.mha")
+    assert header["shape"] == (3, 4, 5)
+    assert np.allclose(header["spacing"], vol.spacing)
+    assert np.allclose(header["origin"], vol.origin)
+    assert np.allclose(header["transform"], vol.transform)
+    assert header["metadata"]["PatientName"] == "foo"
+    # same header as read
+    vol2 = volume.read(tmp_path / "vol.mha")
+    assert np.allclose(Volume(vol2, **{k: v for k, v in header.items() if k != "shape"}).affine, vol2.affine)
+
+    # vector image: components in the last axis
+    volume.write(tmp_path / "complex.mha", vol + 1j)
+    assert volume.read_header(tmp_path / "complex.mha")["shape"] == (3, 4, 5, 2)
+
+
+def test_volume_read_dtype(tmp_path):
+    vol = Volume(np.random.rand(3, 4, 5))
+    volume.write(tmp_path / "vol.nii.gz", vol)
+    assert volume.read(tmp_path / "vol.nii.gz").dtype == np.float64
+    vol2 = volume.read(tmp_path / "vol.nii.gz", dtype=np.float32)
+    assert vol2.dtype == np.float32
+    assert np.allclose(vol2, vol)
+
+
+def test_volume_write_compression_level(tmp_path):
+    arr = np.tile(np.arange(20, dtype=np.int16), (20, 20, 1))  # compressible
+    sizes = {}
+    for level in [1, 9]:
+        filename = tmp_path / f"vol{level}.nii.gz"
+        volume.write(filename, arr, compression_level=level)
+        assert np.array_equal(volume.read(filename), arr)
+        sizes[level] = filename.stat().st_size
+    assert sizes[9] <= sizes[1]
+
+
 def test_volume_io_metadata(tmp_path):
     vol = Volume(np.zeros((3, 4, 5)), metadata={"PatientName": "foo", "Count": 3})
     volume.write(tmp_path / "vol.mha", vol)
@@ -236,9 +274,9 @@ def test_volume_io_nifti_rewrite(tmp_path):
 
 def test_volume_write_nan_as(monkeypatch, tmp_path):
     written = {}
-    def write_volume(filename, array, **kwargs):
+    def write_image(filename, array, **kwargs):
         written.update(kwargs, array=np.array(array))
-    monkeypatch.setattr(volume.iovolume, 'write_volume', write_volume)
+    monkeypatch.setattr(volume.imagefile, 'write_image', write_image)
 
     arr = np.array([[[np.nan, 1.0]]])
     vol = Volume(arr, spacing=[1, 2, 3])

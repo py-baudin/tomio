@@ -4,14 +4,18 @@ from __future__ import annotations
 import pathlib
 import numpy as np
 import numpy.typing as npt
-from . import iovolume
+from . import imagefile
 
 DEFAULT_EXT = '.nii.gz'
 
 
 # I/O
 
-def write(filename, vol, *, nan_as=None, geometry=None, use_compression=True):
+def write(filename, vol, *, nan_as=None, geometry=None, use_compression=True, compression_level=None):
+    """ write Volume
+
+    compression_level: if set (format-dependent, e.g. 1-9 for .nii.gz), implies use_compression
+    """
     vol = Volume(vol, **(geometry or {}))
 
     if nan_as is not None:
@@ -26,21 +30,32 @@ def write(filename, vol, *, nan_as=None, geometry=None, use_compression=True):
     if not filename.suffix:
         filename = filename.with_suffix(DEFAULT_EXT)
 
-    wrtopts = dict(spacing=vol.spacing, origin=vol.origin, transform=vol.transform, metadata=vol.metadata, use_compression=use_compression)
-    iovolume.write_volume(filename, data, is_vector=is_complex, **wrtopts)
+    wrtopts = dict(spacing=vol.spacing, origin=vol.origin, transform=vol.transform, metadata=vol.metadata, use_compression=use_compression, compression_level=compression_level)
+    imagefile.write_image(filename, data, is_vector=is_complex, **wrtopts)
 
 
-def read(filename, *, nan_as=None, as_complex=False):
+def read(filename, *, nan_as=None, as_complex=False, dtype=None):
     """ read Volume
 
     as_complex: combine a last axis of size 2 (real, imaginary) into complex values
+    dtype: cast data to dtype
     """
-    array, header = iovolume.read_image(filename)
+    array, header = imagefile.read_image(filename)
     if nan_as is not None:
         array[array==nan_as] = np.nan
     if as_complex and array.ndim > 3 and array.shape[-1] == 2:
         array = array[..., 0] + 1j * array[..., 1]
+    if dtype is not None:
+        array = array.astype(dtype, copy=False)
     return Volume(array, **header)
+
+
+def read_header(filename) -> dict:
+    """ read file header only (no pixel data)
+
+    returns: dict with shape (x, y, z, ..., [components]), spacing, origin, transform, metadata
+    """
+    return imagefile.read_header(filename)
 
 
 

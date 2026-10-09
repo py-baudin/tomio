@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Added
+- `volume.read_header(filename)`: shape, geometry and metadata, without reading the pixel data.
+- `volume.read(..., dtype=...)`: cast the data.
+- `volume.write(..., compression_level=...)`: compression level (e.g. 1-9 for `.nii.gz`).
+
 ### Changed
 - Require Python >= 3.10 and numpy >= 1.24.
 - scipy is now an optional extra: `pip install iomed[interp]` (also included in the `test` extra).
@@ -37,6 +42,7 @@
 - YAML config files are loaded safely (`yaml.safe_load`): Python-specific tags (`!!python/...`) are rejected.
 - Config files: strings of the form `"3 + 4i"` are read as complex numbers.
 - `volume.read` returned the transposed direction matrix (only visible with non-symmetric directions, e.g. oblique or permuted axes): `vol.transform`, `vol.affine` and `vol.get_coords` were wrong. Code that compensated for it must be updated.
+- Internal module `iovolume` renamed `imagefile`, and `iovolume.write_volume` renamed `imagefile.write_image` (`read_image` unchanged).
 - `volume.read` of vector images (e.g. RGB, vector fields): the components are in the last axis (x, y, z, c); they were in the first axis (c, x, y, z).
 - `config.write` keeps the given file extension (`c.yaml` was written as `c.yml`); without extension, `kind` is used as extension (`kind="yaml"` gives `.yaml`, was `.yml`).
 - Config files are read and written as UTF-8.

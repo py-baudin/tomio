@@ -63,7 +63,7 @@ def _from_image_data(array, header, *, nan_as=None, as_complex=False, dtype=None
 
 # interoperability
 
-# LPS (ITK, iomed) <-> RAS (NIfTI, nibabel) world coordinates
+# LPS (ITK, tomio) <-> RAS (NIfTI, nibabel) world coordinates
 LPS_TO_RAS = np.diag([-1.0, -1.0, 1.0, 1.0])
 
 

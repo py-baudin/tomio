@@ -13,7 +13,7 @@ import time
 import numpy as np
 import SimpleITK as sitk
 
-from iomed import volume, interp
+from tomio import volume, interp
 
 METHODS = ["nearest", "linear", "spline3"]
 

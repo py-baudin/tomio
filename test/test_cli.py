@@ -8,7 +8,7 @@ import pytest
 
 sitk = pytest.importorskip("SimpleITK")
 
-from iomed import cli, volume, interp
+from tomio import cli, volume, interp
 Volume = volume.Volume
 
 GEOMETRY = dict(spacing=[1, 2, 3], origin=[4, 5, 6], transform=((0.8, 0.6, 0), (-0.6, 0.8, 0), (0, 0, 1)))
@@ -58,7 +58,7 @@ def test_convert_vector_and_complex(tmp_path):
     assert out.GetNumberOfComponentsPerPixel() == 3
     assert np.allclose(sitk.GetArrayFromImage(out), sitk.GetArrayFromImage(im))
 
-    # complex (written by iomed)
+    # complex (written by tomio)
     cvol = Volume(np.random.rand(3, 4, 5) + 1j * np.random.rand(3, 4, 5), **GEOMETRY)
     volume.write(tmp_path / "complex.mha", cvol)
     assert run("convert", tmp_path / "complex.mha", tmp_path / "complex.nii.gz") == 0
@@ -153,7 +153,7 @@ def test_errors(tmp_path, vol_file, capsys):
     filename, _ = vol_file
     assert run("info", tmp_path / "missing.mha") == 1
     err = capsys.readouterr().err
-    assert err.startswith("iomed: error:") and "missing.mha" in err and "Traceback" not in err
+    assert err.startswith("tomio: error:") and "missing.mha" in err and "Traceback" not in err
 
     assert run("convert", filename, tmp_path / "out.unknown") == 1
     assert run("convert", filename, tmp_path / "out.nii.gz", "--dtype", "foo") == 1
@@ -168,7 +168,7 @@ def test_errors(tmp_path, vol_file, capsys):
 
 def test_entry_point():
     env = dict(os.environ, PYTHONPATH=str(Path(__file__).parents[1] / "src") + os.pathsep + os.environ.get("PYTHONPATH", ""))
-    result = subprocess.run([sys.executable, "-m", "iomed", "--help"], capture_output=True, text=True, env=env)
+    result = subprocess.run([sys.executable, "-m", "tomio", "--help"], capture_output=True, text=True, env=env)
     assert result.returncode == 0
     for command in ["convert", "resample", "info"]:
         assert command in result.stdout

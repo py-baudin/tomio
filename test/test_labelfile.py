@@ -5,7 +5,7 @@ import types
 import numpy as np
 import pytest
 
-from iomed import labelfile
+from tomio import labelfile
 
 Labels = labelfile.Labels
 
@@ -356,7 +356,7 @@ def test_apply_mapping():
 
 
 def test_apply_mapping_volume():
-    volume = pytest.importorskip("iomed.volume")
+    volume = pytest.importorskip("tomio.volume")
     labelmap = volume.Volume(np.array([[[0, 3], [7, 7]]], dtype=np.uint8), spacing=[1, 2, 3])
     out = labelfile.apply_mapping(labelmap, {3: 1, 7: 2})
     assert isinstance(out, volume.Volume)

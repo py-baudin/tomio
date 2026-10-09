@@ -1,8 +1,8 @@
 """ command-line interface
 
-    iomed convert IN OUT
-    iomed resample IN OUT (--like REF | --spacing SX SY SZ) [--method METHOD]
-    iomed info IN
+    tomio convert IN OUT
+    tomio resample IN OUT (--like REF | --spacing SX SY SZ) [--method METHOD]
+    tomio info IN
 """
 import sys
 import argparse
@@ -30,13 +30,13 @@ def main(argv=None):
     try:
         args.func(args)
     except (UserError, FileNotFoundError, ValueError, RuntimeError, ImportError, NotImplementedError) as exc:
-        print(f"iomed: error: {exc}", file=sys.stderr)
+        print(f"tomio: error: {exc}", file=sys.stderr)
         return 1
     return 0
 
 
 def get_parser():
-    parser = argparse.ArgumentParser(prog="iomed", description="Convert, resample and inspect medical image volumes.")
+    parser = argparse.ArgumentParser(prog="tomio", description="Convert, resample and inspect medical image volumes.")
     commands = parser.add_subparsers(title="commands", required=True, metavar="COMMAND")
 
     # convert
@@ -87,7 +87,7 @@ def run_convert(args):
 
 def run_resample(args):
     check_files(args)
-    # complex data: 2-component vector image (as written by iomed)
+    # complex data: 2-component vector image (as written by tomio)
     as_complex = imagefile.read_info(args.input)["components"] == 2
     vol = volume.read(args.input, as_complex=as_complex)
     if args.like is not None:

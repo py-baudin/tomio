@@ -1,0 +1,46 @@
+name: publish
+
+# Publish to PyPI when a GitHub release is published.
+# Uses PyPI trusted publishing (no API token): configure it once on PyPI,
+# see https://docs.pypi.org/trusted-publishers/ (workflow: publish.yml, environment: pypi).
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  tests:
+    uses: ./.github/workflows/tests.yml
+
+  build:
+    needs: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install build twine
+          python -m build
+          python -m twine check --strict dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/tomio/
+    permissions:
+      id-token: write  # trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

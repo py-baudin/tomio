@@ -4,17 +4,17 @@ import numpy as np
 import pytest
 import yaml
 
-import iomed
-from iomed import configfile
+import tomio
+from tomio import configfile
 
 
 def test_config_alias():
     # backward compatible name
-    from iomed import config
+    from tomio import config
     assert config is configfile
-    assert iomed.config is configfile
-    assert iomed.read_config is configfile.read
-    assert iomed.write_config is configfile.write
+    assert tomio.config is configfile
+    assert tomio.read_config is configfile.read
+    assert tomio.write_config is configfile.write
 
 
 def test_tame():
@@ -202,5 +202,5 @@ def test_yaml_unsafe(tmp_path):
 
 
 def test_yaml_globals_unchanged():
-    # importing iomed.configfile does not register tags in PyYAML's default classes
+    # importing tomio.configfile does not register tags in PyYAML's default classes
     assert "!ndarray" not in yaml.dump(np.arange(3))

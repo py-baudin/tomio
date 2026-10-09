@@ -3,7 +3,7 @@ import dataclasses
 import numpy as np
 import pytest
 
-from iomed import volume
+from tomio import volume
 Volume = volume.Volume
 
 def test_volume_class():
@@ -651,12 +651,12 @@ def test_volume_nibabel_canonical(direction):
 
 @pytest.mark.parametrize("direction", list(DIRECTIONS))
 def test_volume_nibabel_files(tmp_path, direction):
-    # files written by iomed (SimpleITK) and read by nibabel, and vice versa
+    # files written by tomio (SimpleITK) and read by nibabel, and vice versa
     nib = pytest.importorskip("nibabel")
     vol = nibabel_volume(direction)
 
-    volume.write(tmp_path / "iomed.nii.gz", vol)
-    vol2 = Volume.from_nibabel(nib.load(tmp_path / "iomed.nii.gz"))
+    volume.write(tmp_path / "tomio.nii.gz", vol)
+    vol2 = Volume.from_nibabel(nib.load(tmp_path / "tomio.nii.gz"))
     assert np.array_equal(vol2, vol)
     assert vol2.geometry.same_as(vol, tol=1e-4)
 

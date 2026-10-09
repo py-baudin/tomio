@@ -2,7 +2,7 @@ import importlib.util
 import numpy as np
 import pytest
 
-from iomed import volume, interp
+from tomio import volume, interp
 Volume = volume.Volume
 
 # scipy: optional (scipy backend, and fallback of the default backend)
@@ -288,11 +288,11 @@ def test_sitk_backend_errors():
 
 
 def test_resample_exports():
-    import iomed
+    import tomio
     src = Volume(np.random.rand(10, 10, 10))
     expected = interp.resample(src, like=SHIFTED)
     assert np.array_equal(volume.resample(src, like=SHIFTED), expected)
-    assert np.array_equal(iomed.resample(src, like=SHIFTED), expected)
+    assert np.array_equal(tomio.resample(src, like=SHIFTED), expected)
 
 
 def concentric_spheres(vol, center, radii):

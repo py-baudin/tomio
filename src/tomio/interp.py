@@ -448,7 +448,7 @@ def _make_scipy_resampler(target_geom, source_geom, round_axes=(), reason=None):
     """scipy.ndimage resampling"""
     if ndimage is None:
         needed = f" for {reason}" if reason else " with the scipy backend"
-        raise ImportError(f"`scipy` is required for interpolation{needed} (pip install iomed[interp])")
+        raise ImportError(f"`scipy` is required for interpolation{needed} (pip install tomio[interp])")
     target_geom = get_geometry(target_geom)
     source_geom = get_geometry(source_geom)
     shape_t = target_geom["shape"]

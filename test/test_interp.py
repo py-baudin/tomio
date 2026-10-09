@@ -41,6 +41,51 @@ def test_interpolate_roi_sparse_slices_downsampling():
     assert set(np.unique(nearest)) == {0, 2}
 
 
+SHIFTED = Volume(np.zeros((10, 10, 10)), origin=(0.5, 0.3, 0))
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.int16, np.int64])
+def test_interpolate_default_integer(dtype):
+    # label maps: default nearest, no new values
+    lab = Volume(np.random.randint(0, 4, (10, 10, 10)).astype(dtype))
+    out = interp.interpolate_like(SHIFTED, lab)
+    assert out.dtype == dtype
+    assert set(np.unique(out)) <= {0, 1, 2, 3}
+    assert np.array_equal(out, interp.interpolate_like(SHIFTED, lab, method="nearest"))
+
+
+def test_interpolate_default_bool():
+    mask = Volume(np.random.rand(10, 10, 10) > 0.5)
+    out = interp.interpolate_like(SHIFTED, mask)
+    assert out.dtype == bool
+    assert np.array_equal(out, interp.interpolate_like(SHIFTED, mask.astype(np.uint8), method="nearest"))
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_interpolate_default_float(dtype):
+    src = Volume(np.random.rand(10, 10, 10).astype(dtype))
+    out = interp.interpolate_like(SHIFTED, src)
+    assert out.dtype == dtype
+    assert np.array_equal(out, interp.interpolate_like(SHIFTED, src, method="spline3"))
+
+
+def test_interpolate_explicit_method_integer():
+    # an explicit method is used for integer data too, output keeps the input dtype
+    lab = Volume(np.random.randint(0, 100, (10, 10, 10)).astype(np.int16))
+    out = interp.interpolate_like(SHIFTED, lab, method="spline1")
+    assert out.dtype == np.int16
+    assert not np.array_equal(out, interp.interpolate_like(SHIFTED, lab, method="nearest"))
+
+
+def test_interpolate_default_mixed_sources():
+    src = Volume(np.random.rand(10, 10, 10))
+    lab = Volume(np.random.randint(0, 4, (10, 10, 10)))
+    geom = interp.get_geometry(src)
+    out_src, out_lab = interp.interpolate(interp.get_geometry(SHIFTED), geom, src, lab)
+    assert np.array_equal(out_src, interp.interpolate_like(SHIFTED, src, method="spline3"))
+    assert np.array_equal(out_lab, interp.interpolate_like(SHIFTED, lab, method="nearest"))
+
+
 def concentric_spheres(vol, center, radii):
     """label map: label i+1 for radius in [radii[i-1], radii[i]["""
     dist = np.linalg.norm(vol.get_coords(np.indices(vol.shape).reshape(3, -1).T) - center, axis=1)

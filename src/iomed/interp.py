@@ -180,7 +180,7 @@ def interpolate(
     target_geom,
     source_geom,
     *sources,
-    method="spline3",
+    method=None,
     order=None,
     mode=None,
     cval=0,
@@ -198,23 +198,22 @@ def interpolate(
         sources: ndarray (or list of ndarrays)
             The arrays dimensions must match the values in source_geom
 
-        method: ['spline3'], 'nearest'
+        method: [None], 'nearest', 'spline1', 'spline3'...
             Interpolation method
+            Default: 'nearest' for integer and bool data, 'spline3' otherwise
+        order: spline order (overrides `method`)
         mode: [None], 'nearest', any float number
             How values outside the box defined by the coordinates
             should be filled. Default: constant 0
 
     Returns
     ---
-        results: ndarray (or list of)
-            Interpolated array
+        results: Volume (or list of)
+            Interpolated array, with the same dtype as the source
 
     """
     if ndimage is None:
         raise ImportError('`scipy` is required for interpolation')
-
-    # interpolation method
-    order = get_order(method, order)
 
     # extend mode
     try:
@@ -234,15 +233,26 @@ def interpolate(
     # do the interpolation
     results = []
     for vol in sources:
-        isnan = np.isnan(vol)
-        vol = np.where(isnan, 0, vol)  # copy: do not modify the input
-        res = resample(vol, order=order, mode=mode, cval=const_value, prefilter=order > 1)
+        vol = np.asarray(vol)
+        dtype = vol.dtype
+        # interpolation method
+        vol_order = get_order(method or get_default_method(vol), order)
 
-        if np.any(isnan):
+        if dtype == bool:
+            # not supported by scipy.ndimage
+            vol = vol.astype(np.uint8)
+        isnan = np.isnan(vol) if np.issubdtype(dtype, np.inexact) else None
+        if isnan is not None and np.any(isnan):
+            vol = np.where(isnan, 0, vol)  # copy: do not modify the input
+        else:
+            isnan = None
+
+        res = resample(vol, order=vol_order, mode=mode, cval=const_value, prefilter=vol_order > 1)
+        if isnan is not None:
             mask = resample(isnan.astype(np.uint8), order=0, mode="nearest", prefilter=False)
             res[mask > 0] = np.nan
 
-        results.append(volume.Volume(res, **get_geometry(target_geom, shape=False)))
+        results.append(volume.Volume(res.astype(dtype, copy=False), **get_geometry(target_geom, shape=False)))
 
     # return
     if len(sources) == 1:
@@ -252,6 +262,14 @@ def interpolate(
 
 
 # utilities
+
+def get_default_method(array):
+    """default interpolation method: 'nearest' for integer and bool data (e.g. label maps), else 'spline3'"""
+    dtype = np.asarray(array).dtype
+    if dtype == bool or np.issubdtype(dtype, np.integer):
+        return "nearest"
+    return "spline3"
+
 
 def get_order(method, order=None):
     """spline order of interpolation method ('nearest', 'spline1', 'spline3'...)"""

@@ -3,6 +3,8 @@
 ## Unreleased
 
 ### Added
+- Interoperability: `vol.to_sitk()` / `Volume.from_sitk(image)` (SimpleITK `Image`), and `vol.to_nibabel()` / `Volume.from_nibabel(image)` (nibabel `Nifti1Image`, LPS ↔ RAS conversion of the affine; optional dependency: `pip install iomed[nibabel]`).
+- Orientation conventions: `vol.get_orientation(convention="from" | "to")` and `vol.reorient(code, convention=...)`. "from" (default, ITK, identity: `RAI`) is the convention of `vol.anatomical_orientation`; "to" (identity: `LPS`) gives the direction each axis points to. `volume.convert_orientation` converts codes between them.
 - `volume.Geometry` (also `iomed.Geometry`): immutable geometry (shape, spacing, origin, transform) with `affine`, `extent`, `center`, `voxel_volume`, `get_coords`, `get_indices`, `same_as(other, tol)`, `to_dict`/`from_dict`. `vol.geometry` returns it (first 3 axes), `Volume(data, geometry=...)` accepts it, and interpolation functions accept it in place of geometry dicts.
 - `resample(vol, like=ref | spacing=... | geometry={...}, method=..., fill=...)`: single entry point for interpolation, in `interp`, `volume` and `iomed`. Methods: `nearest`, `linear`, `splineN`, `roi`, `labels`. The `interpolate*` functions are unchanged.
 - `volume.read_header(filename)`: shape, geometry and metadata, without reading the pixel data.

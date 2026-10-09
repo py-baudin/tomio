@@ -6,12 +6,24 @@ import SimpleITK as sitk
 import numpy as np
 
 
-def write_image(filename, array, *, spacing=None, origin=None, transform=None, metadata=None, use_compression=True, compression_level=None, is_vector=False):
+def write_image(filename, array, *, use_compression=True, compression_level=None, **kwargs):
     """write array (x, y, z, ...) to image file
+
+    kwargs: spacing, origin, transform, metadata, is_vector (see `to_image`)
+    compression_level: if set (format-dependent, e.g. 1-9 for gzip), implies use_compression
+    """
+    im = to_image(array, **kwargs)
+    if compression_level is None:
+        sitk.WriteImage(im, str(filename), useCompression=use_compression)
+    else:
+        sitk.WriteImage(im, str(filename), useCompression=True, compressionLevel=compression_level)
+
+
+def to_image(array, *, spacing=None, origin=None, transform=None, metadata=None, is_vector=False):
+    """convert array (x, y, z, ...) to sitk Image
 
     is_vector: the last axis of `array` contains the components of a vector image
     spacing, origin, transform: 3d geometry (identity for the extra dimensions)
-    compression_level: if set (format-dependent, e.g. 1-9 for gzip), implies use_compression
     """
     array = np.asarray(array)
     if np.issubdtype(array.dtype, np.bool_):
@@ -36,10 +48,7 @@ def write_image(filename, array, *, spacing=None, origin=None, transform=None, m
     if metadata is not None:
         for key, value in metadata.items():
             im.SetMetaData(str(key), str(value))
-    if compression_level is None:
-        sitk.WriteImage(im, str(filename), useCompression=use_compression)
-    else:
-        sitk.WriteImage(im, str(filename), useCompression=True, compressionLevel=compression_level)
+    return im
 
 
 def read_image(filename):
@@ -47,7 +56,14 @@ def read_image(filename):
 
     vector images: components are in the last axis
     """
-    im = sitk.ReadImage(str(filename))
+    return from_image(sitk.ReadImage(str(filename)))
+
+
+def from_image(im):
+    """convert sitk Image to array (x, y, z, ...) and header (3d geometry and metadata)
+
+    vector images: components are in the last axis
+    """
     ndim = im.GetDimension()
 
     array = sitk.GetArrayFromImage(im)

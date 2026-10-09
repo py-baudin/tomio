@@ -322,6 +322,24 @@ def test_geometry_same_as():
     assert not geom.same_as(vol[::-1])
 
 
+def test_orientation_convention():
+    vol = Volume(np.random.rand(4, 5, 6))
+    assert vol.anatomical_orientation == "RAI"
+    assert vol.get_orientation() == "RAI"
+    assert vol.get_orientation(convention="to") == "LPS"
+
+    for code in ["LPS", "RAS", "ASL", "IRP"]:
+        out = vol.reorient(code, convention="to")
+        assert out.get_orientation(convention="to") == code
+        # same as the opposite code in the "from" convention
+        assert np.array_equal(out, vol.reorient(volume.convert_orientation(code, "to")))
+
+    with pytest.raises(ValueError):
+        vol.get_orientation(convention="towards")
+    with pytest.raises(ValueError):
+        vol.reorient("RAI", convention="towards")
+
+
 def test_volume_utils():
     arr = np.arange(3*4*5).reshape(3,4,5)
     vol = Volume(arr, spacing=[1,2,3], origin=[4,5,6], metadata={'foo': 'bar'})
@@ -572,7 +590,77 @@ def test_volume_write_nan_as(monkeypatch, tmp_path):
     assert written['spacing'] == (1.0, 2.0, 3.0)
 
 
+def test_volume_sitk():
+    import SimpleITK as sitk
+
+    vol = Volume(np.random.rand(3, 4, 5).astype(np.float32), metadata={"foo": "bar"}, **GEOMETRY)
+    im = vol.to_sitk()
+    assert isinstance(im, sitk.Image)
+    assert im.GetSize() == vol.shape
+    assert im.GetMetaData("foo") == "bar"
+    for idx in INDICES:
+        assert np.allclose(im.TransformIndexToPhysicalPoint(idx), vol.get_coords(idx))
+        assert im.GetPixel(idx) == vol[idx]
+
+    vol2 = Volume.from_sitk(im)
+    assert np.array_equal(vol2, vol)
+    assert vol2.geometry.same_as(vol, tol=1e-8)
+    assert vol2.metadata["foo"] == "bar"
+
+    # complex
+    cvol = vol + 1j * vol
+    im = cvol.to_sitk()
+    assert im.GetNumberOfComponentsPerPixel() == 2
+    assert np.array_equal(Volume.from_sitk(im, as_complex=True), cvol)
 
 
+def nibabel_volume(direction):
+    return Volume(np.random.rand(3, 4, 5).astype(np.float32), spacing=[1, 2, 3], origin=[4, 5, 6], transform=DIRECTIONS[direction].T)
 
 
+@pytest.mark.parametrize("direction", list(DIRECTIONS))
+def test_volume_nibabel(direction):
+    nib = pytest.importorskip("nibabel")
+    vol = nibabel_volume(direction)
+    img = vol.to_nibabel()
+    assert isinstance(img, nib.Nifti1Image)
+    assert np.array_equal(np.asanyarray(img.dataobj), vol)
+    # RAS coordinates: LPS with x and y flipped
+    for idx in INDICES:
+        ras = (img.affine @ [*idx, 1])[:3]
+        assert np.allclose(ras * [-1, -1, 1], vol.get_coords(idx))
+
+    vol2 = Volume.from_nibabel(img)
+    assert np.array_equal(vol2, vol)
+    assert vol2.geometry.same_as(vol, tol=1e-8)
+
+    # bool: stored as uint8
+    assert np.asanyarray((vol > 0.5).to_nibabel().dataobj).dtype == np.uint8
+
+
+@pytest.mark.parametrize("direction", list(DIRECTIONS))
+def test_volume_nibabel_canonical(direction):
+    # nibabel's RAS+ canonical orientation == reorient to "RAS" ("to" convention)
+    nib = pytest.importorskip("nibabel")
+    vol = nibabel_volume(direction)
+    canonical = nib.as_closest_canonical(vol.to_nibabel())
+    expected = vol.reorient("RAS", convention="to")
+    assert np.array_equal(np.asanyarray(canonical.dataobj), expected)
+    assert Volume.from_nibabel(canonical).geometry.same_as(expected, tol=1e-6)
+
+
+@pytest.mark.parametrize("direction", list(DIRECTIONS))
+def test_volume_nibabel_files(tmp_path, direction):
+    # files written by iomed (SimpleITK) and read by nibabel, and vice versa
+    nib = pytest.importorskip("nibabel")
+    vol = nibabel_volume(direction)
+
+    volume.write(tmp_path / "iomed.nii.gz", vol)
+    vol2 = Volume.from_nibabel(nib.load(tmp_path / "iomed.nii.gz"))
+    assert np.array_equal(vol2, vol)
+    assert vol2.geometry.same_as(vol, tol=1e-4)
+
+    nib.save(vol.to_nibabel(), tmp_path / "nibabel.nii.gz")
+    vol3 = volume.read(tmp_path / "nibabel.nii.gz")
+    assert np.array_equal(vol3, vol)
+    assert vol3.geometry.same_as(vol, tol=1e-4)

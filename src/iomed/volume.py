@@ -23,16 +23,12 @@ def write(filename, vol, *, nan_as=None, geometry=None, use_compression=True, co
         # copy: do not modify the input
         vol = Volume(np.where(np.isnan(vol), nan_as, vol), **vol.header)
 
-    # complex: vector image with 2 components (real, imaginary)
-    is_complex = np.iscomplexobj(vol)
-    data = np.stack([vol.real, vol.imag], axis=-1) if is_complex else vol
-
     filename = pathlib.Path(filename)
     if not filename.suffix:
         filename = filename.with_suffix(DEFAULT_EXT)
 
-    wrtopts = dict(spacing=vol.spacing, origin=vol.origin, transform=vol.transform, metadata=vol.metadata, use_compression=use_compression, compression_level=compression_level)
-    imagefile.write_image(filename, data, is_vector=is_complex, **wrtopts)
+    data, options = _to_image_data(vol)
+    imagefile.write_image(filename, data, use_compression=use_compression, compression_level=compression_level, **options)
 
 
 def read(filename, *, nan_as=None, as_complex=False, dtype=None):
@@ -42,6 +38,20 @@ def read(filename, *, nan_as=None, as_complex=False, dtype=None):
     dtype: cast data to dtype
     """
     array, header = imagefile.read_image(filename)
+    return _from_image_data(array, header, nan_as=nan_as, as_complex=as_complex, dtype=dtype)
+
+
+def _to_image_data(vol):
+    """ data and options for imagefile.to_image / write_image """
+    # complex: vector image with 2 components (real, imaginary)
+    is_complex = np.iscomplexobj(vol)
+    data = np.stack([vol.real, vol.imag], axis=-1) if is_complex else vol
+    options = dict(spacing=vol.spacing, origin=vol.origin, transform=vol.transform, metadata=vol.metadata, is_vector=is_complex)
+    return data, options
+
+
+def _from_image_data(array, header, *, nan_as=None, as_complex=False, dtype=None):
+    """ Volume from the outputs of imagefile.from_image / read_image """
     if nan_as is not None:
         array[array==nan_as] = np.nan
     if as_complex and array.ndim > 3 and array.shape[-1] == 2:
@@ -49,6 +59,44 @@ def read(filename, *, nan_as=None, as_complex=False, dtype=None):
     if dtype is not None:
         array = array.astype(dtype, copy=False)
     return Volume(array, **header)
+
+
+# interoperability
+
+# LPS (ITK, iomed) <-> RAS (NIfTI, nibabel) world coordinates
+LPS_TO_RAS = np.diag([-1.0, -1.0, 1.0, 1.0])
+
+
+def to_sitk(vol):
+    """ convert Volume to SimpleITK Image (complex: vector image with 2 components) """
+    data, options = _to_image_data(asvolume(vol))
+    return imagefile.to_image(data, **options)
+
+
+def from_sitk(image, *, as_complex=False, dtype=None) -> Volume:
+    """ convert SimpleITK Image to Volume (vector images: components in the last axis)
+
+    as_complex: combine a last axis of size 2 (real, imaginary) into complex values
+    """
+    array, header = imagefile.from_image(image)
+    return _from_image_data(array, header, as_complex=as_complex, dtype=dtype)
+
+
+def to_nibabel(vol):
+    """ convert Volume to nibabel Nifti1Image (requires nibabel) """
+    import nibabel  # lazy import: optional dependency
+
+    vol = asvolume(vol)
+    data = vol.A.astype(np.uint8) if vol.dtype == bool else vol.A
+    image = nibabel.Nifti1Image(data, LPS_TO_RAS @ vol.affine)
+    image.header.set_xyzt_units("mm")
+    return image
+
+
+def from_nibabel(image) -> Volume:
+    """ convert nibabel image (with an affine, e.g. Nifti1Image) to Volume """
+    origin, spacing, transform = split_affine_transform(LPS_TO_RAS @ image.affine)
+    return Volume(np.asanyarray(image.dataobj), spacing=spacing, origin=origin, transform=transform)
 
 
 def read_header(filename) -> dict:
@@ -440,10 +488,39 @@ class Volume(np.ndarray):
 
     @property
     def anatomical_orientation(self) -> str:
+        """ anatomical orientation code, ITK "from" convention (e.g. RAI) """
         return get_orientation(self)
-    
-    def reorient(self, orientation: str):
-        return set_orientation(self, orientation)
+
+    def get_orientation(self, convention: str = "from") -> str:
+        """ anatomical orientation code
+
+        convention: "from" (ITK, identity: RAI) or "to" (identity: LPS)
+        """
+        return get_orientation(self, convention=convention)
+
+    # interoperability
+
+    def to_sitk(self):
+        """ convert to SimpleITK Image """
+        return to_sitk(self)
+
+    @classmethod
+    def from_sitk(cls, image, **kwargs) -> Volume:
+        """ convert SimpleITK Image to Volume (see `volume.from_sitk`) """
+        return from_sitk(image, **kwargs)
+
+    def to_nibabel(self):
+        """ convert to nibabel Nifti1Image (requires nibabel) """
+        return to_nibabel(self)
+
+    @classmethod
+    def from_nibabel(cls, image) -> Volume:
+        """ convert nibabel image to Volume """
+        return from_nibabel(image)
+
+    def reorient(self, orientation: str, convention: str = "from"):
+        """ flip/permute axes to match orientation code (see `get_orientation`) """
+        return set_orientation(self, orientation, convention=convention)
 
     # utilities
         
@@ -557,8 +634,22 @@ def check_orientation(code):
     return True
 
 
-def get_orientation(vol):
-    """get volume anatomical orientation """
+def convert_orientation(code, convention):
+    """ convert orientation code from `convention` ("from" or "to") to the "from" convention (or back) """
+    if convention == "from":
+        return code
+    elif convention == "to":
+        # opposite direction on each axis
+        opposite = {a: b for pair in ORIENTATIONS for a, b in (pair, pair[::-1])}
+        return "".join(opposite[c] for c in code)
+    raise ValueError(f'Invalid orientation convention (expected "from" or "to"): {convention}')
+
+
+def get_orientation(vol, *, convention="from"):
+    """get volume anatomical orientation
+
+    convention: "from" (ITK, identity: RAI) or "to" (identity: LPS)
+    """
 
     transform = getattr(vol, "transform", np.eye(3))
 
@@ -570,13 +661,17 @@ def get_orientation(vol):
     orient = "".join(ORIENTATIONS[i][s] for i, s in zip(indices, signs))
 
     check_orientation(orient)
-    return orient
+    return convert_orientation(orient, convention)
 
 
-def set_orientation(vol, orientation, *, transform=None, copy=True):
-    """set volume anatomical orientation"""
+def set_orientation(vol, orientation, *, transform=None, copy=True, convention="from"):
+    """set volume anatomical orientation
+
+    convention: "from" (ITK, identity: RAI) or "to" (identity: LPS)
+    """
 
     check_orientation(orientation)
+    orientation = convert_orientation(orientation, convention)
 
     vol = asvolume(vol, transform=transform)
     if copy:

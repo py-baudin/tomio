@@ -3,6 +3,11 @@
 ## Unreleased
 
 ### Added
+- Labels:
+  - `labels.lut`: RGBA lookup table (`uint8`, shape `(max index + 1, 4)`), e.g. `rgba = labels.lut[labelmap]`.
+  - `Labels.from_volume(labelmap, names=None)`: labels from the values of a label map, with automatic colors.
+  - `labels.reindex()`: consecutive indices 1..N, returns the new labels and the mapping `{old: new}`; `labelfile.apply_mapping(labelmap, mapping)` (also `Labels.apply_mapping`) applies it to a label map.
+  - `labelfile.read(filename, format="freesurfer" | "slicer")`: FreeSurfer (`FreeSurferColorLUT.txt`) and 3D Slicer (`.ctbl`) color tables.
 - Interoperability: `vol.to_sitk()` / `Volume.from_sitk(image)` (SimpleITK `Image`), and `vol.to_nibabel()` / `Volume.from_nibabel(image)` (nibabel `Nifti1Image`, LPS ↔ RAS conversion of the affine; optional dependency: `pip install iomed[nibabel]`).
 - Orientation conventions: `vol.get_orientation(convention="from" | "to")` and `vol.reorient(code, convention=...)`. "from" (default, ITK, identity: `RAI`) is the convention of `vol.anatomical_orientation`; "to" (identity: `LPS`) gives the direction each axis points to. `volume.convert_orientation` converts codes between them.
 - `volume.Geometry` (also `iomed.Geometry`): immutable geometry (shape, spacing, origin, transform) with `affine`, `extent`, `center`, `voxel_volume`, `get_coords`, `get_indices`, `same_as(other, tol)`, `to_dict`/`from_dict`. `vol.geometry` returns it (first 3 axes), `Volume(data, geometry=...)` accepts it, and interpolation functions accept it in place of geometry dicts.

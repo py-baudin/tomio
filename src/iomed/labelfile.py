@@ -6,6 +6,7 @@ import numbers
 import functools
 import itertools
 from collections import abc
+import numpy as np
 
 
 class LabelFileError(ValueError, RuntimeError):
@@ -55,7 +56,11 @@ PREAMBLE = (
 )
 
 
+FORMATS = ("itksnap", "freesurfer", "slicer")
+
+
 def read(filename, **kwargs):
+    """read label file (format: "itksnap" (default), "freesurfer", "slicer"; see `Labels.load`)"""
     return Labels.load(filename, **kwargs)
 
 
@@ -104,9 +109,23 @@ class Labels(abc.MutableMapping):
         )
     )
 
+    # color table (FreeSurfer, Slicer): index name R G B A
+    re_parse_lut_line = re.compile(
+        r"^\s*(?P<index>\d+)\s+(?P<name>\S.*?)"
+        r"\s+(?P<R>\d+)\s+(?P<G>\d+)\s+(?P<B>\d+)\s+(?P<A>\d+)\s*$"
+    )
+
     @classmethod
-    def load(cls, filename, **kwargs):
-        """load label file"""
+    def load(cls, filename, *, format="itksnap", **kwargs):
+        """load label file
+
+        format:
+            "itksnap": ITK-SNAP label description file
+            "freesurfer": FreeSurfer color table (FreeSurferColorLUT.txt; A: transparency 0..255)
+            "slicer": 3D Slicer color table (.ctbl; A: opacity 0..255)
+        """
+        if format not in FORMATS:
+            raise ValueError(f"Unknown label file format: {format} (expected one of {FORMATS})")
         labels = cls({}, **kwargs)
         with open(filename, "r", encoding="utf-8") as fp:
             lines = fp.read().splitlines()
@@ -118,34 +137,62 @@ class Labels(abc.MutableMapping):
                 continue
 
             # parse line
-            match = cls.re_parse_line.match(line)
-            if not match:
+            parse = cls._parse_itksnap_line if format == "itksnap" else cls._parse_lut_line
+            parsed = parse(line, format)
+            if parsed is None:
                 raise LabelFileError(f"{filename}, line {num}: could not parse: {line}")
 
-            # index is the first number
-            index = int(match.group("index"))
+            index, info = parsed
             if index in labels:
                 raise LabelFileError(f"{filename}, line {num}: duplicate index: {index}")
-
-            # color, including alpha
-            rgba = (
-                int(match.group("R")),
-                int(match.group("G")),
-                int(match.group("B")),
-                float(match.group("A")),
-            )
-            info = {
-                "LABEL": match.group("name"),
-                "RGBA": rgba,
-                "VIS": int(match.group("vis")),
-                "MSH": int(match.group("meshvis")),
-            }
             try:
                 labels.set(index, info)
             except ValueError as exc:
                 raise LabelFileError(f"{filename}, line {num}: {exc}") from None
 
         return labels
+
+    @classmethod
+    def from_volume(cls, labelmap, names=None, **kwargs):
+        """ labels from the values of a label map (integer array), with automatic colors
+
+        names: descriptions, as a dict {index: name} or a sequence (one per nonzero value)
+            default: "label_<index>"
+        index 0 (background) is included only if it is in `names` (dict)
+        """
+        values = np.unique(np.asarray(labelmap))
+        if not (values.dtype == bool or np.issubdtype(values.dtype, np.integer)):
+            raise ValueError(f"Integer label map required, not: {values.dtype}")
+        indices = [int(value) for value in values if value != 0]
+        if isinstance(names, abc.Mapping):
+            indices = sorted(set(indices) | {0} if 0 in names else indices)
+            names = [names.get(index, f"label_{index}") for index in indices]
+        elif names is None:
+            names = [f"label_{index}" for index in indices]
+        elif len(names) != len(indices):
+            raise ValueError(f"Expected {len(indices)} names (one per nonzero value), got {len(names)}")
+        return cls(dict(zip(indices, names)), **kwargs)
+
+    @classmethod
+    def _parse_itksnap_line(cls, line, format):
+        match = cls.re_parse_line.match(line)
+        if not match:
+            return None
+        rgba = (int(match["R"]), int(match["G"]), int(match["B"]), float(match["A"]))
+        info = {"LABEL": match["name"], "RGBA": rgba, "VIS": int(match["vis"]), "MSH": int(match["meshvis"])}
+        return int(match["index"]), info
+
+    @classmethod
+    def _parse_lut_line(cls, line, format):
+        match = cls.re_parse_lut_line.match(line)
+        if not match:
+            return None
+        alpha = int(match["A"]) / 255
+        if format == "freesurfer":
+            # FreeSurfer: transparency
+            alpha = 1 - alpha
+        rgba = (int(match["R"]), int(match["G"]), int(match["B"]), alpha)
+        return int(match["index"]), {"LABEL": match["name"], "RGBA": rgba}
 
     @_hybridmethod
     def save(cls, filename, labels, **kwargs):
@@ -219,6 +266,18 @@ class Labels(abc.MutableMapping):
             else:
                 palette.extend((0, 0, 0))
         return palette
+
+    @property
+    def lut(self):
+        """ RGBA lookup table: uint8 array of shape (max index + 1, 4)
+
+        rgba = labels.lut[labelmap]  # (..., 4) RGBA image; missing indices: (0, 0, 0, 0)
+        """
+        lut = np.zeros((max(self.data, default=0) + 1, 4), dtype=np.uint8)
+        for index, info in self.data.items():
+            red, green, blue, alpha = info["RGBA"]
+            lut[index] = (red, green, blue, round(alpha * 255))
+        return lut
 
     def __repr__(self):
         return str(self.data)
@@ -305,6 +364,22 @@ class Labels(abc.MutableMapping):
             "MSH": int(meshvis),
         }
         
+    def reindex(self):
+        """ renumber labels with consecutive indices 1..N (0 is kept), in index order
+
+        returns: new Labels, mapping {old index: new index} (see `apply_mapping`)
+        """
+        new_indices = itertools.count(1)
+        mapping = {index: 0 if index == 0 else next(new_indices) for index in self}
+        labels = type(self)({}, allow_duplicates=self.allow_duplicates)
+        labels.data = {mapping[index]: dict(info) for index, info in self.data.items()}
+        return labels, mapping
+
+    @staticmethod
+    def apply_mapping(labelmap, mapping):
+        """ replace the values of `labelmap` with `mapping` {old: new} (see `labelfile.apply_mapping`) """
+        return apply_mapping(labelmap, mapping)
+
     def getindex(self, name):
         """return index of given name (reverse of .__getitem__)"""
         return {self.data[index]["LABEL"]: index for index in self.indices}[name]
@@ -312,6 +387,30 @@ class Labels(abc.MutableMapping):
     def newcolor(self, alpha=1.0):
         """return a different color every time"""
         return next(self.color_gen) + [alpha]
+
+
+def apply_mapping(labelmap, mapping):
+    """ replace the values of an integer label map with `mapping` {old: new}
+
+    values not in `mapping` are unchanged; the dtype is promoted if needed;
+    the type and header of the label map are kept (e.g. Volume)
+    """
+    array = np.asarray(labelmap)
+    if not np.issubdtype(array.dtype, np.integer):
+        raise ValueError(f"Integer label map required, not: {array.dtype}")
+    if array.size and array.min() < 0:
+        raise ValueError("Label map with negative values")
+    if any(new < 0 for new in mapping.values()):
+        raise ValueError("Mapping with negative values")
+    dtype = np.promote_types(array.dtype, np.min_scalar_type(max(mapping.values(), default=0)))
+    maxvalue = int(array.max()) if array.size else 0
+    lut = np.arange(maxvalue + 1, dtype=dtype)
+    for old, new in mapping.items():
+        if 0 <= old <= maxvalue:
+            lut[old] = new
+    result = lut[array]
+    header = getattr(labelmap, "header", None)
+    return type(labelmap)(result, **header) if header is not None else result
 
 
 def is_integer(value):

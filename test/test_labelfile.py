@@ -240,6 +240,125 @@ def test_labels_save(tmp_path):
         Labels.save(tmp_path / "5.txt", [(1, "a")])
 
 
+def test_labels_lut():
+    labels = Labels({1: {"LABEL": "a", "RGBA": (255, 0, 0, 1.0)}, 3: {"LABEL": "b", "RGBA": (0, 0, 255, 0.5)}})
+    lut = labels.lut
+    assert lut.shape == (4, 4) and lut.dtype == np.uint8
+    assert tuple(lut[1]) == (255, 0, 0, 255)
+    assert tuple(lut[3]) == (0, 0, 255, 128)
+    assert tuple(lut[2]) == (0, 0, 0, 0)
+    labelmap = np.array([[0, 1], [3, 3]])
+    rgba = labels.lut[labelmap]
+    assert rgba.shape == (2, 2, 4)
+    assert tuple(rgba[1, 0]) == (0, 0, 255, 128)
+    assert Labels().lut.shape == (1, 4)
+
+
+def test_labels_from_volume():
+    labelmap = np.array([[0, 2], [5, 5]], dtype=np.uint8)
+    labels = Labels.from_volume(labelmap)
+    assert labels.indices == [2, 5]
+    assert labels.descriptions == ["label_2", "label_5"]
+    assert labels.colors[2] != labels.colors[5]
+    assert Labels.from_volume(labelmap, names=["a", "b"]).descriptions == ["a", "b"]
+    labels = Labels.from_volume(labelmap, names={0: "background", 5: "b"})
+    assert dict(labels) == {0: "background", 2: "label_2", 5: "b"}
+    assert Labels.from_volume(labelmap > 0).indices == [1]
+    with pytest.raises(ValueError):
+        Labels.from_volume(labelmap, names=["a"])
+    with pytest.raises(ValueError):
+        Labels.from_volume(labelmap.astype(float))
+
+
+def test_labels_reindex():
+    labels = Labels({0: "background", 3: "a", 7: {"LABEL": "b", "RGBA": (1, 2, 3, 1.0), "VIS": 0}})
+    new, mapping = labels.reindex()
+    assert mapping == {0: 0, 3: 1, 7: 2}
+    assert dict(new) == {0: "background", 1: "a", 2: "b"}
+    assert new.data[2] == labels.data[7]
+    assert dict(labels) == {0: "background", 3: "a", 7: "b"}  # unchanged
+
+    # without background
+    assert Labels({3: "a", 7: "b"}).reindex()[1] == {3: 1, 7: 2}
+
+    # apply to label map
+    labelmap = np.array([[0, 3], [7, 7]], dtype=np.uint8)
+    assert np.array_equal(Labels.apply_mapping(labelmap, mapping), [[0, 1], [2, 2]])
+    assert np.array_equal(labelfile.apply_mapping(labelmap, mapping), [[0, 1], [2, 2]])
+
+
+def test_apply_mapping():
+    labelmap = np.array([[0, 1], [2, 4]], dtype=np.uint8)
+    out = labelfile.apply_mapping(labelmap, {1: 10, 4: 300, 99: 5})
+    assert np.array_equal(out, [[0, 10], [2, 300]])  # unmapped values unchanged
+    assert out.dtype == np.uint16  # promoted
+    assert labelfile.apply_mapping(labelmap, {1: 2}).dtype == np.uint8
+    for invalid in [labelmap.astype(float), labelmap.astype(int) - 1]:
+        with pytest.raises(ValueError):
+            labelfile.apply_mapping(invalid, {1: 2})
+
+
+def test_apply_mapping_volume():
+    volume = pytest.importorskip("iomed.volume")
+    labelmap = volume.Volume(np.array([[[0, 3], [7, 7]]], dtype=np.uint8), spacing=[1, 2, 3])
+    out = labelfile.apply_mapping(labelmap, {3: 1, 7: 2})
+    assert isinstance(out, volume.Volume)
+    assert out.spacing == (1, 2, 3)
+
+
+FREESURFER_LUT = """\
+#$Id: FreeSurferColorLUT.txt,v 1.105 2015/07/29 18:20:54 greve Exp $
+
+#No. Label Name:                            R   G   B   A
+
+0   Unknown                                 0   0   0   0
+2   Left-Cerebral-White-Matter              245 245 245 0
+3   Left-Cerebral-Cortex                    205 62  78  0
+"""
+
+SLICER_CTBL = """\
+# Color table file C:/data/labels.ctbl
+# 3 values
+0 background 0 0 0 0
+1 tissue 128 174 128 255
+2 bone with spaces 241 214 145 128
+"""
+
+
+def test_labels_read_freesurfer(tmp_path):
+    filename = tmp_path / "FreeSurferColorLUT.txt"
+    filename.write_text(FREESURFER_LUT)
+    labels = labelfile.read(filename, format="freesurfer")
+    assert dict(labels) == {0: "Unknown", 2: "Left-Cerebral-White-Matter", 3: "Left-Cerebral-Cortex"}
+    # A: transparency
+    assert labels.colors[0] == (0, 0, 0, 1.0)
+    assert labels.colors[3] == (205, 62, 78, 1.0)
+
+
+def test_labels_read_slicer(tmp_path):
+    filename = tmp_path / "labels.ctbl"
+    filename.write_text(SLICER_CTBL)
+    labels = labelfile.read(filename, format="slicer")
+    assert dict(labels) == {0: "background", 1: "tissue", 2: "bone with spaces"}
+    # A: opacity
+    assert labels.colors[0] == (0, 0, 0, 0.0)
+    assert labels.colors[1] == (128, 174, 128, 1.0)
+    assert labels.colors[2][3] == pytest.approx(128 / 255)
+
+
+def test_labels_read_format_errors(tmp_path):
+    filename = tmp_path / "labels.txt"
+    filename.write_text(FREESURFER_LUT)
+    with pytest.raises(ValueError):
+        labelfile.read(filename, format="unknown")
+    # wrong format
+    with pytest.raises(labelfile.LabelFileError, match="line 5"):
+        labelfile.read(filename)
+    filename.write_text("1 name 256 0 0 0\n")
+    with pytest.raises(labelfile.LabelFileError, match="line 1"):
+        labelfile.read(filename, format="slicer")
+
+
 def test_labels_pop():
     labels = Labels({1: "a", 2: "b"})
     assert labels.pop(99, None) is None

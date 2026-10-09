@@ -25,7 +25,8 @@ def read_image(filename):
     array = sitk.GetArrayFromImage(im).T
     spacing = im.GetSpacing()
     origin = im.GetOrigin()
-    transform = im.GetDirection()
+    # GetDirection: direction matrix D, row-major; transform: columns of D
+    transform = np.reshape(im.GetDirection(), (3, 3)).T
     metadata = {key: im.GetMetaData(key) for key in im.GetMetaDataKeys()}
 
     header = dict(spacing=spacing, origin=origin, transform=transform, metadata=metadata)

@@ -4,17 +4,7 @@ import numpy as np
 import pytest
 import yaml
 
-import tomio
 from tomio import configfile
-
-
-def test_config_alias():
-    # backward compatible name
-    from tomio import config
-    assert config is configfile
-    assert tomio.config is configfile
-    assert tomio.read_config is configfile.read
-    assert tomio.write_config is configfile.write
 
 
 def test_tame():

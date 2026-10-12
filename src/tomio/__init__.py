@@ -1,10 +1,12 @@
+""" tomio: I/O utilities for medical images
+
+    import tomio as io
+    vol = io.read_volume("vol.nii.gz")
+    cfg = io.read_config("config.yml")
+    labels = io.read_labels("labels.txt")
+"""
 from . import volume, configfile, labelfile, interp
 
-# backward compatible name
-config = configfile
-
-volread = volume.read
-volwrite = volume.write
 read_volume = volume.read
 write_volume = volume.write
 tovolume = volume.tovolume
@@ -18,4 +20,3 @@ write_config = configfile.write
 
 read_labels = labelfile.read
 write_labels = labelfile.write
-

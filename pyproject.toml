@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tomio"
-version = "0.1.1"
+version = "0.1.2"
 description = "I/O utilities for medical images: image volumes with geometry, interpolation, label and config files"
 readme = "README.md"
 license = "MIT"

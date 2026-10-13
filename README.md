@@ -165,6 +165,11 @@ labels = io.labelfile.Labels.from_volume(labelmap)  # one label per value
 rgba = labels.lut[labelmap]  # RGBA image (uint8)
 labels2, mapping = labels.reindex()  # indices 1..N
 labelmap2 = io.labelfile.apply_mapping(labelmap, mapping)
+
+# plain data (JSON, YAML, config files): descriptions, colors and visibility
+data = labels.to_dict()  # {index: {"LABEL": ..., "RGBA": [R, G, B, A], "VIS": 1, "MSH": 1}}
+io.write_config("config.json", {"labels": data})
+labels = io.labelfile.Labels.from_dict(io.read_config("config.json")["labels"])  # string indices accepted
 ```
 
 Labels are validated: non-negative integer indices, unique descriptions without `"` or line breaks (`allow_duplicates=True` to allow duplicates), RGB in 0..255, alpha in 0..1. Label files are UTF-8.

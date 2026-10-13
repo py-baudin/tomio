@@ -82,6 +82,10 @@ class Labels(abc.MutableMapping):
     # save
     labels.save(filename)  # or Labels.save(filename, labels), labelfile.write(filename, labels)
 
+    # plain data (e.g. JSON, YAML, config files)
+    data = labels.to_dict()  # {index: {"LABEL", "RGBA", "VIS", "MSH"}}
+    labels = Labels.from_dict(data)  # indices may be strings (JSON)
+
     # access
     name = labels[1]  # description of index 1
     index = labels.getindex("label_1")  # index of a description
@@ -174,6 +178,30 @@ class Labels(abc.MutableMapping):
         return cls(dict(zip(indices, names)), **kwargs)
 
     @classmethod
+    def from_dict(cls, mapping, **kwargs):
+        """ labels from plain data {index: {"LABEL", "RGBA", "VIS", "MSH"}} (see `to_dict`)
+
+        indices may be strings of digits (e.g. read from JSON); kwargs: see `Labels`
+        """
+        items = {}
+        for index, info in mapping.items():
+            if isinstance(index, str):
+                if not index.strip().isdigit():
+                    raise ValueError(f"Invalid label index: {index!r}")
+                index = int(index)
+            if index in items:
+                raise ValueError(f"Duplicate index: {index}")
+            items[index] = info
+        return cls(items, **kwargs)
+
+    def to_dict(self):
+        """ plain data {index: {"LABEL", "RGBA" (list), "VIS", "MSH"}}, sorted by index
+
+        e.g. for JSON or YAML (JSON turns the indices into strings: see `from_dict`)
+        """
+        return {index: dict(self.data[index], RGBA=list(self.data[index]["RGBA"])) for index in self}
+
+    @classmethod
     def _parse_itksnap_line(cls, line, format):
         match = cls.re_parse_line.match(line)
         if not match:
@@ -252,6 +280,17 @@ class Labels(abc.MutableMapping):
             self.indices = indices
         if colors is not None:
             self.colors = colors
+
+    # pickle, copy: without the color generator (itertools objects are not picklable
+    # from Python 3.14); a copy restarts the color cycle, as Labels(labels)
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        state.pop("color_gen", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.color_gen = itertools.cycle(COLOR_MAP)
 
     def _replace(self, items):
         """ replace all labels with validated (index, info) items """

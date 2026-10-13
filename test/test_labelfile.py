@@ -442,3 +442,55 @@ def test_labels_load_comments(tmp_path):
     )
     labels = labelfile.read(filename)
     assert labels.descriptions == ["label #1", "Côté"]
+
+
+def test_labels_to_from_dict():
+    labels = Labels({0: "background", 2: "fat", 1: {"LABEL": "muscle", "RGBA": (255, 0, 0, 0.5), "VIS": 0}})
+    data = labels.to_dict()
+    assert list(data) == [0, 1, 2]  # sorted
+    assert data[1] == {"LABEL": "muscle", "RGBA": [255, 0, 0, 0.5], "VIS": 0, "MSH": 1}
+    data[1]["LABEL"] = "changed"  # a copy
+    assert labels[1] == "muscle"
+    assert Labels.from_dict(labels.to_dict()) == labels
+    assert Labels.from_dict({}) == Labels()
+
+
+def test_labels_json_roundtrip():
+    import json
+
+    labels = Labels({0: "background", 1: "muscle", 12: "fat"}, allow_duplicates=True)
+    text = json.dumps(labels.to_dict())
+    copy = Labels.from_dict(json.loads(text), allow_duplicates=True)
+    assert copy == labels  # descriptions, colors and visibility
+    assert copy.allow_duplicates
+
+
+def test_labels_config_roundtrip(tmp_path):
+    from tomio import configfile
+
+    labels = Labels({1: "muscle", 2: "fat"})
+    for name in ["labels.json", "labels.yml"]:
+        configfile.write(tmp_path / name, {"labels": labels.to_dict()})
+        assert Labels.from_dict(configfile.read(tmp_path / name)["labels"]) == labels
+
+
+@pytest.mark.parametrize("mapping", [{"a": "x"}, {"-1": "x"}, {"1.5": "x"}, {"1": "x", 1: "y"}])
+def test_labels_from_dict_invalid(mapping):
+    with pytest.raises(ValueError):
+        Labels.from_dict(mapping)
+
+
+def test_labels_pickle_copy():
+    import copy
+    import pickle
+    import warnings
+
+    labels = Labels({1: "muscle", 2: "fat"})
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # no itertools pickling (removed in Python 3.14)
+        shallow = copy.copy(labels)
+        assert shallow == labels and shallow.data is labels.data  # (shallow: shared data)
+        for clone in [pickle.loads(pickle.dumps(labels)), copy.deepcopy(labels)]:
+            assert clone == labels
+            clone[3] = "bone"  # new color still available
+            assert len(clone.colors[3]) == 4 and 3 not in labels

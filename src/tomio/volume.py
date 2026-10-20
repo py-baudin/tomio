@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import itertools
 import pathlib
 import dataclasses
 import numpy as np
@@ -656,7 +657,13 @@ def get_orientation(vol, *, convention="from"):
     # assumes transform is a sequence of columns
     transform = np.asarray(transform).reshape(3, 3).T
 
-    indices = np.argmax(np.abs(transform), axis=0)[:3]
+    # each axis to a distinct anatomical axis: the assignment with the largest direction cosines (an oblique axis
+    # may be closest to an anatomical axis already taken)
+    indices = max(
+        itertools.permutations(range(3)),
+        key=lambda perm: sum(abs(transform[perm[axis], axis]) for axis in range(3)),
+    )
+    indices = np.asarray(indices)
     signs = 1 * (np.sign(transform[indices, np.arange(3)]) < 0)
     orient = "".join(ORIENTATIONS[i][s] for i, s in zip(indices, signs))
 

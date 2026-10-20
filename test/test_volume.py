@@ -664,3 +664,13 @@ def test_volume_nibabel_files(tmp_path, direction):
     vol3 = volume.read(tmp_path / "nibabel.nii.gz")
     assert np.array_equal(vol3, vol)
     assert vol3.geometry.same_as(vol, tol=1e-4)
+
+
+def test_orientation_oblique():
+    # an oblique direction: two axes closest to the same anatomical axis, each assigned to a distinct one
+    a, b = np.radians(45), np.radians(40)
+    rx = np.array([[1, 0, 0], [0, np.cos(a), -np.sin(a)], [0, np.sin(a), np.cos(a)]])
+    ry = np.array([[np.cos(b), 0, np.sin(b)], [0, 1, 0], [-np.sin(b), 0, np.cos(b)]])
+    vol = Volume(np.zeros((2, 2, 2)), transform=ry @ rx)
+    # the dominant anatomical axis of each axis alone: R, A, L (two left-right axes)
+    assert vol.anatomical_orientation == "RAI"

@@ -4,6 +4,18 @@
 
 - Added `tomio.elastix`: registration framework imported from mutools (`mutools.registration.elastix`), with its test suite.
 
+### tomio.elastix: accelerations (phase 4 of `PLAN_elastix.md`)
+
+- Optimized parameters are scaled (rotations and matrix coefficients × the radius of the fixed image):
+  better conditioned optimization (translations were barely optimized before).
+- `lbfgs`: new `xtol` stopping criterion (default 1e-3, ≈ mm), `ftol` 1e-7: far fewer cost evaluations.
+- Mutual information by scatter-add (same result, faster).
+- Pyramid: linear downsampling by default (`order=1`), recursive gaussian smoothing.
+- `SamplerRandomCoordinates(thick_ratio=2.0)`: samples stay on the grid along thick-slice axes.
+- New `initialize` section: `None`, `"geometry"` or `"moments"` (initial translation of the first stage).
+- `Elastix.execute` returns per-level results in `info.levels`.
+- `benchmarks/bench_elastix.py`.
+
 ### tomio.elastix: no scipy (phase 3 of `PLAN_elastix.md`)
 
 - scipy is no longer used: B-spline coefficients with SimpleITK (`sitk.BSplineDecomposition`, cached per image),

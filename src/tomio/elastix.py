@@ -315,6 +315,13 @@ class Geometry:
             return (points - self.origin) / self.spacing
         return (points - self.origin) @ np.linalg.inv(self.matrix).T
 
+    def radius(self, center=None):
+        """RMS distance of the grid points to a center (default: grid center), in mm"""
+        center = self.center if center is None else np.asarray(center)
+        extent = self.shape * self.spacing
+        offset = np.linalg.norm(self.center - center)
+        return float(np.sqrt(np.sum(extent**2) / 12 + offset**2))
+
     def coords_jacobian(self):
         """jacobian of `to_coords` (ndim x ndim)"""
         return np.linalg.inv(self.matrix)
@@ -567,7 +574,7 @@ class PyramidGaussian(Pyramid):
         minsize=8,
         minlevel=0,
         maxlevel=3,
-        order=3,
+        order=1,
         sigma=None,
         magnitude=True,
     ):
@@ -819,6 +826,21 @@ class Transform(ABC):
     def init(self, ndim):
         raise NotImplementedError("'init' is not implemented for this transform")
 
+    def with_translation(self, parameters, offset):
+        """parameters with the given translation (None if not supported)"""
+        if getattr(self, "axis", None) is not None:
+            return None
+        parameters = np.array(parameters, dtype=float)
+        parameters[-len(offset):] = offset
+        return parameters
+
+    def scales(self, parameters, radius):
+        """parameter scales: one unit of each scaled parameter moves the points by about 1 mm
+
+        radius: typical distance of the points to the center (mm)
+        """
+        return np.ones(len(parameters))
+
     def __str__(self):
         return str(type(self).__name__)
 
@@ -938,6 +960,11 @@ class TransformRigid(Transform):
         else:
             raise NotImplementedError(f"Invalid number of dimensions: {ndim}")
 
+    def scales(self, parameters, radius):
+        """rotation angles scaled by the radius, translations unchanged"""
+        nrot = 3 if len(parameters) == 6 else 1
+        return np.r_[np.full(nrot, radius), np.ones(len(parameters) - nrot)]
+
     def inverse(self, parameters):
         """parameters of the inverse transform (same center)"""
         if len(parameters) == 3:
@@ -968,6 +995,11 @@ class TransformAffine(Transform):
         A = np.eye(ndim)
         b = np.zeros(ndim)
         return self.pack(A, b)
+
+    def scales(self, parameters, radius):
+        """matrix coefficients scaled by the radius, translations unchanged"""
+        nmat = len(self.parse(np.asarray(parameters))["A"].flat)
+        return np.r_[np.full(nmat, radius), np.ones(len(parameters) - nmat)]
 
     def parse(self, parameters):
         ndim = {2: 1, 6: 2, 12: 3}.get(len(parameters), None)
@@ -1056,10 +1088,17 @@ class SamplerRandom(Sampler):
 
 
 class SamplerRandomCoordinates(Sampler):
-    """Sample random values at non grid coordinates"""
+    """Sample random values at non grid coordinates
 
-    def __init__(self, maxsample=3000, order=3):
+    maxsample: number of samples
+    order: interpolation order of the fixed image
+    thick_ratio: along axes with a spacing >= thick_ratio x the smallest spacing (thick slices),
+        samples stay on the grid (interpolating between thick slices gives inaccurate values); None: never
+    """
+
+    def __init__(self, maxsample=3000, order=3, thick_ratio=2.0):
         self.maxsample = maxsample
+        self.thick_ratio = thick_ratio
         self.image = None
         # interpolator options
         self._interp_opts = {"order": order, "mode": "nearest"}
@@ -1090,6 +1129,10 @@ class SamplerRandomCoordinates(Sampler):
             coords = coords + self._rgen.uniform(-0.5, 0.5, size=coords.shape)
             coords = np.clip(coords, 0, maxcoord)
         coords[:, maxcoord == 0] = 0  # quantize points in single valued dimensions
+        if self.thick_ratio is not None:
+            spacing = np.asarray(self.image.spacing)
+            thick = spacing >= self.thick_ratio * spacing.min()
+            coords[:, thick] = np.round(coords[:, thick])
         points = self.image.geometry.to_points(coords)
         order = self._interp_opts["order"]
         coeffs = self.image.spline_coefficients(order)
@@ -1267,15 +1310,18 @@ class Optimizer(ABC):
 class OptimizerLBFGS(Optimizer):
     """Limited-memory BFGS with backtracking line search (samples fixed during the optimization)
 
+    The parameters are scaled (one unit moves the points by about 1 mm).
+
     maxiter: maximum number of iterations
     memory: number of corrections kept
     gtol: stop when the largest gradient component is below gtol
     ftol: stop when the relative cost decrease is below ftol
-    maxstep: largest parameter change of the first iteration
+    xtol: stop when the largest parameter change is below xtol (~ mm)
+    maxstep: largest parameter change of the first iteration (~ mm)
     """
 
-    def __init__(self, maxiter=100, memory=10, gtol=1e-8, ftol=1e-9, maxstep=1.0):
-        self.opts = {"maxiter": maxiter, "memory": memory, "gtol": gtol, "ftol": ftol, "maxstep": maxstep}
+    def __init__(self, maxiter=100, memory=10, gtol=1e-8, ftol=1e-7, xtol=1e-3, maxstep=1.0):
+        self.opts = {"maxiter": maxiter, "memory": memory, "gtol": gtol, "ftol": ftol, "xtol": xtol, "maxstep": maxstep}
 
     def optimize(self, objective, init):
         sol, info = lbfgs(lambda x: objective(x, gradient=True), init, **self.opts)
@@ -1351,6 +1397,8 @@ class Config:
             - a dict with a "type" key and options, e.g. {"type": "mi", "nbin": 32}
             - a dict of options only (the current type is kept), e.g. {"maxsample": 5000}
             - a component object, e.g. TransformRigid(axis=2)
+        initialize: {"method": ...}, initial translation of the first stage:
+            None, "geometry" (align the image centers) or "moments" (align the centers of mass)
         resample: {"method": ...}, interpolation of the registered image (see `transform`)
 
     examples:
@@ -1360,7 +1408,8 @@ class Config:
         Config.describe()  # available types and options
     """
 
-    SECTIONS = tuple(COMPONENTS) + ("resample",)
+    SECTIONS = tuple(COMPONENTS) + ("initialize", "resample")
+    INITIALIZE = (None, "geometry", "moments")
 
     DEFAULTS = {
         "transform": "rigid",
@@ -1369,6 +1418,7 @@ class Config:
         "interpolator": "linear",
         "metric": "mse",
         "optimizer": "lbfgs",
+        "initialize": {"method": None},
         "resample": {"method": None},
     }
 
@@ -1392,11 +1442,13 @@ class Config:
     def __setitem__(self, name, value):
         if name not in self.SECTIONS:
             raise ValueError(f"Unknown section: '{name}' (expected one of: {', '.join(self.SECTIONS)})")
-        if name == "resample":
+        if name in ("initialize", "resample"):
             value = {"method": value} if value is None or isinstance(value, str) else dict(value)
             unknown = set(value) - {"method"}
             if unknown:
-                raise ValueError(f"Unknown resample option(s): {', '.join(sorted(unknown))}")
+                raise ValueError(f"Unknown {name} option(s): {', '.join(sorted(unknown))}")
+            if name == "initialize" and value.get("method") not in self.INITIALIZE:
+                raise ValueError(f"Unknown initialize method: {value['method']} (expected one of: {self.INITIALIZE})")
             self._sections[name] = {**self._sections.get(name, {}), **value}
             return
         if isinstance(value, str):
@@ -1471,6 +1523,8 @@ class Config:
                     lines.append(f"        {option}{default}")
                 if any_option:
                     lines.append("        (other options passed through)")
+        lines.append("initialize:")
+        lines.append("    method = None  # None, 'geometry' (image centers) or 'moments' (centers of mass)")
         lines.append("resample:")
         lines.append("    method = None  # see `transform`")
         return "\n".join(lines)
@@ -1546,6 +1600,21 @@ class Objective:
         LOGGER.debug(f"parameters: {parameters}, cost: {cost:.4}, gradient: {gradient}")
         return cost, gradient
 
+class ScaledObjective:
+    """objective function of scaled parameters: x = parameters * scales"""
+
+    def __init__(self, objective, scales):
+        self.objective = objective
+        self.scales = np.asarray(scales, dtype=float)
+
+    def __call__(self, x, gradient=False, **kwargs):
+        parameters = np.asarray(x) / self.scales
+        if not gradient:
+            return self.objective(parameters, **kwargs)
+        cost, grad = self.objective(parameters, gradient=True, **kwargs)
+        return cost, grad / self.scales
+
+
 class Elastix:
     """Main registration object"""
 
@@ -1574,7 +1643,12 @@ class Elastix:
 
         # same center of rotation at all levels
         center = fixed.geometry.center
+        radius = fixed.geometry.radius(center)
         parameters = None if init is None else np.asarray(init, dtype=float)
+        method = self.config["initialize"].get("method")
+        if parameters is None and initial is None and method is not None:
+            parameters = initialize(self.config.setup("transform"), fixed, moving, method)
+        results = []
         for level, images in zip(*levels):
             _fixed, _moving = images
 
@@ -1603,12 +1677,22 @@ class Elastix:
             init = transform.init(fixed.ndim) if parameters is None else parameters
             self.logger.debug(f"Initialization: {init}")
 
-            # optimize
-            parameters, info = optimizer(objective, init)
+            # optimize scaled parameters (one unit ~ 1 mm displacement)
+            scales = transform.scales(init, radius)
+            scaled = ScaledObjective(objective, scales)
+            parameters, info = optimizer(scaled, np.asarray(init, dtype=float) * scales)
+            parameters = parameters / scales
 
-            self.logger.debug(f"num samples: {len(sampler(_fixed)[0])}")
+            nsample = len(sampler(_fixed)[0])
+            self.logger.debug(f"num samples: {nsample}")
             self.logger.debug(info)
             self.logger.info(f"Parameters: {parameters}")
+            results.append(
+                OptimResults(
+                    level=level, fixed_shape=_fixed.shape, moving_shape=_moving.shape, nsample=nsample,
+                    parameters=parameters, **{key: getattr(info, key, None) for key in ("fun", "nit", "nfev", "message", "success")}
+                )
+            )
 
             if callback:
                 callback(_fixed, _moving, parameters, self.config, level=level)
@@ -1616,7 +1700,30 @@ class Elastix:
         transformation = Transformation(transform, fixed.geometry, parameters, center=center)
         self.logger.info(f"Found transformation: {transformation}")
         self.logger.info(f"Done.")
+        info.levels = results
         return transformation, info
+
+
+def initialize(transform, fixed, moving, method):
+    """initial parameters: translation aligning the image centers ("geometry") or centers of mass ("moments")"""
+    if method == "geometry":
+        offset = moving.geometry.center - fixed.geometry.center
+    elif method == "moments":
+        offset = center_of_mass(moving) - center_of_mass(fixed)
+    else:
+        raise ValueError(f"Unknown initialization method: {method}")
+    parameters = transform.with_translation(transform.init(fixed.ndim), offset)
+    if parameters is None:
+        LOGGER.warning(f"Initialization '{method}' is not supported by {transform}: ignored")
+    return parameters
+
+
+def center_of_mass(image):
+    """intensity-weighted center (of the masked values), world coordinates"""
+    weights = np.abs(image.values)
+    if not np.any(weights):
+        return image.geometry.center
+    return np.average(image.points, axis=0, weights=weights)
 
 
 #
@@ -1977,11 +2084,24 @@ def resample_grid(array, origin, spacing, shape, order=3):
 
 
 def gaussian_filter(array, sigma):
-    """gaussian smoothing, sigma in pixels (per axis), with SimpleITK"""
+    """gaussian smoothing, sigma in pixels (per axis), with SimpleITK
+
+    recursive filter along each smoothed axis (cost independent of sigma); discrete kernel along axes
+    with fewer than 8 pixels (not supported by the recursive filter below 4, boundary effects)
+    """
     sigma = np.broadcast_to(np.asarray(sigma, dtype=float), (np.ndim(array),))
     image = sitk.GetImageFromArray(np.asarray(array, dtype=float).T, isVector=False)
-    smoothed = sitk.DiscreteGaussian(image, (sigma**2).tolist(), 64, 0.001, False)
-    return sitk.GetArrayFromImage(smoothed).T
+    short = np.zeros(len(sigma))
+    for axis, value in enumerate(sigma):
+        if value <= 0:
+            continue
+        elif array.shape[axis] < 8:
+            short[axis] = value
+            continue
+        image = sitk.RecursiveGaussian(image, float(value), False, sitk.RecursiveGaussianImageFilter.ZeroOrder, axis)
+    if np.any(short):
+        image = sitk.DiscreteGaussian(image, (short**2).tolist(), 64, 0.001, False)
+    return sitk.GetArrayFromImage(image).T
 
 
 def binary_dilation(mask):
@@ -2132,20 +2252,55 @@ def parzen2d(
     return pdf, jac
 
 
+def _log_ratio(p12):
+    """log(p12 / (p1 p2)), 0 where p12 = 0"""
+    p1p2 = np.outer(p12.sum(axis=1), p12.sum(axis=0))
+    nonzero = (p12 > 0) & (p1p2 > 0)
+    log12 = np.zeros_like(p12)
+    log12[nonzero] = np.log(p12[nonzero] / p1p2[nonzero])
+    return log12
+
+
+def mutualinfo_scatter(values1, values2, nbin=32, gradient2=False):
+    """mutual information (negative) with zero-order (fixed) and cubic (moving) Parzen windows, values in [0, 1]
+
+    Same result as `mutualinfo(..., windows=["spline0", "spline3"])`, by scatter-add: each sample adds to
+    1 x 4 bins of the joint histogram, O(N) instead of O(N nbin).
+    """
+    nvalue = len(values1)
+    # fixed: bin of each value (window [-0.5, 0.5))
+    bins1 = np.clip(np.ceil((nbin - 1) * values1 - 0.5), 0, nbin - 1).astype(np.intp)
+    # moving: 4 cubic taps, folded into the edge bins
+    u2 = (nbin - 1) * values2
+    taps = np.floor(u2)[:, np.newaxis] + np.arange(-1, 3)
+    dist = taps - u2[:, np.newaxis]
+    bins2 = np.clip(taps, 0, nbin - 1).astype(np.intp)
+    flat = bins1[:, np.newaxis] * nbin + bins2
+    weights = Kernel.spline3(dist)
+    p12 = np.bincount(flat.ravel(), weights=weights.ravel(), minlength=nbin * nbin).reshape(nbin, nbin) / nvalue
+    log12 = _log_ratio(p12)
+    mi = -(p12 * log12).sum()
+    if not gradient2:
+        return mi
+    # d window / d value2 = -(nbin - 1) B3'(dist), B3'(x) = B2(x + 1/2) - B2(x - 1/2)
+    dweights = Kernel.spline2(dist + 0.5) - Kernel.spline2(dist - 0.5)
+    grad = (nbin - 1) / nvalue * (dweights * log12.ravel()[flat]).sum(axis=1)
+    return mi, grad
+
+
 def mutualinfo(values1, values2, gradient2=False, **kwargs):
     """mutual information metric"""
+    windows = list(kwargs.get("windows", ["spline0", "spline3"]))
+    if windows == ["spline0", "spline3"] and not kwargs.get("normalize"):
+        return mutualinfo_scatter(values1, values2, nbin=kwargs.get("nbin", 10), gradient2=gradient2)
+
     # estimate joint distribution
     jac2 = "split" if gradient2 else False
     res = parzen2d(values1, values2, jac2=jac2, **kwargs)
     p12, jp12 = res if gradient2 else (res, None)
 
-    # marginal distributions
-    p1p2 = np.outer(p12.sum(axis=1), p12.sum(axis=0))
-
     # mutual information
-    nonzero = (p12 > 0) & (p1p2 > 0)
-    log12 = np.zeros_like(p12)
-    log12[nonzero] = np.log(p12[nonzero] / p1p2[nonzero])
+    log12 = _log_ratio(p12)
     mi = -(p12 * log12).sum()
 
     if not gradient2:
@@ -2158,10 +2313,12 @@ def mutualinfo(values1, values2, gradient2=False, **kwargs):
     return mi, grad
 
 
-def lbfgs(func, init, maxiter=100, memory=10, gtol=1e-8, ftol=1e-9, maxstep=1.0, maxls=30):
+def lbfgs(func, init, maxiter=100, memory=10, gtol=1e-8, ftol=1e-7, xtol=1e-3, maxstep=1.0, maxls=30):
     """limited-memory BFGS with backtracking (Armijo) line search
 
     func: returns cost and gradient
+    stops when: max |gradient| <= gtol, relative cost decrease <= ftol, or max |step| <= xtol
+        (the line search stops backtracking below xtol)
     """
     x = np.asarray(init, dtype=float).copy()
     cost, grad = func(x)
@@ -2201,15 +2358,20 @@ def lbfgs(func, init, maxiter=100, memory=10, gtol=1e-8, ftol=1e-9, maxstep=1.0,
 
         # backtracking line search
         step = 1.0
+        maxdir = np.max(np.abs(direction))
+        accepted = False
         for _ in range(maxls):
+            if step * maxdir <= xtol:
+                break
             xnew = x + step * direction
             cnew, gnew = func(xnew)
             nfev += 1
             if np.isfinite(cnew) and cnew <= cost + 1e-4 * step * slope:
+                accepted = True
                 break
             step *= 0.5
-        else:
-            res["message"] = "Line search failed"
+        if not accepted:
+            res.update(success=True, message="Small step")
             break
 
         s, y = xnew - x, gnew - grad

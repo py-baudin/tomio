@@ -4,6 +4,20 @@
 
 - Added `tomio.elastix`: registration framework imported from mutools (`mutools.registration.elastix`), with its test suite.
 
+### tomio.elastix: configuration API (phase 2 of `PLAN_elastix.md`)
+
+- New configuration: one section per component (`transform`, `pyramid`, `sampler`, `interpolator`, `metric`,
+  `optimizer`, `resample`), with short type names (`"rigid"`, `"mi"`, ...), options validated against the
+  components; `Config.describe()` lists the types and options; configs from YAML/JSON files.
+  Replaces the flat `{"Transform": "TransformRigid", "TransformRigid": {...}}` settings and `Config.SETTINGS`.
+- `register(fixed, moving, config=None, **sections)`: keyword sections (`transform="rigid", metric="mi"`),
+  `fixed_mask` / `moving_mask`; a list of configs runs successive stages (`TransformationSequence`).
+- `transform(transformations, moving, ref=None, method=None)`: `method` as in `tomio.resample`
+  (`'nearest'`, `'linear'`, `'spline3'`, `'roi'`, `'labels'`), replaces `interpolation_order`; global
+  transforms of 3d images are resampled with `tomio.resample`.
+- Serialized transformations: lowercase keys (`transform: {type: rigid, ...}`, `geometry`, `parameters`, `center`);
+  `Transformation(transform, geometry, parameters, center=None)` takes a transform object, name or dict.
+
 ### tomio.elastix: fixes and changes (phase 1 of `PLAN_elastix.md`)
 
 Not backward compatible with `mutools.registration.elastix`:

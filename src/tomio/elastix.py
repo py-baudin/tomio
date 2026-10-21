@@ -1,130 +1,189 @@
-""" Implementation of the Elastix registration framework
+""" Image registration: an implementation of the Elastix registration framework
 
 cf:
 - https://en.wikipedia.org/wiki/Elastix_(image_registration)
 - https://elastix.lumc.nl/doxygen/classelastix_1_1RandomSampler.html
 - https://simpleelastix.readthedocs.io/ParameterMaps.html
 
-TODO:
-    - refactor Objective: separate gradient ev. function (less func. calls with some optims)
-    - non-downsampling pyramid (only smoothing)
-    - OptimizerRobinMonro (a_k = a / (k + A)^alpha), alpha=0.6, A=0.1*maxiter, a=...
-    - weighted combination of transforms
-    - handle image orientation
+usage:
+    from tomio import elastix
+    registered, trans = elastix.register(fixed, moving, transform="rigid", metric="mi", return_transform=True)
+    roi_registered = elastix.transform(trans, roi, ref=fixed, method="roi")
 
+configuration: see `Config` and `Config.describe()`
 """
 
-import warnings
-import yaml
+import os
+import copy
+import inspect
 import logging
 from abc import ABC, abstractmethod
 from types import SimpleNamespace
+
+import yaml
 import numpy as np
 from scipy import ndimage, optimize
 
-LOGGER = logging.getLogger(__name__)
+from . import volume as _volume, interp as _interp, configfile as _configfile
 
-""" TODO
-- handle one or several images in `register()` and `transform()`
-"""
+LOGGER = logging.getLogger(__name__)
 
 
 def register(
-    fixed, moving, *, config=None, return_transform=False, reset=False, **kwargs
+    fixed,
+    moving,
+    config=None,
+    *,
+    return_transform=False,
+    reset=False,
+    loglevel="WARN",
+    callback=None,
+    fixed_mask=None,
+    moving_mask=None,
+    **sections,
 ):
-    """helper function to register moving images"""
+    """register moving image(s) onto a fixed image
 
-    if not isinstance(moving, (list, tuple)):
-        single = True
-        moving = [moving]
-    else:
-        # several moving images
-        single = False
+    fixed: fixed image (array, tomio Volume or Image)
+    moving: moving image, or list of moving images
+    config: registration settings (see `Config`): Config, dict, or YAML/JSON file;
+        a list of settings: successive stages (e.g. rigid, then B-spline), each stage starting from the previous ones
+    sections: settings of a single stage, e.g. `transform="rigid"`, `metric={"type": "mi", "nbin": 32}`
+    return_transform: also return the transformation(s)
+    reset: with several moving images, start each registration from the initial parameters
+        (default: start from the parameters found for the previous image)
+    loglevel: logging level
+    callback: function called after each pyramid level: callback(fixed, moving, parameters, config, level=level)
+    fixed_mask: samples are drawn in this mask of the fixed image
+    moving_mask: samples falling outside this mask of the moving image(s) are discarded
 
-    # init config object
-    if not isinstance(config, Config):
-        config = Config(config)
+    returns: registered image(s) (Image), [transformation(s)]
+        the transformation is a `Transformation`, or a `TransformationSequence` with several stages
+    """
+    single = not isinstance(moving, (list, tuple))
+    moving = [moving] if single else list(moving)
+    stages = make_stages(config, **sections)
 
-    fixed = Image(fixed, label="fixed")
-    moving = [Image(im, label="moving") for im in moving]
+    fixed = Image(fixed, mask=fixed_mask, label="fixed")
+    moving = [Image(im, mask=moving_mask, label="moving") for im in moving]
 
-    # get pipeline
-    pipeline = Elastix(config, loglevel=kwargs.pop("loglevel", "WARN"))
-
-    # optimize
-    init = None
     registered = []
     transformations = []
+    inits = [None] * len(stages)
     for im in moving:
-        # optimize
-        transformation, info = pipeline.execute(fixed, im, init=init, **kwargs)
+        found = []
+        for stage, init in zip(stages, inits):
+            pipeline = Elastix(stage, loglevel=loglevel)
+            initial = TransformationSequence(found) if found else None
+            trans, info = pipeline.execute(fixed, im, init=init, callback=callback, initial=initial)
+            found.append(trans)
 
-        # apply transform
-        new = pipeline.apply(transformation, im, label="registered")
-        registered.append(new)
+        transformation = found[0] if len(found) == 1 else TransformationSequence(found)
+        method = stages[-1]["resample"].get("method")
+        registered.append(apply(transformation, im, method=method, label="registered"))
         transformations.append(transformation)
 
         if not reset:
             # use optimized parameters for next registration
-            init = transformation.parameters
+            inits = [trans.parameters for trans in found]
 
     if single:
         registered = registered[0]
         transformations = transformations[0]
 
-    # return
     if return_transform:
         return registered, transformations
     return registered
 
 
-def transform(
-    transformations, moving, *, ref=None, interpolation_order=3, config=None, **kwargs
-):
-    """helper function to transform images"""
+def transform(transformations, moving, *, ref=None, method=None):
+    """apply transformation(s) to image(s)
 
-    if not isinstance(moving, (list, tuple)):
-        single = True
-        moving = [moving]
-    else:
-        # several moving images
-        single = False
+    transformations: Transformation, TransformationSequence or serialized transformation
+        (or a list of them, one per moving image)
+    moving: image or list of images
+    ref: output grid (default: the fixed image of the transformation)
+    method: interpolation method (as `tomio.resample`):
+        None: 'nearest' for integer and bool data, 'spline3' otherwise
+        'nearest', 'linear', 'spline<n>'
+        'roi', 'labels': ROI / label map interpolation (global transforms of 3d images only)
+    """
+    single = not isinstance(moving, (list, tuple))
+    moving = [moving] if single else list(moving)
 
-    if not isinstance(transformations, (tuple, list)):
+    if isinstance(transformations, (Transformation, TransformationSequence, dict)):
+        transformations = [transformations] * len(moving)
+    elif isinstance(transformations, (list, tuple)) and transformations and isinstance(transformations[0], dict) and "transform" in transformations[0]:
+        # serialized sequence
         transformations = [transformations] * len(moving)
     elif single:
         raise ValueError("A single transformation must be given")
     elif len(transformations) != len(moving):
         raise ValueError("Different numbers of moving images and transformations")
 
-    loglevel = kwargs.pop("loglevel", "WARN")
-
-    # init config object
-    if not isinstance(config, Config):
-        config = Config(config)
-
-    # get pipeline
-    pipeline = Elastix(config, loglevel=loglevel)
-
-    if ref is not None:
-        ref = Image(ref, label="reference").geometry
-    moving = [Image(im, label="moving") for im in moving]
-
-    # reference image
+    geometry = None if ref is None else Image(ref, label="reference").geometry
     transformed = []
     for trans, im in zip(transformations, moving):
-        if not isinstance(trans, Transformation):  # parse transformation
-            trans = Transformation.deserialize(trans)
-        if ref is not None:
-            # select source of geometrical information (spacing, origin, etc.)
-            trans = Transformation(trans.transform, ref, trans.parameters, center=trans.center)
-        # apply transformation
-        new = pipeline.apply(trans, im, label="transformed", order=interpolation_order)
+        new = apply(as_transformation(trans), Image(im, label="moving"), geometry=geometry, method=method, label="transformed")
         transformed.append(new)
 
     if single:
         transformed = transformed[0]
     return transformed
+
+
+def apply(transformation, moving, *, geometry=None, method=None, label=None):
+    """resample a moving Image through a transformation
+
+    geometry: output grid (default: transformation's geometry)
+    method: see `transform`
+
+    Global transforms of real 3d images are resampled with `tomio.resample`: the output grid mapped by the
+    transformation is a (possibly oblique) regular grid in the moving image space.
+    """
+    moving = Image(moving)
+    if geometry is not None:
+        transformation = transformation.with_geometry(geometry)
+    geometry = transformation.geometry
+    if method is None:
+        method = _interp.get_default_method(moving.array)
+
+    if transformation.is_global and moving.ndim == 3 and not np.iscomplexobj(moving.array):
+        # mapped grid: T(origin + M @ i) = (A @ origin + t) + (A @ M) @ i
+        A, t = transformation.affine()
+        matrix = A @ geometry.matrix
+        spacing = np.linalg.norm(matrix, axis=0)
+        mapped = {
+            "shape": tuple(int(n) for n in geometry.shape),
+            "spacing": spacing,
+            "origin": A @ geometry.origin + t,
+            "transform": (matrix / spacing).T,
+        }
+        vol = _volume.Volume(moving.array, spacing=moving.spacing, origin=moving.origin, transform=moving.transform)
+        values = np.asarray(_interp.resample(vol, geometry=mapped, method=method))
+    elif method in ("roi", "labels"):
+        raise NotImplementedError(f"Method '{method}' requires a global transform of a real 3d image")
+    else:
+        order = _interp.get_order(method)
+        interpolator = InterpolatorBSpline(order=order, mode="constant", cval=0)
+        values = interpolator(moving, transformation()).reshape(tuple(geometry.shape))
+        if not np.issubdtype(moving.array.dtype, np.inexact):
+            values = np.rint(values).astype(moving.array.dtype)
+
+    return Image(values, spacing=geometry.spacing, origin=geometry.origin, direction=geometry.direction, label=label)
+
+
+def make_stages(config=None, **sections):
+    """list of Config objects (one per registration stage)"""
+    if isinstance(config, (str, os.PathLike)):
+        config = _configfile.read(config)
+    if isinstance(config, (list, tuple)):
+        if sections:
+            raise ValueError("Keyword settings cannot be combined with several stages")
+        if not config:
+            raise ValueError("No registration stage")
+        return [Config(cfg) for cfg in config]
+    return [Config(config, **sections)]
 
 
 def _tolist(value):
@@ -479,9 +538,6 @@ class Pyramid(ABC):
 class PyramidDummy(Pyramid):
     """Pass-through pyramid (does nothing)"""
 
-    def __init__(self, **kwargs):
-        pass
-
     def pyramid(self, *images):
         return [0], [tuple(images)]
 
@@ -585,19 +641,17 @@ class PyramidGaussian(Pyramid):
 
 
 class Transformation:
-    """Container for transformation parameters"""
+    """Transform with parameters: maps points of the fixed image to the moving image"""
 
-    def __init__(self, transform, geometry, parameters, center=None, **kwargs):
+    def __init__(self, transform, geometry, parameters, center=None):
         """
-        transform: Transform object or name (`kwargs`: its settings)
+        transform: Transform object, or type name or serialized transform (dict with a "type" key)
         geometry: output grid (fixed image)
         parameters: transform parameters
         center: rotation center (default: center of `geometry`)
         """
-        if isinstance(transform, str):
-            transform = Transform.deserialize(
-                {"Settings": kwargs, "TransformType": transform}
-            )
+        if isinstance(transform, (str, dict)):
+            transform = Transform.deserialize(transform)
         elif not isinstance(transform, Transform):
             raise TypeError(f"Not a Transform: {transform}")
 
@@ -610,60 +664,151 @@ class Transformation:
     def center(self):
         return self.geometry.center if self._center is None else self._center
 
+    @property
+    def is_global(self):
+        return self.transform.is_global
+
     def __repr__(self):
         clsname = type(self.transform).__name__
         values = ", ".join([f"{float(val):.2}" for val in self.parameters])
         return f"{clsname}([{values}])"
 
+    def with_geometry(self, geometry):
+        """same transformation, other output grid"""
+        return Transformation(self.transform, geometry, self.parameters, center=self.center)
+
     def serialize(self):
-        data = {}
-        data["Transform"] = self.transform.serialize()
-        data["Geometry"] = self.geometry.serialize()
-        data["Parameters"] = self.parameters.tolist()
+        data = {
+            "transform": self.transform.serialize(),
+            "geometry": self.geometry.serialize(),
+            "parameters": self.parameters.tolist(),
+        }
         if self._center is not None:
-            data["Center"] = self._center.tolist()
+            data["center"] = self._center.tolist()
         return data
 
     @classmethod
     def deserialize(cls, data):
-        transform = Transform.deserialize(data["Transform"])
-        geometry = Geometry.deserialize(data["Geometry"])
-        parameters = data["Parameters"]
-        return cls(transform, geometry, parameters, center=data.get("Center"))
+        transform = Transform.deserialize(data["transform"])
+        geometry = Geometry.deserialize(data["geometry"])
+        return cls(transform, geometry, data["parameters"], center=data.get("center"))
 
-    def __call__(self, **kwargs):
-        """transform points"""
-        points = self.geometry.points
+    def __call__(self, points=None, **kwargs):
+        """transform points (default: points of the output grid)"""
+        points = self.geometry.points if points is None else points
         return self.transform(self.parameters, points, center=self.center, **kwargs)
 
-    def __array__(self):
+    def affine(self):
+        """matrix A and vector t of a global transformation: T(x) = A @ x + t"""
+        if not self.is_global:
+            raise ValueError(f"Not a global transform: {self.transform}")
+        ndim = self.geometry.ndim
+        points = self(np.vstack([np.zeros(ndim), np.eye(ndim)]))
+        return (points[1:] - points[0]).T, points[0]
+
+    def __array__(self, dtype=None, copy=None):
         """numpy converter"""
-        return self.parameters
+        return np.asarray(self.parameters, dtype=dtype)
+
+
+class TransformationSequence:
+    """composition of transformations: T(x) = T_n(...T_2(T_1(x)))"""
+
+    def __init__(self, transformations):
+        self.transformations = [as_transformation(trans) for trans in transformations]
+        if not self.transformations:
+            raise ValueError("Empty sequence of transformations")
+
+    def __len__(self):
+        return len(self.transformations)
+
+    def __getitem__(self, index):
+        return self.transformations[index]
+
+    def __iter__(self):
+        return iter(self.transformations)
+
+    def __repr__(self):
+        return f"TransformationSequence({self.transformations})"
+
+    @property
+    def geometry(self):
+        return self.transformations[-1].geometry
+
+    @property
+    def parameters(self):
+        return [trans.parameters for trans in self.transformations]
+
+    @property
+    def is_global(self):
+        return all(trans.is_global for trans in self.transformations)
+
+    def with_geometry(self, geometry):
+        return TransformationSequence([trans.with_geometry(geometry) for trans in self.transformations])
+
+    def __call__(self, points=None):
+        points = self.geometry.points if points is None else points
+        for trans in self.transformations:
+            points = trans(points)
+        return points
+
+    def affine(self):
+        A, t = np.eye(self.geometry.ndim), np.zeros(self.geometry.ndim)
+        for trans in self.transformations:
+            A_, t_ = trans.affine()
+            A, t = A_ @ A, A_ @ t + t_
+        return A, t
+
+    def serialize(self):
+        return [trans.serialize() for trans in self.transformations]
+
+    @classmethod
+    def deserialize(cls, data):
+        return cls([Transformation.deserialize(item) for item in data])
+
+
+def as_transformation(obj):
+    """Transformation or TransformationSequence from an object or its serialized form"""
+    if isinstance(obj, (Transformation, TransformationSequence)):
+        return obj
+    elif isinstance(obj, dict):
+        return Transformation.deserialize(obj)
+    elif isinstance(obj, (list, tuple)):
+        sequence = TransformationSequence.deserialize(obj)
+        return sequence[0] if len(sequence) == 1 else sequence
+    raise TypeError(f"Not a transformation: {obj}")
 
 
 class Transform(ABC):
     """Base class for geometric transform"""
 
+    # affine transform (with fixed matrix and translation)
+    is_global = False
+
     @abstractmethod
     def transform(self, parameters, points, **kwargs):
         pass
 
+    def settings(self):
+        """initialization arguments (serializable)"""
+        return {}
+
+    def serialize(self):
+        return {"type": component_name("transform", self), **self.settings()}
+
     @classmethod
     def deserialize(cls, data):
-        transformtype = data["TransformType"]
-        transform = globals()[transformtype]
-        assert issubclass(transform, cls)
-        settings = data.get("Settings") or {}
-        return transform(**settings)
+        if isinstance(data, str):
+            data = {"type": data}
+        data = dict(data)
+        transform = get_component("transform", data.pop("type"))
+        return transform(**data)
 
     def parse(self, parameters):
         raise NotImplementedError("'parse' is not implemented for this transform")
 
     def pack(self, *args, **kwargs):
         raise NotImplementedError("'pack' is not implemented for this transform")
-
-    def serialize(self):
-        raise NotImplementedError("'serialize' is not implemented for this transform")
 
     def __call__(self, parameters, points, **kwargs):
         parameters = np.ravel(parameters)
@@ -690,11 +835,10 @@ class TransformTranslation(Transform):
     def pack(self, b):
         return b
 
-    def serialize(self):
-        return {
-            "TransformType": "TransformTranslation",
-            "Settings": {"axis": _tolist(self.axis), "init": _tolist(self._init)},
-        }
+    is_global = True
+
+    def settings(self):
+        return {"axis": _tolist(self.axis), "init": _tolist(self._init)}
 
     def init(self, ndim):
         if self._init is not None:
@@ -730,15 +874,10 @@ class TransformRigid(Transform):
         self.axis = None if axis is None else np.asarray(axis) / np.linalg.norm(axis)
         self._init = None if init is None else np.asarray(init)
 
-    def serialize(self):
-        return {
-            "TransformType": "TransformRigid",
-            "Settings": {
-                "axis": _tolist(self.axis),
-                "center": _tolist(self.center),
-                "init": _tolist(self._init),
-            },
-        }
+    is_global = True
+
+    def settings(self):
+        return {"axis": _tolist(self.axis), "center": _tolist(self.center), "init": _tolist(self._init)}
 
     def init(self, ndim):
         if self._init is not None:
@@ -813,14 +952,10 @@ class TransformAffine(Transform):
         self.axis = axis
         self._init = init
 
-    def serialize(self):
-        return {
-            "TransformType": "TransformAffine",
-            "Settings": {
-                "axis": _tolist(self.axis),
-                "init": _tolist(self._init),
-            },
-        }
+    is_global = True
+
+    def settings(self):
+        return {"axis": _tolist(self.axis), "init": _tolist(self._init)}
 
     def init(self, ndim):
         if self._init is not None:
@@ -1119,7 +1254,7 @@ class Optimizer(ABC):
 
 
 class OptimizerGeneric(Optimizer):
-    """Scipy minimizer
+    """Scipy minimizer (other options: see scipy.optimize.minimize)
 
     resample: draw new samples at each iteration (the cost function is then not deterministic,
         which breaks the line searches of quasi-Newton methods)
@@ -1137,8 +1272,10 @@ class OptimizerGeneric(Optimizer):
 
 
 class OptimizerAdaptiveGradientDescent(Optimizer):
-    def __init__(self, **kwargs):
-        self.opts = kwargs
+    """Adaptive gradient descent (adagrad), new samples at each iteration"""
+
+    def __init__(self, niter=20, alpha=1e-1, eps=1e-5, rtol=1e-5):
+        self.opts = {"niter": niter, "alpha": alpha, "eps": eps, "rtol": rtol}
 
     def optimize(self, objective, init):
         sol, info = agd(
@@ -1151,119 +1288,199 @@ class OptimizerAdaptiveGradientDescent(Optimizer):
         return sol, OptimResults(**info)
 
 
+# component registry: section -> {type name: class}
+COMPONENTS = {
+    "transform": {
+        "translation": TransformTranslation,
+        "rigid": TransformRigid,
+        "affine": TransformAffine,
+    },
+    "pyramid": {
+        "gaussian": PyramidGaussian,
+        "none": PyramidDummy,
+    },
+    "sampler": {
+        "full": SamplerFull,
+        "random": SamplerRandom,
+        "random_coordinates": SamplerRandomCoordinates,
+    },
+    "interpolator": {
+        "nearest": InterpolatorNearestNeighbor,
+        "linear": InterpolatorLinear,
+        "bspline": InterpolatorBSpline,
+    },
+    "metric": {
+        "mse": MetricMeanSquares,
+        "mi": MetricMutualInformation,
+    },
+    "optimizer": {
+        "scipy": OptimizerGeneric,
+        "agd": OptimizerAdaptiveGradientDescent,
+    },
+}
+
+
+def get_component(section, name):
+    """component class from its type name"""
+    if section not in COMPONENTS:
+        raise ValueError(f"Unknown section: '{section}' (expected one of: {', '.join(COMPONENTS)})")
+    try:
+        return COMPONENTS[section][name]
+    except (KeyError, TypeError):
+        choices = ", ".join(COMPONENTS[section])
+        raise ValueError(f"Unknown {section} type: '{name}' (expected one of: {choices})") from None
+
+
+def component_name(section, obj):
+    """type name of a component (class or object)"""
+    cls = obj if isinstance(obj, type) else type(obj)
+    for name, comptype in COMPONENTS[section].items():
+        if comptype is cls:
+            return name
+    raise ValueError(f"Unregistered {section}: {cls.__name__}")
+
+
+def component_options(cls):
+    """initialization options and their defaults, and whether other options are accepted (**kwargs)"""
+    if cls.__init__ is object.__init__:
+        return {}, False
+    parameters = list(inspect.signature(cls.__init__).parameters.values())[1:]
+    options = {par.name: par.default for par in parameters if par.kind in (par.POSITIONAL_OR_KEYWORD, par.KEYWORD_ONLY)}
+    return options, any(par.kind == par.VAR_KEYWORD for par in parameters)
+
+
 class Config:
-    """Base class for elastix pipeline settings"""
+    """Registration settings, one section per component
 
-    COMPONENTS = {
-        "Transform": Transform,
-        "Sampler": Sampler,
-        "Interpolator": Interpolator,
-        "Metric": Metric,
-        "Optimizer": Optimizer,
-        "Pyramid": Pyramid,
-    }
+    sections:
+        transform, pyramid, sampler, interpolator, metric, optimizer: component settings, given as
+            - a type name, e.g. "rigid" (default options)
+            - a dict with a "type" key and options, e.g. {"type": "mi", "nbin": 32}
+            - a dict of options only (the current type is kept), e.g. {"maxsample": 5000}
+            - a component object, e.g. TransformRigid(axis=2)
+        resample: {"method": ...}, interpolation of the registered image (see `transform`)
 
-    # defaults
-    SETTINGS = """
-    # Elastix registration configuration
-
-    # Transform type
-    Transform: TransformRigid
-    # choices: TransformRigid, TransformTranslation, TransformAffine
-
-    # Multi-scale image pyramid
-    Pyramid: PyramidGaussian
-
-    # Sample points during optimization
-    Sampler: SamplerRandomCoordinates
-    # choices: SamplerFull, SamplerRandom, SamplerRandomCoordinates
-
-    # Interpolate image values during optimization
-    Interpolator: InterpolatorLinear
-    # choices: InterpolatorLinear, InterpolatorNearestNeighbor, InterpolatorBSpline
-    # note: registered images are interpolated using InterpolatorBSpline
-
-    # Image comparison metric for optimization
-    Metric: MetricMeanSquares
-    # choices: MetricMeanSquares, MetricMutualInformation
-
-    # Local optimization algorithm
-    Optimizer: OptimizerGeneric
-    # OptimizerAdaptiveGradientDescent 
-
-    
-    #
-    # Component settings
-
-    PyramidGaussian:
-        # scale_ratio: 2 # spacing ratio between levels
-        # minlevel: 0 # finest level used
-        # maxlevel: 3 # coarsest level
-        # minsize: 8 # minimum number of pixels of a reduced axis
-
-    # TransformTranslation:
-    # TransformAffine:
-    TransformRigid:
-        # axis: 2 # fixed axis (for 3d volumes)
-        # axis: [0, 0, 1] # idem, more general
-
-    # SamplerRandom:
-    # SamplerRandomCoordinates:
-        # maxsample: 3000 # max number of random samples
-    
-    OptimizerGeneric:
-        jac: True # use jacobian of cost function (recommanded)
-        # method: 'cg', 'BFGS', ... (cf scipy.optimize.minimize)
-
-    # other settings
-    ResampleInterpolator: # BSpline interpolator
-        order: 3
-
+    examples:
+        Config(transform="rigid", metric="mi")
+        Config({"transform": {"type": "rigid", "axis": 2}, "metric": "mi"})
+        Config("config.yml")
+        Config.describe()  # available types and options
     """
 
-    def __init__(self, custom=None):
-        settings = yaml.safe_load(self.SETTINGS)
-        if custom:
-            settings.update(custom)
-        missing = set(self.COMPONENTS) - set(settings)
-        if missing:
-            raise ValueError(f"Missing components: {missing}")
-        self.settings = settings
+    SECTIONS = tuple(COMPONENTS) + ("resample",)
 
-    def __getitem__(self, key):
-        return self.settings[key]
+    DEFAULTS = {
+        "transform": "rigid",
+        "pyramid": "gaussian",
+        "sampler": "random_coordinates",
+        "interpolator": "linear",
+        "metric": "mse",
+        "optimizer": "scipy",
+        "resample": {"method": None},
+    }
 
-    def __setitem__(self, key, value):
-        self.settings[key] = value
+    def __init__(self, config=None, **sections):
+        if isinstance(config, Config):
+            config = config.to_dict()
+        elif isinstance(config, (str, os.PathLike)):
+            config = _configfile.read(config)
+        if config is not None and not isinstance(config, dict):
+            raise TypeError(f"Invalid configuration: {config!r}")
+        self._sections = {}
+        for name, value in self.DEFAULTS.items():
+            self[name] = value
+        for name, value in {**(config or {}), **sections}.items():
+            self[name] = value
+
+    def __getitem__(self, name):
+        value = self._sections[name]
+        return value if isinstance(value, dict) is False else dict(value)
+
+    def __setitem__(self, name, value):
+        if name not in self.SECTIONS:
+            raise ValueError(f"Unknown section: '{name}' (expected one of: {', '.join(self.SECTIONS)})")
+        if name == "resample":
+            value = {"method": value} if value is None or isinstance(value, str) else dict(value)
+            unknown = set(value) - {"method"}
+            if unknown:
+                raise ValueError(f"Unknown resample option(s): {', '.join(sorted(unknown))}")
+            self._sections[name] = {**self._sections.get(name, {}), **value}
+            return
+        if isinstance(value, str):
+            value = {"type": value}
+        elif not isinstance(value, dict):
+            # component object
+            component_name(name, value)  # registered type
+            self._sections[name] = value
+            return
+        value = dict(value)
+        if "type" not in value:
+            # options of the current type
+            current = self._sections.get(name)
+            if not isinstance(current, dict):
+                raise ValueError(f"No type for section '{name}'")
+            value = {**current, **value}
+        cls = get_component(name, value["type"])
+        options, any_option = component_options(cls)
+        if not any_option:
+            unknown = set(value) - {"type"} - set(options)
+            if unknown:
+                raise ValueError(
+                    f"Unknown option(s) for {name} '{value['type']}': {', '.join(sorted(unknown))}"
+                    f" (expected: {', '.join(options) or 'none'})"
+                )
+        self._sections[name] = value
+
+    def __contains__(self, name):
+        return name in self._sections
+
+    def __eq__(self, other):
+        return isinstance(other, Config) and self.to_dict() == other.to_dict()
+
+    def to_dict(self):
+        """settings as a dict (component objects are kept as is)"""
+        return {name: (dict(value) if isinstance(value, dict) else value) for name, value in self._sections.items()}
 
     def __repr__(self):
-        return repr(self.settings)
+        return f"Config({self.to_dict()!r})"
 
     def __str__(self):
-        components = {c: self.settings[c] for c in self.COMPONENTS}
-        options = {c: self.settings.get(c) for c in components.values()}
-        repr = "# Components\n"
-        repr += yaml.dump(components)
-        repr += "# Options\n"
-        for name in options:
-            if not options[name]:
-                continue
-            repr += yaml.dump({name: options[name]})
+        data = {
+            name: (value if isinstance(value, dict) else {"type": component_name(name, value), "object": repr(value)})
+            for name, value in self.to_dict().items()
+        }
+        return yaml.safe_dump(data, sort_keys=False, default_flow_style=None).strip()
 
-        return repr
-        # return yaml.dump(self.settings, default_flow_style=None)
+    def setup(self, name):
+        """instantiate the component of a section"""
+        if name not in COMPONENTS:
+            raise ValueError(f"Unknown component: '{name}' (expected one of: {', '.join(COMPONENTS)})")
+        value = self._sections[name]
+        if not isinstance(value, dict):
+            # component object: fresh copy (components may hold state, e.g. samplers)
+            return copy.deepcopy(value)
+        options = dict(value)
+        cls = get_component(name, options.pop("type"))
+        return cls(**options)
 
-    def setup(self, component):
-        """instantiate component"""
-        if not component in self.COMPONENTS:
-            raise ValueError(f"Unknown component: '{component}'")
-        compname = self.settings.get(component)
-        comptype = globals()[compname]
-        if not issubclass(comptype, self.COMPONENTS[component]):
-            raise ValueError(f"Invalid {component} type: {compname}")
-        params = self.settings.get(compname, {})
-        settings = dict(params or {})
-        return comptype(**settings)
+    @classmethod
+    def describe(cls):
+        """available components and their options (text)"""
+        lines = []
+        for section, types in COMPONENTS.items():
+            lines.append(f"{section}: (default: {cls.DEFAULTS[section]})")
+            for name, comptype in types.items():
+                doc = (comptype.__doc__ or "").strip().splitlines()
+                lines.append(f"    {name}: {doc[0] if doc else comptype.__name__}")
+                options, any_option = component_options(comptype)
+                for option, default in options.items():
+                    default = "" if default is inspect.Parameter.empty else f" = {default!r}"
+                    lines.append(f"        {option}{default}")
+                if any_option:
+                    lines.append("        (other options passed through)")
+        lines.append("resample:")
+        lines.append("    method = None  # see `transform`")
+        return "\n".join(lines)
 
 
 class Objective:
@@ -1278,9 +1495,12 @@ class Objective:
         metric: Metric,
         interpolator: Interpolator,
         center=None,
+        initial=None,
     ):
         """
         center: center of rotation (default: center of the fixed image)
+        initial: transformation applied before `transform` (e.g. previous registration stages),
+            function of the fixed points
         """
         self.fixed = fixed
         self.moving = moving
@@ -1289,16 +1509,27 @@ class Objective:
         self.interpolator = interpolator
         self.metric = metric
         self.center = fixed.geometry.center if center is None else np.asarray(center)
+        self.initial = initial
+        self._moving_mask = None
+        if moving.mask is not None:
+            self._moving_mask = Image(
+                moving.mask.astype(float), spacing=moving.spacing, origin=moving.origin, direction=moving.direction
+            )
         self.normalize = lambda f, m: (fixed.normalize(f), moving.normalize(m))
 
     def valid(self, points2, values2):
-        """samples inside the moving image, with finite values"""
-        return self.moving.geometry.contains(points2) & np.isfinite(values2)
+        """samples inside the moving image (and its mask), with finite values"""
+        valid = self.moving.geometry.contains(points2) & np.isfinite(values2)
+        if self._moving_mask is not None:
+            valid &= InterpolatorNearestNeighbor()(self._moving_mask, points2) > 0
+        return valid
 
     def __call__(self, parameters, gradient=False, **kwargs):
         transform_args = {"center": self.center}
         metric_args = {"normalize": self.normalize, **kwargs}
         points1, values1 = self.sampler(self.fixed)
+        if self.initial is not None:
+            points1 = self.initial(points1)
         if not gradient:
             points2 = self.transform(parameters, points1, **transform_args)
             values2 = self.interpolator(self.moving, points2)
@@ -1340,34 +1571,23 @@ class Elastix:
         loglevel = loglevel if loglevel else "WARN"  # default log-level
         self.logger.setLevel(getattr(logging, str(loglevel), loglevel))
 
-    def apply(self, transformation: Transformation, moving: Image, label=None, order=None):
-        """generate transformed image
+    def apply(self, transformation, moving, *, geometry=None, method=None, label=None):
+        """resample moving image (see `apply`); default method: config["resample"]"""
+        if method is None:
+            method = self.config["resample"].get("method")
+        return apply(transformation, moving, geometry=geometry, method=method, label=label)
 
-        order: interpolation order (default: config["ResampleInterpolator"])
+    def execute(self, fixed: Image, moving: Image, init=None, callback=None, initial=None):
+        """compute transform
+
+        init: initial parameters
+        callback: called after each level: callback(fixed, moving, parameters, config, level=level)
+        initial: transformation applied before the optimized transform (previous stages)
         """
-        assert isinstance(transformation, Transformation)
-        options = {"mode": "constant", "cval": 0, **(self.config.settings.get("ResampleInterpolator") or {})}
-        if order is not None:
-            options["order"] = order
-        interpolator = InterpolatorBSpline(**options)
-
-        points2 = transformation()
-        values = interpolator(moving, points2)
-        geom = transformation.geometry
-        return Image(
-            values.reshape(geom.shape),
-            spacing=geom.spacing,
-            origin=geom.origin,
-            direction=geom.direction,
-            label=label,
-        )
-
-    def execute(self, fixed: Image, moving: Image, init=None, callback=None):
-        """compute transform"""
         LOGGER.info("Execute pipeline")
 
-        pyramid = self.config.setup("Pyramid")
-        optimizer = self.config.setup("Optimizer")
+        pyramid = self.config.setup("pyramid")
+        optimizer = self.config.setup("optimizer")
         self.logger.info(f"Using pyramid: {pyramid}")
         self.logger.info(f"Using optimizer: {optimizer}")
 
@@ -1386,10 +1606,10 @@ class Elastix:
                 f"Spacing: fixed={_fixed.spacing}, moving={_moving.spacing}"
             )
 
-            transform = self.config.setup("Transform")
-            sampler = self.config.setup("Sampler")
-            interpolator = self.config.setup("Interpolator")
-            metric = self.config.setup("Metric")
+            transform = self.config.setup("transform")
+            sampler = self.config.setup("sampler")
+            interpolator = self.config.setup("interpolator")
+            metric = self.config.setup("metric")
 
             self.logger.info(f"Using transform: {transform}")
             self.logger.info(f"Using sampler: {sampler}")
@@ -1398,7 +1618,7 @@ class Elastix:
 
             # objective
             objective = Objective(
-                _fixed, _moving, transform, sampler, metric, interpolator, center=center
+                _fixed, _moving, transform, sampler, metric, interpolator, center=center, initial=initial
             )
 
             # initial parameter values

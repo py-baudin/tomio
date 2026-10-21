@@ -5,6 +5,7 @@ Regression tests of the bugs fixed in phase 1 are labelled with their id in PLAN
 import numpy as np
 import pytest
 
+import tomio as io
 from tomio import elastix as ex
 
 
@@ -85,10 +86,10 @@ def make_objective(fixed, moving, config=None, spacing=None):
     return ex.Objective(
         ex.Image(fixed, spacing=spacing),
         ex.Image(moving, spacing=spacing),
-        config.setup("Transform"),
-        config.setup("Sampler"),
-        config.setup("Metric"),
-        config.setup("Interpolator"),
+        config.setup("transform"),
+        config.setup("sampler"),
+        config.setup("metric"),
+        config.setup("interpolator"),
     )
 
 
@@ -97,8 +98,8 @@ def finite_gradient(func, params, step=1e-5):
     return np.array([(func(params + step * e) - func(params - step * e)) / (2 * step) for e in np.eye(len(params))])
 
 
-TRANSLATION = {"Transform": "TransformTranslation"}
-MI = {"Metric": "MetricMutualInformation"}
+TRANSLATION = {"transform": "translation"}
+MI = {"metric": "mi"}
 
 
 # registration
@@ -149,10 +150,10 @@ def test_transform_matches_register():
     assert np.allclose(np.asarray(ex.transform(trans.serialize(), moving)), np.asarray(registered))
 
 
-@pytest.mark.parametrize("transform", ["TransformTranslation", "TransformRigid", "TransformAffine"])
+@pytest.mark.parametrize("transform", ["translation", "rigid", "affine"])
 def test_serialize_roundtrip(transform):
     fixed, moving = shifted((32, 32), (1.0, 0.5))
-    _, trans = ex.register(fixed, moving, config={"Transform": transform}, return_transform=True)
+    _, trans = ex.register(fixed, moving, transform=transform, return_transform=True)
     trans2 = ex.Transformation.deserialize(trans.serialize())
     assert type(trans2.transform) is type(trans.transform)
     assert np.allclose(trans2.parameters, trans.parameters)
@@ -163,8 +164,8 @@ def test_serialize_roundtrip(transform):
     "config, params",
     [
         (TRANSLATION, [0.3, 0.2]),
-        ({"Transform": "TransformRigid"}, [0.01, 0.3, 0.2]),
-        ({"Transform": "TransformAffine"}, [1.01, 0.02, -0.01, 0.99, 0.3, 0.2]),
+        ({"transform": "rigid"}, [0.01, 0.3, 0.2]),
+        ({"transform": "affine"}, [1.01, 0.02, -0.01, 0.99, 0.3, 0.2]),
         ({**TRANSLATION, **MI}, [0.3, 0.2]),
     ],
 )
@@ -177,10 +178,106 @@ def test_gradient_unit_spacing(config, params):
 
 def test_config_defaults():
     config = ex.Config()
-    for component in ex.Config.COMPONENTS:
-        assert config.setup(component) is not None
+    for section in ex.COMPONENTS:
+        assert config.setup(section) is not None
+        assert config[section]["type"] == ex.Config.DEFAULTS[section]
     with pytest.raises(ValueError):
-        ex.Config({"Transform": None}).setup("Unknown")
+        config.setup("unknown")
+
+
+def test_config_sections():
+    # type name, dict with type and options, options only
+    config = ex.Config(transform="affine", metric={"type": "mi", "nbin": 16})
+    assert isinstance(config.setup("transform"), ex.TransformAffine)
+    assert config.setup("metric").nbin == 16
+    config["metric"] = {"nbin": 8}  # keep type
+    assert config["metric"] == {"type": "mi", "nbin": 8}
+    config["metric"] = "mse"  # new type: default options
+    assert config["metric"] == {"type": "mse"}
+    # dict and keywords
+    config = ex.Config({"transform": "translation", "metric": "mi"}, metric="mse")
+    assert config["transform"]["type"] == "translation" and config["metric"]["type"] == "mse"
+    # copy
+    assert ex.Config(config) == config
+
+
+def test_config_component_object():
+    config = ex.Config(transform=ex.TransformRigid(axis=2))
+    transform = config.setup("transform")
+    assert isinstance(transform, ex.TransformRigid) and np.allclose(transform.axis, [0, 0, 1])
+    # a new object at each setup (components may hold state)
+    assert config.setup("transform") is not transform
+
+
+@pytest.mark.parametrize(
+    "sections, message",
+    [
+        ({"foo": "rigid"}, "Unknown section"),
+        ({"transform": "foo"}, "Unknown transform type"),
+        ({"metric": {"type": "mi", "nbins": 32}}, "Unknown option"),
+        ({"metric": {"nbin": 32}}, "Unknown option"),  # default metric (mse) has no option
+        ({"resample": {"order": 3}}, "Unknown resample option"),
+    ],
+)
+def test_config_validation(sections, message):
+    with pytest.raises(ValueError, match=message):
+        ex.Config(sections)
+
+
+def test_config_file(tmp_path):
+    from tomio import configfile
+
+    configfile.write(tmp_path / "config.yml", {"transform": {"type": "rigid", "axis": 2}, "metric": "mi"})
+    config = ex.Config(tmp_path / "config.yml")
+    assert config["transform"] == {"type": "rigid", "axis": 2}
+    assert config["metric"]["type"] == "mi"
+    # stages
+    configfile.write(tmp_path / "stages.yml", [{"transform": "translation"}, {"transform": "rigid"}])
+    stages = ex.make_stages(tmp_path / "stages.yml")
+    assert [stage["transform"]["type"] for stage in stages] == ["translation", "rigid"]
+
+
+def test_config_describe():
+    text = ex.Config.describe()
+    for section, types in ex.COMPONENTS.items():
+        assert f"{section}:" in text
+        for name in types:
+            assert f"    {name}:" in text
+    assert "nbin = 32" in text
+
+
+def test_config_str():
+    import yaml
+
+    config = ex.Config(transform={"type": "rigid", "axis": 2}, metric="mi")
+    assert ex.Config(yaml.safe_load(str(config))) == config
+
+
+def test_register_keywords():
+    fixed, moving = shifted((40, 40), (1.5, 1.0))
+    _, trans = ex.register(fixed, moving, transform="translation", metric="mi", return_transform=True)
+    assert isinstance(trans.transform, ex.TransformTranslation)
+    assert np.allclose(trans.parameters, (1.5, 1.0), atol=0.05)
+    with pytest.raises(ValueError):
+        ex.register(fixed, moving, [TRANSLATION, TRANSLATION], metric="mi")
+
+
+def test_register_stages():
+    fixed, moving = rotated((48, 48), 0.05, (2.5, -1.5))
+    registered, trans = ex.register(fixed, moving, [TRANSLATION, {"transform": "rigid"}], return_transform=True)
+    assert isinstance(trans, ex.TransformationSequence) and len(trans) == 2
+    assert isinstance(trans[0].transform, ex.TransformTranslation)
+    assert isinstance(trans[1].transform, ex.TransformRigid)
+    assert inner_error(registered, fixed) < 0.1 * inner_error(moving, fixed)
+    # composition: second stage applied after the first
+    points = np.random.default_rng(0).uniform(0, 40, size=(5, 2))
+    assert np.allclose(trans(points), trans[1](trans[0](points)))
+    # serialization
+    data = trans.serialize()
+    assert isinstance(data, list) and len(data) == 2
+    trans2 = ex.as_transformation(data)
+    assert np.allclose(trans2(points), trans(points))
+    assert np.allclose(np.asarray(ex.transform(data, moving)), np.asarray(registered))
 
 
 # regression tests (PLAN_elastix.md, phase 1)
@@ -188,7 +285,7 @@ def test_config_defaults():
 # B1 (fixed): Elastix.execute ignores `init`
 def test_execute_uses_init():
     fixed, moving = shifted((32, 32), (1.0, 0.5))
-    config = ex.Config({**TRANSLATION, "Pyramid": "PyramidDummy", "OptimizerGeneric": {"options": {"maxiter": 0}}})
+    config = ex.Config({**TRANSLATION, "pyramid": "none", "optimizer": {"options": {"maxiter": 0}}})
     trans, _ = ex.Elastix(config).execute(ex.Image(fixed), ex.Image(moving), init=[0.7, 0.3])
     assert np.allclose(trans.parameters, [0.7, 0.3])
 
@@ -202,11 +299,11 @@ def test_transform_with_ref():
 
 
 # B3 (fixed): serialize uses the bound method `self.init`
-@pytest.mark.parametrize("transform, init", [("TransformRigid", [0.1, 1.0, 2.0]), ("TransformAffine", [1, 0, 0, 1, 1.0, 2.0])])
+@pytest.mark.parametrize("transform, init", [("rigid", [0.1, 1.0, 2.0]), ("affine", [1, 0, 0, 1, 1.0, 2.0])])
 def test_serialize_with_init(transform, init):
-    trans = ex.Transformation(transform, ex.Geometry((8, 8)), init, init=np.asarray(init))
+    trans = ex.Transformation({"type": transform, "init": np.asarray(init)}, ex.Geometry((8, 8)), init)
     data = ex.Transformation.deserialize(trans.serialize()).transform.serialize()
-    assert np.allclose(data["Settings"]["init"], init)
+    assert np.allclose(data["init"], init)
 
 
 # B4 (fixed): TransformTranslation.serialize drops `axis`
@@ -237,7 +334,7 @@ def test_gradient_mi_intensity_scale():
 # B7 (fixed): B-spline interpolator gradient has the wrong shape
 def test_register_bspline_interpolator():
     fixed, moving = shifted((32, 32), (1.0, 0.5))
-    _, trans = ex.register(fixed, moving, config={**TRANSLATION, "Interpolator": "InterpolatorBSpline"}, return_transform=True)
+    _, trans = ex.register(fixed, moving, config={**TRANSLATION, "interpolator": "bspline"}, return_transform=True)
     assert np.allclose(trans.parameters, (1.0, 0.5), atol=0.05)
 
 
@@ -251,7 +348,7 @@ def test_cost_out_of_fov():
 # B8 (fixed): out-of-FOV samples make the cost discontinuous at the image border (full sampling)
 def test_register_full_sampler():
     fixed, moving = shifted((32, 32), (1.0, 0.5))
-    _, trans = ex.register(fixed, moving, config={**TRANSLATION, "Sampler": "SamplerFull"}, return_transform=True)
+    _, trans = ex.register(fixed, moving, config={**TRANSLATION, "sampler": "full"}, return_transform=True)
     assert np.allclose(trans.parameters, (1.0, 0.5), atol=0.05)
 
 
@@ -279,7 +376,7 @@ def test_rigid_array_axis():
 # B14 (fixed): the default pyramid goes down to a few pixels
 def test_pyramid_default_levels():
     image = ex.Image(phantom((48, 48, 12)))
-    levels, images = ex.Config().setup("Pyramid")(image)
+    levels, images = ex.Config().setup("pyramid")(image)
     assert len(levels) <= 4
     assert min(images[0][0].shape) >= 4
 
@@ -306,20 +403,20 @@ def test_parzen_spline0_boundary():
 
 
 GRADIENT_TRANSFORMS = {
-    "TransformTranslation": [0.3, 0.2, 0.7],
-    "TransformRigid": [0.02, -0.01, 0.03, 0.3, 0.2, 0.7],
-    "TransformAffine": [1.01, 0.02, -0.01, 0.01, 0.99, 0.02, -0.02, 0.01, 1.02, 0.3, 0.2, 0.7],
+    "translation": [0.3, 0.2, 0.7],
+    "rigid": [0.02, -0.01, 0.03, 0.3, 0.2, 0.7],
+    "affine": [1.01, 0.02, -0.01, 0.01, 0.99, 0.02, -0.02, 0.01, 1.02, 0.3, 0.2, 0.7],
 }
 
 
 # B5, B6, B7 (fixed): gradients of all components, anisotropic spacing and intensity range
 @pytest.mark.parametrize("transform", list(GRADIENT_TRANSFORMS))
-@pytest.mark.parametrize("interpolator", ["InterpolatorLinear", "InterpolatorBSpline"])
-@pytest.mark.parametrize("metric", ["MetricMeanSquares", "MetricMutualInformation"])
+@pytest.mark.parametrize("interpolator", ["linear", "bspline"])
+@pytest.mark.parametrize("metric", ["mse", "mi"])
 def test_gradient_components(transform, interpolator, metric):
     spacing = (1.0, 1.5, 4.0)
     fixed, moving = shifted((16, 16, 8), (1.0, -1.0, 2.0), spacing=spacing, scale=50)
-    config = {"Transform": transform, "Interpolator": interpolator, "Metric": metric}
+    config = {"transform": transform, "interpolator": interpolator, "metric": metric}
     objective = make_objective(fixed, moving, config, spacing=spacing)
     params = GRADIENT_TRANSFORMS[transform]
     _, gradient = objective(params, gradient=True)
@@ -344,10 +441,8 @@ def test_register_oblique():
 
 def test_image_from_volume():
     """tomio Volume: transform = rows of axis directions (columns of the ITK direction matrix)"""
-    from tomio import Volume
-
     direction = np.array([[0, 1, 0], [0, 0, 1], [1, 0, 0]], dtype=float)
-    vol = Volume(np.zeros((4, 5, 6)), spacing=(1, 2, 3), origin=(1, 1, 1), transform=direction.T)
+    vol = io.Volume(np.zeros((4, 5, 6)), spacing=(1, 2, 3), origin=(1, 1, 1), transform=direction.T)
     image = ex.Image(vol)
     assert np.allclose(image.direction, direction)
     assert np.allclose(image.geometry.to_points([[1, 1, 1]]), vol.get_coords([1, 1, 1]))
@@ -363,7 +458,7 @@ def test_image_keeps_mask():
 # B10 (fixed): the transform found at a coarse level is applied on the full resolution grid
 def test_register_minlevel():
     fixed, moving = rotated((48, 48), 0.05, (2.5, -1.5))
-    config = {**MI, "PyramidGaussian": {"minlevel": 1}}
+    config = {**MI, "pyramid": {"minlevel": 1}}
     registered = ex.register(fixed, moving, config=config)
     assert inner_error(registered, fixed) < 0.2 * inner_error(moving, fixed)
 
@@ -394,9 +489,77 @@ def test_register_fixed_slab():
     fixed = sample_phantom((32, 32, 4), **slab)
     moving = sample_phantom((32, 32, 32), shift=shift)
     # samples on the fixed grid (random coordinates interpolate the fixed image between thick slices)
-    config = {**TRANSLATION, **MI, "Sampler": "SamplerRandom"}
+    config = {**TRANSLATION, **MI, "sampler": "random"}
     _, trans = ex.register(ex.Image(fixed, **slab), ex.Image(moving), config=config, return_transform=True)
     assert np.allclose(trans.parameters, shift, atol=0.05)
+
+
+# transform(): methods, global transforms through tomio.resample
+
+def rigid_transformation(geometry, params=(0.02, -0.01, 0.05, 1.5, -1.0, 2.0)):
+    return ex.Transformation("rigid", geometry, np.asarray(params, dtype=float))
+
+
+def test_transformation_affine():
+    trans = rigid_transformation(ex.Geometry((10, 12, 8), spacing=(1, 1, 3)))
+    A, t = trans.affine()
+    points = np.random.default_rng(0).uniform(0, 10, size=(5, 3))
+    assert np.allclose(points @ A.T + t, trans(points))
+    assert np.allclose(A, ex.euler_to_matrix(trans.parameters[:3]))
+
+
+@pytest.mark.parametrize("method, order", [("linear", 1), ("spline3", 3)])
+def test_transform_global_3d(method, order):
+    """global 3d transforms: tomio.resample on the mapped grid == interpolation at the transformed points"""
+    spacing = (1.0, 1.0, 3.0)
+    moving = ex.Image(sample_phantom((24, 24, 10), spacing=spacing), spacing=spacing)
+    ref = ex.Image(np.zeros((20, 22, 8)), spacing=(1.2, 1.0, 3.5), origin=(1, 2, 3))
+    trans = rigid_transformation(ref.geometry)
+    out = ex.transform(trans, moving, ref=ref, method=method)
+    expected = ex.InterpolatorBSpline(order=order, mode="constant")(moving, trans()).reshape(out.shape)
+    inner = (slice(4, -4), slice(4, -4), slice(2, -2))
+    assert np.allclose(np.asarray(out)[inner], expected[inner], atol=1e-4)
+    assert np.allclose(out.spacing, ref.spacing) and np.allclose(out.origin, ref.origin)
+
+
+def test_transform_roi_sparse_slices():
+    """ROI labelled on every 4th slice: 'roi' method of tomio.resample"""
+    roi = np.zeros((20, 20, 24), dtype=np.uint8)
+    roi[5:15, 5:15, ::4] = 1
+    roi[8:12, 8:12, ::4] = 2
+    roi = io.Volume(roi, spacing=(1, 1, 5))
+    # target slices between the labelled slices (z = 0, 20, 40...)
+    target = io.Volume(np.zeros((20, 20, 4)), spacing=(1, 1, 20), origin=(0, 0, 10))
+    identity = ex.Transformation("rigid", ex.Image(target).geometry, np.zeros(6))
+    out = ex.transform(identity, roi, ref=target, method="roi")
+    assert np.array_equal(np.asarray(out), io.resample(roi, like=target, method="roi"))
+    assert set(np.unique(out)) == {0, 1, 2}
+    # nearest neighbour misses the labelled slices
+    assert set(np.unique(ex.transform(identity, roi, ref=target, method="nearest"))) == {0}
+
+
+def test_transform_default_method():
+    labels = np.zeros((16, 16, 8), dtype=np.uint8)
+    labels[4:12, 4:12, 2:6] = 3
+    trans = rigid_transformation(ex.Geometry(labels.shape))
+    out = ex.transform(trans, labels)
+    assert np.asarray(out).dtype == np.uint8
+    assert set(np.unique(out)) <= {0, 3}
+
+
+def test_transform_roi_2d_not_supported():
+    trans = ex.Transformation("translation", ex.Geometry((8, 8)), [1.0, 0.0])
+    with pytest.raises(NotImplementedError):
+        ex.transform(trans, np.zeros((8, 8), dtype=np.uint8), method="roi")
+
+
+def test_transform_complex_3d():
+    """complex images: own interpolation (not tomio.resample)"""
+    image = sample_phantom((16, 16, 8)) * (1 + 1j)
+    trans = rigid_transformation(ex.Geometry(image.shape), params=np.zeros(6))
+    out = ex.transform(trans, image, method="linear")
+    assert np.iscomplexobj(np.asarray(out))
+    assert np.allclose(np.asarray(out), image)
 
 
 # tests ported from mutools (test/registration/test_elastix.py)
@@ -666,18 +829,18 @@ def test_transform_class():
 
 def test_transformation_class():
     geometry = elastix.Geometry((10, 12, 12))
-    transf = elastix.Transformation("TransformRigid", geometry, [0, 1, 2], axis=2)
+    transf = elastix.Transformation({"type": "rigid", "axis": 2}, geometry, [0, 1, 2])
     assert np.allclose(transf.transform.axis, [0, 0, 1])
     assert np.allclose(np.asarray(transf), [0, 1, 2])
     # assert np.allclose(transf([[0, 0, 0]]), [[1, 2, 0]])
 
     # test serialize
     data = transf.serialize()
-    assert data["Transform"]["TransformType"] == "TransformRigid"
-    assert np.allclose(data["Transform"]["Settings"]["axis"], transf.transform.axis)
-    assert data["Transform"]["Settings"]["center"] is None
-    assert data["Transform"]["Settings"]["init"] is None
-    assert np.allclose(data["Parameters"], [0, 1, 2])
+    assert data["transform"]["type"] == "rigid"
+    assert np.allclose(data["transform"]["axis"], transf.transform.axis)
+    assert data["transform"]["center"] is None
+    assert data["transform"]["init"] is None
+    assert np.allclose(data["parameters"], [0, 1, 2])
     transf2 = transf.deserialize(data)
     assert np.allclose(transf2.parameters, [0, 1, 2])
     assert transf2.transform.center is None
@@ -838,8 +1001,9 @@ def test_objective_class():
     # sample in the center: the transformed samples stay inside the moving image
     fixed.mask = arr > 0
 
+    # (moving image without mask: the mask of `fixed` restricts the samples only)
     objective0 = elastix.Objective(
-        fixed, fixed, transform, sampler, metric, interpolator
+        fixed, fixed.copy(mask=None), transform, sampler, metric, interpolator
     )
     objective = elastix.Objective(
         fixed, moving, transform, sampler, metric, interpolator
@@ -927,35 +1091,33 @@ def test_objective_class():
 def test_config_class():
     config = elastix.Config()
 
-    assert isinstance(config.setup("Transform"), elastix.Transform)
-    assert isinstance(config.setup("Sampler"), elastix.Sampler)
-    assert isinstance(config.setup("Optimizer"), elastix.Optimizer)
-    assert isinstance(config.setup("Interpolator"), elastix.Interpolator)
-    assert isinstance(config.setup("Metric"), elastix.Metric)
-    assert isinstance(config.setup("Pyramid"), elastix.Pyramid)
+    assert isinstance(config.setup("transform"), elastix.Transform)
+    assert isinstance(config.setup("sampler"), elastix.Sampler)
+    assert isinstance(config.setup("optimizer"), elastix.Optimizer)
+    assert isinstance(config.setup("interpolator"), elastix.Interpolator)
+    assert isinstance(config.setup("metric"), elastix.Metric)
+    assert isinstance(config.setup("pyramid"), elastix.Pyramid)
 
     # update default
-    assert isinstance(config.setup("Transform"), elastix.TransformRigid)
-    config = elastix.Config({"Transform": "TransformAffine"})
-    assert isinstance(config.setup("Transform"), elastix.TransformAffine)
+    assert isinstance(config.setup("transform"), elastix.TransformRigid)
+    config = elastix.Config({"transform": "affine"})
+    assert isinstance(config.setup("transform"), elastix.TransformAffine)
 
     # update settings
-    config["Transform"] = "TransformRigid"
-    assert isinstance(config.setup("Transform"), elastix.TransformRigid)
+    config["transform"] = "rigid"
+    assert isinstance(config.setup("transform"), elastix.TransformRigid)
 
 
 def test_pipeline_class():
 
     config = elastix.Config(
         {
-            "Optimizer": "OptimizerGeneric",
-            "Pyramid": "PyramidDummy",
-            "Sampler": "SamplerFull",
-            "Metric": "MetricMeanSquares",
-            "Transform": "TransformRigid",
-            "Interpolator": "InterpolatorLinear",
-            # options
-            "InterpolatorLinear": {"mode": "nearest"},
+            "optimizer": "scipy",
+            "pyramid": "none",
+            "sampler": "full",
+            "metric": "mse",
+            "transform": "rigid",
+            "interpolator": {"type": "linear", "mode": "nearest"},
         }
     )
     pipeline = elastix.Elastix(config)
@@ -966,7 +1128,7 @@ def test_pipeline_class():
     arr2 = np.c_[arr - 1, arr[:, -1]]
     im2 = elastix.Image(arr2)
 
-    tr = elastix.Transformation("TransformRigid", im1.geometry, [0, 0, 1])
+    tr = elastix.Transformation("rigid", im1.geometry, [0, 0, 1])
     assert np.allclose(arr, pipeline.apply(tr, im2), atol=1e-5)
 
     # register images
@@ -1080,3 +1242,39 @@ def _test_adg():
     # plt.plot(info["values"])
     # plt.hlines(minloss, *plt.xlim(), color="k")
     # plt.show()
+
+
+# masks
+
+def test_register_masks():
+    fixed, moving = shifted((48, 48), (1.5, 1.0))
+    # corrupted images, 4 pixels away from the masks
+    # (interpolation and smoothing mix the values on each side of the mask border)
+    mask = np.zeros((48, 48), dtype=bool)
+    mask[12:36, 12:36] = True
+    clean = np.zeros((48, 48), dtype=bool)
+    clean[8:40, 8:40] = True
+    noise = np.random.default_rng(0).uniform(size=(48, 48))
+    moving_bad = np.where(clean, moving, noise)
+    fixed_bad = np.where(clean, fixed, noise)
+    options = dict(transform="translation", return_transform=True)
+    _, trans = ex.register(fixed_bad, moving_bad, fixed_mask=mask, moving_mask=mask, **options)
+    assert np.allclose(trans.parameters, (1.5, 1.0), atol=0.05)
+    # without masks
+    _, trans = ex.register(fixed_bad, moving_bad, **options)
+    assert not np.allclose(trans.parameters, (1.5, 1.0), atol=0.05)
+
+
+def test_objective_moving_mask():
+    fixed, moving = shifted((20, 20), (0.0, 0.0))
+    mask = np.zeros((20, 20), dtype=bool)
+    mask[:, :10] = True
+    config = ex.Config(transform="translation", sampler="full")
+    objective = ex.Objective(
+        ex.Image(fixed), ex.Image(moving, mask=mask, spacing=(2, 2)), config.setup("transform"),
+        config.setup("sampler"), config.setup("metric"), config.setup("interpolator"),
+    )
+    # moving mask in moving coordinates (spacing 2): pixels 0..9 along axis 1, i.e. y < 19 mm
+    points = np.c_[np.full(5, 10.0), [4.2, 17.2, 18.6, 19.4, 30.2]]
+    valid = objective.valid(points, np.zeros(len(points)))
+    assert valid.tolist() == [True, True, True, False, False]

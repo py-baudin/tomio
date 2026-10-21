@@ -57,7 +57,7 @@ def register(
     fixed_mask: samples are drawn in this mask of the fixed image
     moving_mask: samples falling outside this mask of the moving image(s) are discarded
 
-    returns: registered image(s) (Image), [transformation(s)]
+    returns: registered image(s) (tomio Volume in 3d, Image in 2d), [transformation(s)]
         the transformation is a `Transformation`, or a `TransformationSequence` with several stages
     """
     single = not isinstance(moving, (list, tuple))
@@ -107,6 +107,8 @@ def transform(transformations, moving, *, ref=None, method=None):
         None: 'nearest' for integer and bool data, 'spline3' otherwise
         'nearest', 'linear', 'spline<n>'
         'roi', 'labels': ROI / label map interpolation (global transforms of 3d images only)
+
+    returns: transformed image(s) (tomio Volume in 3d, Image in 2d)
     """
     single = not isinstance(moving, (list, tuple))
     moving = [moving] if single else list(moving)
@@ -137,6 +139,8 @@ def apply(transformation, moving, *, geometry=None, method=None, label=None):
 
     geometry: output grid (default: transformation's geometry)
     method: see `transform`
+
+    returns: tomio Volume (3d) or Image (2d), on the output grid
 
     Global transforms of real 3d images are resampled with `tomio.resample`: the output grid mapped by the
     transformation is a (possibly oblique) regular grid in the moving image space.
@@ -170,6 +174,8 @@ def apply(transformation, moving, *, geometry=None, method=None, label=None):
         if not np.issubdtype(moving.array.dtype, np.inexact):
             values = np.rint(values).astype(moving.array.dtype)
 
+    if geometry.ndim == 3:
+        return _volume.Volume(values, spacing=geometry.spacing, origin=geometry.origin, transform=geometry.direction.T)
     return Image(values, spacing=geometry.spacing, origin=geometry.origin, direction=geometry.direction, label=label)
 
 

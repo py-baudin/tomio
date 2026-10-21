@@ -15,6 +15,8 @@
 - `transform(transformations, moving, ref=None, method=None)`: `method` as in `tomio.resample`
   (`'nearest'`, `'linear'`, `'spline3'`, `'roi'`, `'labels'`), replaces `interpolation_order`; global
   transforms of 3d images are resampled with `tomio.resample`.
+- `register` and `transform` return tomio `Volume`s for 3d images (with the geometry of the fixed / reference
+  image), `Image`s for 2d images.
 - Serialized transformations: lowercase keys (`transform: {type: rigid, ...}`, `geometry`, `parameters`, `center`);
   `Transformation(transform, geometry, parameters, center=None)` takes a transform object, name or dict.
 

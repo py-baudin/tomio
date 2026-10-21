@@ -1278,3 +1278,15 @@ def test_objective_moving_mask():
     points = np.c_[np.full(5, 10.0), [4.2, 17.2, 18.6, 19.4, 30.2]]
     valid = objective.valid(points, np.zeros(len(points)))
     assert valid.tolist() == [True, True, True, False, False]
+
+
+def test_results_types():
+    """3d results: tomio Volume with the fixed geometry; 2d results: Image"""
+    direction = np.array([[0, 1, 0], [0, 0, 1], [1, 0, 0]], dtype=float)
+    fixed = io.Volume(sample_phantom((20, 20, 10)), spacing=(1, 1, 2), origin=(1, 2, 3), transform=direction.T)
+    registered, trans = ex.register(fixed, fixed, transform="translation", return_transform=True)
+    assert isinstance(registered, io.Volume)
+    assert registered.geometry.same_as(fixed.geometry)
+    assert isinstance(ex.transform(trans, fixed), io.Volume)
+    registered2d = ex.register(np.ones((8, 8)), np.ones((8, 8)), transform="translation")
+    assert isinstance(registered2d, ex.Image)

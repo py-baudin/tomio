@@ -285,7 +285,7 @@ def test_register_stages():
 # B1 (fixed): Elastix.execute ignores `init`
 def test_execute_uses_init():
     fixed, moving = shifted((32, 32), (1.0, 0.5))
-    config = ex.Config({**TRANSLATION, "pyramid": "none", "optimizer": {"options": {"maxiter": 0}}})
+    config = ex.Config({**TRANSLATION, "pyramid": "none", "optimizer": {"maxiter": 0}})
     trans, _ = ex.Elastix(config).execute(ex.Image(fixed), ex.Image(moving), init=[0.7, 0.3])
     assert np.allclose(trans.parameters, [0.7, 0.3])
 
@@ -379,15 +379,6 @@ def test_pyramid_default_levels():
     levels, images = ex.Config().setup("pyramid")(image)
     assert len(levels) <= 4
     assert min(images[0][0].shape) >= 4
-
-
-# B16 (fixed): agd keeps rejected steps
-def test_agd_rejected_step():
-    def func(x, gradient=True):
-        return float(x @ x), 2 * x
-
-    x, _ = ex.agd(func, np.array([1.0]), alpha=10, niter=5)
-    assert np.abs(x[0]) <= 1
 
 
 # B18 (fixed): Image.__array__ does not accept dtype
@@ -881,8 +872,8 @@ def test_interpolator_class():
     for i in range(100):
         vec = np.random.uniform(size=coords.shape)
         finitediff = (
-            interpolator(im, coords + vec * 1e-10) - interpolator(im, coords)
-        ) * 1e10
+            interpolator(im, coords + vec * 1e-7) - interpolator(im, coords)
+        ) * 1e7
         assert np.allclose(np.einsum("ijk,jk->i", jac, vec), finitediff, atol=1e-4)
 
     # order-3 spline
@@ -891,8 +882,8 @@ def test_interpolator_class():
     for i in range(100):
         vec = np.random.uniform(size=coords.shape)
         finitediff = (
-            interpolator(im, coords + vec * 1e-10) - interpolator(im, coords)
-        ) * 1e10
+            interpolator(im, coords + vec * 1e-7) - interpolator(im, coords)
+        ) * 1e7
         assert np.allclose(np.einsum("ijk,jk->i", jac, vec), finitediff, atol=1e-4)
 
     # complex
@@ -905,8 +896,8 @@ def test_interpolator_class():
     for i in range(100):
         vec = np.random.uniform(size=coords.shape)
         finitediff = (
-            interpolator(im, coords + vec * 1e-10).real - interpolator(im, coords).real
-        ) * 1e10
+            interpolator(im, coords + vec * 1e-7).real - interpolator(im, coords).real
+        ) * 1e7
         assert np.allclose(
             np.einsum("ijk,jk->i", jac, vec),
             np.r_[finitediff, finitediff],
@@ -1062,32 +1053,6 @@ def test_objective_class():
         assert np.isclose(grad @ vec, finitediff, atol=1e-3)
 
 
-#
-# def test_optimizer_class():
-#     arr = np.arange(3 * 3).reshape(3, 3)
-#     im1 = elastix.Image(arr)
-#
-#     arr2 = np.c_[arr - 1, arr[:, -1]]
-#     im2 = elastix.Image(arr2)
-#
-#     sampler = elastix.SamplerFull()
-#     interpolator = elastix.InterpolatorBSpline()
-#     transform = elastix.TransformTranslation()
-#     costfunction = elastix.MetricMeanSquares()
-#
-#     def objective(parameters, fixed=im1, moving=im2):
-#         points1, values1 = sampler(fixed)
-#         points2 = transform(parameters, points1)
-#         values2 = interpolator(moving, points2)
-#         return costfunction(values1, values2)
-#
-#     optim = elastix.OptimizerGeneric()
-#     init = transform.init()
-#     params, res = optim(objective, init)
-#     # the correct translation was found
-#     assert np.allclose(params, [0, 1])
-
-
 def test_config_class():
     config = elastix.Config()
 
@@ -1112,7 +1077,7 @@ def test_pipeline_class():
 
     config = elastix.Config(
         {
-            "optimizer": "scipy",
+            "optimizer": "lbfgs",
             "pyramid": "none",
             "sampler": "full",
             "metric": "mse",
@@ -1129,7 +1094,7 @@ def test_pipeline_class():
     im2 = elastix.Image(arr2)
 
     tr = elastix.Transformation("rigid", im1.geometry, [0, 0, 1])
-    assert np.allclose(arr, pipeline.apply(tr, im2), atol=1e-5)
+    assert np.allclose(arr, np.asarray(elastix.transform(tr, im2, method="linear")), atol=1e-5)
 
     # register images
     params, info = pipeline.execute(im1, im2)
@@ -1147,19 +1112,15 @@ def test_mutualinfo():
     values1 = elastix.normalize_values(values1)
     values2 = elastix.normalize_values(values2)
 
-    # parzen windows 1d and 2d
-    dist1 = elastix.parzen1d(values1, nbin=10, window="spline0")
-    dist2 = elastix.parzen1d(values2, nbin=10, window="spline3")
+    # parzen windows 2d: joint distribution
     dist12 = elastix.parzen2d(values1, values2, nbin=10, windows=["spline0", "spline3"])
-    assert np.allclose(dist12.sum(axis=1), dist1, atol=1e-5)
-    assert np.allclose(dist12.sum(axis=0), dist2, atol=1e-5)
+    assert np.isclose(dist12.sum(), 1)
+    # spline0 window: marginal = histogram
+    hist = np.bincount(np.floor(values1 * 9 + 0.5).astype(int), minlength=10) / len(values1)
+    assert np.allclose(dist12.sum(axis=1), hist)
 
     # gradient
-    opts = dict(nbin=10, window="spline3")
-    dist2, jac = elastix.parzen1d(values2, jac=True, **opts)
     vec = np.random.uniform(size=len(values2))
-    finitediff = (elastix.parzen1d(values2 + 1e-10 * vec, **opts) - dist2) * 1e10
-    assert np.allclose(jac @ vec, finitediff, atol=1e-5)
 
     opts = dict(nbin=10, windows=["spline0", "spline3"])
     dist12, jac2 = elastix.parzen2d(values1, values2, jac2=True, **opts)
@@ -1167,7 +1128,6 @@ def test_mutualinfo():
         elastix.parzen2d(values1, values2 + 1e-10 * vec, **opts) - dist12
     ) * 1e10
     assert np.allclose(jac2 @ vec, finitediff, atol=1e-5)
-    assert np.allclose(jac2.sum(0), jac)
 
     # mutual info
     opts = dict(windows=["spline3", "spline3"], nbin=10)
@@ -1184,64 +1144,6 @@ def test_mutualinfo():
         elastix.mutualinfo(values1, values2 + 1e-10 * vec, **opts) - mi12
     ) * 1e10
     assert np.allclose(grad12 @ vec, finitediff, atol=1e-5)
-
-
-def _test_adg():
-    def classifier(obs, theta):
-        return 1 / (1 + np.exp(-theta @ obs))
-
-    def dclassifier(obs, theta):
-        return obs * np.exp(-theta @ obs) * classifier(obs, theta) ** 2
-
-    def loss(pred, gt, eps=1e-10):
-        costs = -gt * np.log(pred + eps) - (1 - gt) * np.log(1 - pred + eps)
-        cost = costs.sum()
-        grad = -gt / (pred + eps) + (1 - gt) / (1 - pred + eps)
-        return cost, grad
-
-    # train data
-    theta0 = np.array([1, -2])
-    rstate = np.random.RandomState(0)
-    x_ = rstate.uniform(-2, 2, size=(2, 200))
-    y_ = classifier(x_, theta0)
-    gt = np.rint(y_)
-    obs = x_ + 1e-1 * rstate.normal(size=(2, 200))
-
-    assert np.isclose(loss(gt, gt)[0], 0, atol=1e-5)
-
-    def costfun(theta):
-        pred = classifier(obs, theta)
-        gclass = dclassifier(obs, theta)
-        cost, gloss = loss(pred, gt)
-        grad = gclass @ gloss
-        return cost, grad
-
-    # check costfunction calculation
-    # cost, grad = costfun(theta)
-    # for i in range(100):
-    #     delta = np.random.normal(size=2)
-    #     fdiff = (costfun(theta + 1e-10 * delta)[0] - cost) * 1e10
-    #     assert np.isclose(fdiff, grad @ delta, atol=1e-4)
-
-    minloss = loss(y_, gt)[0]
-
-    # solve
-    init = np.zeros(2)
-    sol, info = elastix.agd(costfun, init)
-
-    assert info["fun"] < minloss
-
-    pred = classifier(obs, sol)
-    crate = np.mean(np.rint(pred) == gt)
-    # print(f"classification rate: {crate}")
-    assert crate > 0.9
-
-    # from matplotlib import pyplot as plt
-    # print(f"Pred: {sol}, GT: {theta0}")
-    # plt.figure()
-    # plt.plot(info["values"])
-    # plt.hlines(minloss, *plt.xlim(), color="k")
-    # plt.show()
 
 
 # masks
@@ -1290,3 +1192,96 @@ def test_results_types():
     assert isinstance(ex.transform(trans, fixed), io.Volume)
     registered2d = ex.register(np.ones((8, 8)), np.ones((8, 8)), transform="translation")
     assert isinstance(registered2d, ex.Image)
+
+
+# phase 3: no scipy dependency
+
+def test_without_scipy():
+    import subprocess
+    import sys
+
+    code = """
+import sys
+sys.modules["scipy"] = None
+import numpy as np
+from tomio import elastix
+points = np.indices((24, 24, 12)).reshape(3, -1).T
+centers = np.random.default_rng(0).uniform(4, [20, 20, 8], size=(6, 3))
+def blobs(points):
+    return np.exp(-0.5 * (((points[:, None] - centers) / 3) ** 2).sum(-1)).sum(1).reshape(24, 24, 12)
+fixed, moving = blobs(points), blobs(points - [2, 0, 0])
+reg, trans = elastix.register(fixed, moving, transform="translation", metric="mi", return_transform=True)
+assert np.allclose(trans.parameters, [2, 0, 0], atol=0.1), trans.parameters
+elastix.transform(trans, (fixed > 0.5).astype(np.uint8), method="roi")
+"""
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("order", [0, 1, 2, 3, 4, 5])
+@pytest.mark.parametrize("shape", [(13, 17), (9, 7, 5), (8, 1, 6)])
+def test_spline_matches_scipy(order, shape):
+    ndimage = pytest.importorskip("scipy.ndimage")
+    rng = np.random.default_rng(order)
+    arr = rng.random(shape)
+    coords = rng.uniform(0, np.array(shape) - 1, size=(200, len(shape)))
+    if order == 0:
+        coords = np.round(coords) + rng.uniform(-0.4, 0.4, size=coords.shape)  # away from the rounding ties
+        coords = np.clip(coords, 0, np.array(shape) - 1)
+    values = ex.ndspline_interpolation(arr, coords, order=order, mode="mirror")
+    expected = ndimage.map_coordinates(arr, coords.T, order=order, mode="mirror")
+    assert np.allclose(values, expected, atol=1e-8)
+
+
+@pytest.mark.parametrize("order", [1, 2, 3, 4, 5])
+def test_spline_gradient(order):
+    rng = np.random.default_rng(order)
+    arr = rng.random((9, 8, 6))
+    coords = rng.uniform(-1, np.array(arr.shape), size=(100, 3))  # some outside (mode nearest: zero derivative)
+    _, jac = ex.ndspline_interpolation(arr, coords, order=order, mode="nearest", jac=True)
+    grad = np.diagonal(jac, axis1=0, axis2=1).T
+    step = 1e-6
+    for d in range(3):
+        delta = step * np.eye(3)[d]
+        fd = ex.ndspline_interpolation(arr, coords + delta, order=order, mode="nearest")
+        fd -= ex.ndspline_interpolation(arr, coords - delta, order=order, mode="nearest")
+        fd /= 2 * step
+        # (linear: kinks on the grid nodes)
+        smooth = np.abs(coords[:, d] - np.round(coords[:, d])) > 1e-4 if order == 1 else slice(None)
+        assert np.allclose(grad[smooth, d], fd[smooth], atol=1e-5)
+
+
+def test_spline_modes():
+    arr = np.arange(12.0).reshape(3, 4)  # arr[i, j] = 4 i + j
+    coords = np.array([[-1.0, 0.0], [1.0, 4.5], [1.0, 1.0]])
+    assert np.allclose(ex.ndspline_interpolation(arr, coords, order=1, mode="constant", cval=-1), [-1, -1, 5])
+    assert np.allclose(ex.ndspline_interpolation(arr, coords, order=1, mode="nearest"), [0, 7, 5])
+    # mirror: row -1 -> 1, column 4.5 -> 1.5
+    assert np.allclose(ex.ndspline_interpolation(arr, coords, order=1, mode="mirror"), [4, 5.5, 5])
+    _, jac = ex.ndspline_interpolation(arr, coords, order=1, mode="mirror", jac=True)
+    assert np.allclose(np.diagonal(jac, axis1=0, axis2=1).T, [[-4, 1], [4, -1], [4, 1]])
+
+
+def test_gaussian_filter_and_dilation():
+    ndimage = pytest.importorskip("scipy.ndimage")
+    arr = np.zeros((31, 25))
+    arr[15, 12] = 1
+    smoothed = ex.gaussian_filter(arr, (2.0, 0.0))
+    assert np.isclose(smoothed.sum(), 1, atol=1e-3)
+    # (SimpleITK's discrete gaussian kernel differs slightly from scipy's sampled gaussian)
+    assert np.allclose(smoothed[:, 12], ndimage.gaussian_filter1d(arr[:, 12], 2.0), atol=1e-2)
+    assert np.allclose(smoothed[:, [11, 13]], 0)  # no smoothing along axis 1
+    mask = np.zeros((7, 8), dtype=bool)
+    mask[3, 4] = True
+    assert np.array_equal(ex.binary_dilation(mask), ndimage.binary_dilation(mask))
+
+
+def test_lbfgs_rosenbrock():
+    def rosenbrock(x):
+        cost = (1 - x[0]) ** 2 + 100 * (x[1] - x[0] ** 2) ** 2
+        grad = np.array([-2 * (1 - x[0]) - 400 * x[0] * (x[1] - x[0] ** 2), 200 * (x[1] - x[0] ** 2)])
+        return cost, grad
+
+    x, info = ex.lbfgs(rosenbrock, [-1.2, 1.0], maxiter=200, gtol=1e-10, ftol=0)
+    assert info["success"], info["message"]
+    assert np.allclose(x, [1, 1], atol=1e-5)

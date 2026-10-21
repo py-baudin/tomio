@@ -4,6 +4,15 @@
 
 - Added `tomio.elastix`: registration framework imported from mutools (`mutools.registration.elastix`), with its test suite.
 
+### tomio.elastix: no scipy (phase 3 of `PLAN_elastix.md`)
+
+- scipy is no longer used: B-spline coefficients with SimpleITK (`sitk.BSplineDecomposition`, cached per image),
+  interpolation at points in numpy (values and analytic gradients), pyramid smoothing / resampling / mask
+  dilation with SimpleITK.
+- New default optimizer `"lbfgs"` (numpy L-BFGS); removed the `scipy` and `agd` optimizers.
+- Removed: `parzen1d`, `Image.summary`, `Objective.gradient`, `Objective.callback`, `Elastix.apply`
+  (use `transform`).
+
 ### tomio.elastix: configuration API (phase 2 of `PLAN_elastix.md`)
 
 - New configuration: one section per component (`transform`, `pyramid`, `sampler`, `interpolator`, `metric`,

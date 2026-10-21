@@ -15,6 +15,7 @@ configuration: see `Config` and `Config.describe()`
 
 import os
 import copy
+import math
 import inspect
 import logging
 from abc import ABC, abstractmethod
@@ -22,7 +23,7 @@ from types import SimpleNamespace
 
 import yaml
 import numpy as np
-from scipy import ndimage, optimize
+import SimpleITK as sitk
 
 from . import volume as _volume, interp as _interp, configfile as _configfile
 
@@ -80,7 +81,7 @@ def register(
 
         transformation = found[0] if len(found) == 1 else TransformationSequence(found)
         method = stages[-1]["resample"].get("method")
-        registered.append(apply(transformation, im, method=method, label="registered"))
+        registered.append(_apply(transformation, im, method=method, label="registered"))
         transformations.append(transformation)
 
         if not reset:
@@ -126,7 +127,7 @@ def transform(transformations, moving, *, ref=None, method=None):
     geometry = None if ref is None else Image(ref, label="reference").geometry
     transformed = []
     for trans, im in zip(transformations, moving):
-        new = apply(as_transformation(trans), Image(im, label="moving"), geometry=geometry, method=method, label="transformed")
+        new = _apply(as_transformation(trans), Image(im, label="moving"), geometry=geometry, method=method, label="transformed")
         transformed.append(new)
 
     if single:
@@ -134,7 +135,7 @@ def transform(transformations, moving, *, ref=None, method=None):
     return transformed
 
 
-def apply(transformation, moving, *, geometry=None, method=None, label=None):
+def _apply(transformation, moving, *, geometry=None, method=None, label=None):
     """resample a moving Image through a transformation
 
     geometry: output grid (default: transformation's geometry)
@@ -451,7 +452,14 @@ class Image:
         self.label = label
         self._array = array
         self._mask = mask
+        self._coefficients = {}
         self._update_range()
+
+    def spline_coefficients(self, order):
+        """B-spline interpolation coefficients of the array (cached)"""
+        if order not in self._coefficients:
+            self._coefficients[order] = bspline_coefficients(self.array, order)
+        return self._coefficients[order]
 
     def _update_range(self):
         """intensity range (of the masked values), used for normalization"""
@@ -488,19 +496,8 @@ class Image:
         values = np.asarray(values)
         self._array = np.array(self._array, dtype=np.result_type(self._array, values))
         self._array.flat[self.indices] = values
+        self._coefficients = {}
         self._update_range()
-
-    def summary(self):
-        return {
-            "ndim": self.ndim,
-            "shape": self.shape,
-            "dtype": self.array.dtype,
-            "mean": np.mean(self.array),
-            "std": np.std(self.array),
-            "median": np.median(self.array),
-            "pc05": np.percentile(self.array, 5),
-            "pc95": np.percentile(self.array, 95),
-        }
 
     def copy(self, arr=None, values=None, **kwargs):
         """copy image and set new values"""
@@ -598,8 +595,6 @@ class PyramidGaussian(Pyramid):
         ratio = spacing / image.spacing
         # coordinates of the new grid in the original grid
         offset = ((image.geometry.shape - 1) - (shape - 1) * ratio) / 2
-        axes = [offset[i] + ratio[i] * np.arange(shape[i]) for i in range(image.ndim)]
-        grid = np.meshgrid(*axes, indexing="ij")
 
         # blur image
         if self.sigma is None:
@@ -607,16 +602,16 @@ class PyramidGaussian(Pyramid):
         else:
             sigma = self.sigma
         array = np.asarray(image.array, dtype=float)
-        blurred = ndimage.gaussian_filter(array, sigma=sigma) if np.any(sigma) else array
+        blurred = gaussian_filter(array, sigma) if np.any(sigma) else array
 
         # downsample
-        reduced = ndimage.map_coordinates(blurred, grid, order=self.order, mode="nearest")
+        reduced = resample_grid(blurred, offset, ratio, shape, order=self.order)
 
         # mask
         mask = None
         if image.mask is not None:
-            dilated = ndimage.binary_dilation(image.mask) if np.any(ratio > 1) else image.mask
-            mask = ndimage.map_coordinates(dilated.astype(np.uint8), grid, order=0, mode="nearest") > 0
+            dilated = binary_dilation(image.mask) if np.any(ratio > 1) else image.mask
+            mask = resample_grid(dilated.astype(np.uint8), offset, ratio, shape, order=0) > 0
 
         origin = image.geometry.to_points(offset)
         return Image(reduced, mask=mask, spacing=spacing, origin=origin, direction=image.direction)
@@ -1096,7 +1091,9 @@ class SamplerRandomCoordinates(Sampler):
             coords = np.clip(coords, 0, maxcoord)
         coords[:, maxcoord == 0] = 0  # quantize points in single valued dimensions
         points = self.image.geometry.to_points(coords)
-        values = ndspline_interpolation(self.image.array, coords, **self._interp_opts)
+        order = self._interp_opts["order"]
+        coeffs = self.image.spline_coefficients(order)
+        values = ndspline_interpolation(coeffs, coords, order=order, mode="nearest", prefiltered=True)
         self._samples = points, values
 
 
@@ -1105,9 +1102,11 @@ class SamplerRandomCoordinates(Sampler):
 class Interpolator(ABC):
     """Base class for interpolators"""
 
+    order = 3
+
     @abstractmethod
-    def interpolate(self, image, points, jac):
-        pass
+    def interpolate(self, coeffs, coords, jac):
+        """interpolate at coordinates, from the B-spline coefficients of order `self.order`"""
 
     def __call__(self, image: Image, points, jac=False):
         """interpolate image at points
@@ -1120,15 +1119,16 @@ class Interpolator(ABC):
         """
         coords = image.geometry.to_coords(points)
         dcoords = image.geometry.coords_jacobian()
+        coeffs = image.spline_coefficients(self.order)
         if isinstance(jac, np.ndarray):
             # jacobian w/r to the points -> w/r to the coordinates
             jac = np.einsum("ij,njk->nik", dcoords, jac)
-            return self.interpolate(image.array, coords, jac=jac)
+            return self.interpolate(coeffs, coords, jac=jac)
         elif jac:
-            values, jacmat = self.interpolate(image.array, coords, jac=True)
+            values, jacmat = self.interpolate(coeffs, coords, jac=True)
             # gradient w/r to the coordinates -> w/r to the points
             return values, jacmat @ dcoords
-        return self.interpolate(image.array, coords)
+        return self.interpolate(coeffs, coords)
 
     def __str__(self):
         return str(type(self).__name__)
@@ -1137,14 +1137,16 @@ class Interpolator(ABC):
 class InterpolatorNearestNeighbor(Interpolator):
     """Nearest neighbor interpolation"""
 
+    order = 0
+
     @splitcomplex(how=["complex", "concatenate"], axis=0)
-    def interpolate(self, arr, coords, jac=False):
+    def interpolate(self, coeffs, coords, jac=False):
         if jac:
             raise ValueError(
                 f"Cannot compute jacobian with nearest-neighbor interpolation"
             )
         # return values
-        return ndspline_interpolation(arr, coords, order=0, mode="nearest")
+        return ndspline_interpolation(coeffs, coords, order=0, mode="nearest", prefiltered=True)
 
 
 class InterpolatorLinear(Interpolator):
@@ -1154,23 +1156,26 @@ class InterpolatorLinear(Interpolator):
         samples within half a pixel of the edges (the samples further away are discarded by the Objective)
     """
 
+    order = 1
+
     def __init__(self, mode="nearest", cval=0):
         self.opts = {"mode": mode, "cval": cval}
 
     @splitcomplex(how=["complex", "concatenate"], axis=0)
-    def interpolate(self, arr, coords, jac=False):
-        return ndspline_interpolation(arr, coords, order=1, jac=jac, **self.opts)
+    def interpolate(self, coeffs, coords, jac=False):
+        return ndspline_interpolation(coeffs, coords, order=1, jac=jac, prefiltered=True, **self.opts)
 
 
 class InterpolatorBSpline(Interpolator):
     """general B-Spline interpolation"""
 
     def __init__(self, order=3, mode="nearest", cval=0):
-        self.opts = {"order": order, "mode": mode, "cval": cval}
+        self.order = order
+        self.opts = {"mode": mode, "cval": cval}
 
     @splitcomplex(how=["complex", "concatenate"], axis=0)
-    def interpolate(self, arr, coords, jac=False):
-        return ndspline_interpolation(arr, coords, jac=jac, **self.opts)
+    def interpolate(self, coeffs, coords, jac=False):
+        return ndspline_interpolation(coeffs, coords, order=self.order, jac=jac, prefiltered=True, **self.opts)
 
 
 #
@@ -1259,38 +1264,21 @@ class Optimizer(ABC):
         return str(type(self).__name__)
 
 
-class OptimizerGeneric(Optimizer):
-    """Scipy minimizer (other options: see scipy.optimize.minimize)
+class OptimizerLBFGS(Optimizer):
+    """Limited-memory BFGS with backtracking line search (samples fixed during the optimization)
 
-    resample: draw new samples at each iteration (the cost function is then not deterministic,
-        which breaks the line searches of quasi-Newton methods)
+    maxiter: maximum number of iterations
+    memory: number of corrections kept
+    gtol: stop when the largest gradient component is below gtol
+    ftol: stop when the relative cost decrease is below ftol
+    maxstep: largest parameter change of the first iteration
     """
 
-    def __init__(self, method=None, jac=True, resample=False, **opts):
-        self.opts = {**opts, "method": method, "jac": jac, "args": (jac,)}
-        self.resample = resample
+    def __init__(self, maxiter=100, memory=10, gtol=1e-8, ftol=1e-9, maxstep=1.0):
+        self.opts = {"maxiter": maxiter, "memory": memory, "gtol": gtol, "ftol": ftol, "maxstep": maxstep}
 
     def optimize(self, objective, init):
-        # scipy minimize
-        callback = objective.callback if self.resample else None
-        res = optimize.minimize(objective, init, callback=callback, **self.opts)
-        return res.x, res
-
-
-class OptimizerAdaptiveGradientDescent(Optimizer):
-    """Adaptive gradient descent (adagrad), new samples at each iteration"""
-
-    def __init__(self, niter=20, alpha=1e-1, eps=1e-5, rtol=1e-5):
-        self.opts = {"niter": niter, "alpha": alpha, "eps": eps, "rtol": rtol}
-
-    def optimize(self, objective, init):
-        sol, info = agd(
-            objective,
-            init,
-            callback=objective.callback,
-            args={"gradient": True},
-            **self.opts,
-        )
+        sol, info = lbfgs(lambda x: objective(x, gradient=True), init, **self.opts)
         return sol, OptimResults(**info)
 
 
@@ -1320,8 +1308,7 @@ COMPONENTS = {
         "mi": MetricMutualInformation,
     },
     "optimizer": {
-        "scipy": OptimizerGeneric,
-        "agd": OptimizerAdaptiveGradientDescent,
+        "lbfgs": OptimizerLBFGS,
     },
 }
 
@@ -1381,7 +1368,7 @@ class Config:
         "sampler": "random_coordinates",
         "interpolator": "linear",
         "metric": "mse",
-        "optimizer": "scipy",
+        "optimizer": "lbfgs",
         "resample": {"method": None},
     }
 
@@ -1559,15 +1546,6 @@ class Objective:
         LOGGER.debug(f"parameters: {parameters}, cost: {cost:.4}, gradient: {gradient}")
         return cost, gradient
 
-    def gradient(self, parameters, **kwargs):
-        _, gradient = self(parameters, gradient=True, **kwargs)
-        return gradient
-
-    def callback(self, parameters, *args):
-        self.sampler.update()  # resample if applicable
-        return False
-
-
 class Elastix:
     """Main registration object"""
 
@@ -1576,12 +1554,6 @@ class Elastix:
         self.logger = LOGGER
         loglevel = loglevel if loglevel else "WARN"  # default log-level
         self.logger.setLevel(getattr(logging, str(loglevel), loglevel))
-
-    def apply(self, transformation, moving, *, geometry=None, method=None, label=None):
-        """resample moving image (see `apply`); default method: config["resample"]"""
-        if method is None:
-            method = self.config["resample"].get("method")
-        return apply(transformation, moving, geometry=geometry, method=method, label=label)
 
     def execute(self, fixed: Image, moving: Image, init=None, callback=None, initial=None):
         """compute transform
@@ -1840,68 +1812,183 @@ def affinetransform2d3d(parameters, points, axis=None, jac=False):
 # Interpolation stuff
 
 
-def ndspline_interpolation(arr, coords, order=3, jac=False, **kwargs):
-    """ND-spline interpolation
+def bspline_coefficients(array, order):
+    """B-spline interpolation coefficients (mirror boundaries), computed with SimpleITK
+
+    returns a C-contiguous array (the interpolation uses flat indices)
+    """
+    array = np.asarray(array)
+    if np.iscomplexobj(array):
+        return bspline_coefficients(array.real, order) + 1j * bspline_coefficients(array.imag, order)
+    array = np.asarray(array, dtype=float)
+    if order > 1:
+        image = sitk.GetImageFromArray(array.T, isVector=False)
+        array = sitk.GetArrayFromImage(sitk.BSplineDecomposition(image, int(order))).T
+    return np.ascontiguousarray(array)
+
+
+def bspline_kernel(x, order):
+    """centered B-spline of degree `order` (order >= 1)"""
+    values = np.zeros(np.shape(x))
+    shift = (order + 1) / 2
+    for k in range(order + 2):
+        values += (-1) ** k * math.comb(order + 1, k) * np.maximum(x + shift - k, 0) ** order
+    return values / math.factorial(order)
+
+
+def bspline_kernel_derivative(x, order):
+    """derivative of the centered B-spline of degree `order` (order >= 2)"""
+    return bspline_kernel(x + 0.5, order - 1) - bspline_kernel(x - 0.5, order - 1)
+
+
+def mirror_index(index, size):
+    """mirror boundary conditions (whole-sample symmetric, as SimpleITK and scipy's "mirror")"""
+    period = np.maximum(2 * size - 2, 1)
+    index = np.mod(index, period)
+    return np.where(size == 1, 0, np.where(index >= size, period - index, index))
+
+
+def _spline_weights(coords, order, size):
+    """first tap index, weights and derivative weights along one axis (npoint x ntap)"""
+    if order == 0:
+        first = np.floor(coords + 0.5)
+        return first, np.ones((len(coords), 1)), np.zeros((len(coords), 1))
+    elif order == 1:
+        # linear interpolation in the cell [first, first + 1] (left cell at the last node)
+        first = np.clip(np.floor(coords), 0, max(size - 2, 0))
+        t = (coords - first)[:, np.newaxis]
+        weights = np.hstack([1 - t, t])
+        dweights = np.broadcast_to([-1.0, 1.0], weights.shape)
+        return first, weights, dweights
+    first = np.floor(coords - (order - 1) / 2)
+    dist = coords[:, np.newaxis] - (first[:, np.newaxis] + np.arange(order + 1))
+    return first, bspline_kernel(dist, order), bspline_kernel_derivative(dist, order)
+
+
+def _spline_evaluate(coeffs, coords, order, gradient=False):
+    """values (and gradient) of the spline at coordinates"""
+    npoint, ndim = coords.shape
+    shape = coeffs.shape
+    strides = [int(np.prod(shape[d + 1:])) for d in range(ndim)]
+    flat = np.zeros((npoint,) + (1,) * ndim, dtype=np.intp)
+    weights, dweights = [], []
+    for d in range(ndim):
+        first, w, dw = _spline_weights(coords[:, d], order, shape[d])
+        ntap = w.shape[1]
+        index = mirror_index(first[:, np.newaxis].astype(np.intp) + np.arange(ntap), shape[d])
+        newshape = [npoint] + [1] * ndim
+        newshape[d + 1] = ntap
+        flat = flat + (index * strides[d]).reshape(newshape)
+        weights.append(w.reshape(newshape))
+        dweights.append(dw.reshape(newshape))
+
+    values = np.take(coeffs.ravel(), flat)
+    total = values * math.prod(weights) if ndim > 1 else values * weights[0]
+    result = total.reshape(npoint, -1).sum(axis=1)
+    if not gradient:
+        return result, None
+    grad = np.empty((npoint, ndim), dtype=result.dtype)
+    for d in range(ndim):
+        factors = [dweights[e] if e == d else weights[e] for e in range(ndim)]
+        grad[:, d] = (values * math.prod(factors)).reshape(npoint, -1).sum(axis=1)
+    return result, grad
+
+
+def ndspline_interpolation(arr, coords, order=3, jac=False, mode="constant", cval=0, prefiltered=False, chunk=2**14):
+    """N-d B-spline interpolation at coordinates (pixel units)
 
     Parameters
-        arr: N1xN2x...Nd array
-        coords: Kxd coordinates array
-
+        arr: N1 x N2 x ... Nd array (or its B-spline coefficients if `prefiltered`)
+        coords: K x d coordinates
+        order: spline order (0: nearest neighbor, 1: linear)
+        jac:
+            False: return values
+            True: also return the gradient w/r to the coordinates (K x K x d)
+            array (K x d x P): jacobian of the coordinates w/r to parameters, return the K x P jacobian
+        mode: values beyond the edges (coordinates outside [0, N - 1]):
+            "constant": `cval`; "nearest": edge values; "mirror": mirror extension
     """
-    arr = np.asarray(arr, dtype=float)
+    if mode not in ("constant", "nearest", "mirror"):
+        raise ValueError(f"Invalid mode: {mode}")
+    coeffs = np.ascontiguousarray(arr if prefiltered else bspline_coefficients(arr, order))
+    if not np.iscomplexobj(coeffs):
+        coeffs = coeffs.astype(float, copy=False)
     coords = np.asarray(coords, dtype=float)
-    if order > 1:
-        # spline coefficients: computed once for the values and the derivatives
-        mode = kwargs.get("mode", "constant")
-        coeffs = ndimage.spline_filter(arr, order=order, mode=mode)
-        opts = dict(kwargs, order=order, prefilter=False)
+    npoint, ndim = coords.shape
+    maxcoord = np.array(coeffs.shape) - 1
+    outside = (coords < 0) | (coords > maxcoord)
+    sign = None
+    if mode == "mirror":
+        # mirror the coordinates into the grid (the spline is symmetric about the edges)
+        period = np.maximum(2 * maxcoord, 1)
+        coords = np.mod(coords, period)
+        reflected = coords > maxcoord
+        coords = np.where(maxcoord == 0, 0, np.where(reflected, period - coords, coords))
+        sign = np.where(reflected, -1.0, 1.0)
     else:
-        coeffs = arr
-        opts = dict(kwargs, order=order)
+        coords = np.clip(coords, 0, maxcoord)
 
-    def evaluate(coords):
-        return ndimage.map_coordinates(coeffs, coords.T, **opts)
+    gradient = jac is not False
+    values = np.empty(npoint, dtype=coeffs.dtype)
+    grad = np.empty((npoint, ndim), dtype=coeffs.dtype) if gradient else None
+    for start in range(0, npoint, chunk):
+        index = slice(start, start + chunk)
+        values[index], grad_ = _spline_evaluate(coeffs, coords[index], order, gradient=gradient)
+        if gradient:
+            grad[index] = grad_
 
-    values = evaluate(coords)
-    if jac is False:
+    if mode == "constant":
+        values[outside.any(axis=1)] = cval
+    if not gradient:
         return values
-
-    if order == 0:
+    elif order == 0:
         raise ValueError("Cannot compute jacobian nearest-neighbor mode")
 
-    # gradient w/r to the coordinates (npoint x ndim)
-    npoint = len(coords)
-    ndim = arr.ndim
-    grad = np.zeros((npoint, ndim))
-    if order == 1:
-        # exact: difference of the neighboring values along each axis (right-sided on the grid nodes)
-        nearest = {**kwargs, "mode": "nearest"}
-        nearest.pop("cval", None)
-        for d in range(ndim):
-            if arr.shape[d] < 2:
-                continue
-            coords1 = np.copy(coords)
-            coords1[:, d] = np.clip(np.floor(coords[:, d]), 0, arr.shape[d] - 2) + 1
-            coords2 = coords1 - np.eye(ndim)[d]
-            grad[:, d] = ndimage.map_coordinates(arr, coords1.T, order=1, **nearest)
-            grad[:, d] -= ndimage.map_coordinates(arr, coords2.T, order=1, **nearest)
-            # outside the grid: constant extension
-            grad[(coords[:, d] < 0) | (coords[:, d] > arr.shape[d] - 1), d] = 0
+    if mode == "constant":
+        grad[outside.any(axis=1)] = 0
+    elif mode == "nearest":
+        # constant extension
+        grad[outside] = 0
     else:
-        # central finite differences on the spline
-        step = 1e-3
-        for d in range(ndim):
-            delta = step * np.eye(ndim)[d]
-            grad[:, d] = (evaluate(coords + delta) - evaluate(coords - delta)) / (2 * step)
+        grad *= sign
 
     if isinstance(jac, np.ndarray):
         # jacobian w/r to parameters (npoint x nparam)
         return values, np.einsum("nd,ndk->nk", grad, jac)
     # jacobian w/r to the coordinates of all points (npoint x npoint x ndim)
-    jacmat = np.zeros((npoint, npoint, ndim))
+    jacmat = np.zeros((npoint, npoint, ndim), dtype=grad.dtype)
     indices = np.arange(npoint)
     jacmat[indices, indices, :] = grad
     return values, jacmat
+
+
+def resample_grid(array, origin, spacing, shape, order=3):
+    """resample an array on a regular grid (in pixel coordinates), with SimpleITK (edges: nearest)"""
+    image = sitk.GetImageFromArray(np.asarray(array, dtype=float).T, isVector=False)
+    resampler = sitk.ResampleImageFilter()
+    resampler.SetSize([int(n) for n in shape])
+    resampler.SetOutputOrigin([float(v) for v in origin])
+    resampler.SetOutputSpacing([float(v) for v in spacing])
+    resampler.SetOutputDirection(np.eye(np.ndim(array)).ravel().tolist())
+    resampler.SetInterpolator(_interp.get_sitk_interpolator(order))
+    resampler.SetUseNearestNeighborExtrapolator(True)
+    resampler.SetOutputPixelType(sitk.sitkFloat64)
+    return sitk.GetArrayFromImage(resampler.Execute(image)).T
+
+
+def gaussian_filter(array, sigma):
+    """gaussian smoothing, sigma in pixels (per axis), with SimpleITK"""
+    sigma = np.broadcast_to(np.asarray(sigma, dtype=float), (np.ndim(array),))
+    image = sitk.GetImageFromArray(np.asarray(array, dtype=float).T, isVector=False)
+    smoothed = sitk.DiscreteGaussian(image, (sigma**2).tolist(), 64, 0.001, False)
+    return sitk.GetArrayFromImage(smoothed).T
+
+
+def binary_dilation(mask):
+    """binary dilation (cross structuring element, radius 1), with SimpleITK"""
+    image = sitk.GetImageFromArray(np.asarray(mask, dtype=np.uint8).T, isVector=False)
+    dilated = sitk.BinaryDilate(image, [1] * np.ndim(mask), sitk.sitkCross)
+    return sitk.GetArrayFromImage(dilated).T > 0
 
 
 #
@@ -1931,11 +2018,6 @@ class Kernel:
 
     def __call__(self, x):
         return self.func(x)
-
-    @staticmethod
-    def gaussian(x):
-        """Gaussian window"""
-        return np.exp(-0.5 * x**2 * 2**2) * np.sqrt(0.5 / np.pi * 2**2)
 
     @staticmethod
     def spline0(x):
@@ -1978,47 +2060,6 @@ def normalize_values(values, tol=1e-8):
     if np.isclose(ptp, 0):
         return np.zeros(values.shape)
     return (values - values.min()) / (ptp + tol)
-
-
-def parzen1d(values, nbin=10, window="spline3", normalize=False, jac=False):
-    """1d kernel density estimation"""
-    if callable(normalize):
-        values = normalize(values)
-    elif normalize:
-        values = normalize_values(values)
-    else:
-        assert np.all((0 <= values) & (values <= 1))
-
-    kernel = Kernel(window)
-    pad = -(-kernel.order // 2)
-
-    # centers = np.arange(0, nbin)
-    centers = np.arange(-pad, nbin + pad)
-    diff = centers[:, np.newaxis] - (nbin - 1) * values
-    dist = kernel(diff).sum(axis=1)
-    dist = np.r_[
-        dist[: pad + 1].sum(),
-        dist[pad + 1 : nbin + pad - 1],
-        dist[nbin + pad - 1 :].sum(),
-    ]
-    norm = len(values)
-    assert np.isclose(dist.sum(), norm)
-
-    if not jac:
-        return dist / norm
-    elif window != "spline3":
-        raise NotImplementedError(window)
-
-    # warning: rescaling breaks the jacobian calculation
-
-    # spline2 jacobian
-    jac = Kernel.spline2(diff + 0.5) - Kernel.spline2(diff - 0.5)
-    jac = np.r_[
-        jac[: pad + 1].sum(0, keepdims=True),
-        jac[pad + 1 : nbin + pad - 1],
-        jac[nbin + pad - 1 :].sum(0, keepdims=True),
-    ]
-    return dist / norm, -(nbin - 1) * jac / norm
 
 
 def parzen2d(
@@ -2117,52 +2158,73 @@ def mutualinfo(values1, values2, gradient2=False, **kwargs):
     return mi, grad
 
 
-def agd(
-    func, init, callback=None, niter=20, alpha=1e-1, eps=1e-5, rtol=1e-5, args={}
-):  # gamma=0.9
-    """adaptive gradient descent
+def lbfgs(func, init, maxiter=100, memory=10, gtol=1e-8, ftol=1e-9, maxstep=1.0, maxls=30):
+    """limited-memory BFGS with backtracking (Armijo) line search
 
-    Based on 'adagrad' as seen in github.com/antonAce/adaptive-gradient-descent
+    func: returns cost and gradient
     """
-    x = np.asarray(init, dtype=float)
-    G = 0
-    scale = 1.0  # step reduction after rejected steps
-
-    # last accepted point
-    xbest, cbest, gbest, lr = x, np.inf, None, None
-
+    x = np.asarray(init, dtype=float).copy()
+    cost, grad = func(x)
+    nfev = 1
+    corrections = []  # (s, y, rho)
     res = {"success": False, "message": "Maximum number of iterations reached"}
     nit = 0
-    for nit in range(1, niter + 1):
-        # compute current cost and gradient
-        cost, grad = func(x, **args)
-
-        if cost > cbest:
-            # rejected step: smaller step from the last accepted point
-            scale *= 0.5
-            x = xbest - scale * lr * gbest
-            continue
-
-        stationary = np.abs(cost - cbest) <= rtol * np.abs(cost)
-        xbest, cbest, gbest = x, cost, grad
-        LOGGER.debug(f"iter: {nit}, cost: {cost:3.3}, grad: {grad}")
-        if stationary:
-            res["success"] = True
-            res["message"] = "Stationnary cost"
+    for nit in range(1, maxiter + 1):
+        if not np.isfinite(cost):
+            res["message"] = "Non-finite cost"
+            break
+        if np.max(np.abs(grad)) <= gtol:
+            res.update(success=True, message="Small gradient")
             break
 
-        if callback:
-            callback(x)
+        # search direction: two-loop recursion
+        q = np.array(grad, dtype=float)
+        alphas = []
+        for s, y, rho in reversed(corrections):
+            alpha = rho * (s @ q)
+            q -= alpha * y
+            alphas.append(alpha)
+        if corrections:
+            s, y, _ = corrections[-1]
+            q *= (s @ y) / (y @ y)
+        else:
+            q *= maxstep / max(np.max(np.abs(grad)), 1e-300)
+        for (s, y, rho), alpha in zip(corrections, reversed(alphas)):
+            q += s * (alpha - rho * (y @ q))
+        direction = -q
+        slope = grad @ direction
+        if slope >= 0:
+            # not a descent direction: steepest descent, reset memory
+            corrections = []
+            direction = -grad * maxstep / max(np.max(np.abs(grad)), 1e-300)
+            slope = grad @ direction
 
-        # adaptive learning rate
-        G = G + grad**2
-        lr = alpha / np.sqrt(G + eps)
-        x = x - scale * lr * grad
+        # backtracking line search
+        step = 1.0
+        for _ in range(maxls):
+            xnew = x + step * direction
+            cnew, gnew = func(xnew)
+            nfev += 1
+            if np.isfinite(cnew) and cnew <= cost + 1e-4 * step * slope:
+                break
+            step *= 0.5
+        else:
+            res["message"] = "Line search failed"
+            break
 
-    res["nit"] = nit
-    res["fun"] = cbest
+        s, y = xnew - x, gnew - grad
+        if s @ y > 1e-12 * (y @ y):
+            corrections.append((s, y, 1 / (s @ y)))
+            corrections = corrections[-memory:]
+        decrease = cost - cnew
+        x, cost, grad = xnew, cnew, gnew
+        LOGGER.debug(f"iter: {nit}, cost: {cost:3.3}, step: {step}")
+        if decrease <= ftol * max(abs(cost), 1e-300):
+            res.update(success=True, message="Small cost decrease")
+            break
 
-    return xbest, res
+    res.update(nit=nit, nfev=nfev, fun=cost, jac=grad)
+    return x, res
 
 
 class OptimResults(SimpleNamespace):

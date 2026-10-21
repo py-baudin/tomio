@@ -1,7 +1,6 @@
 """ tests for tomio.elastix
 
-Phase 0 (PLAN_elastix.md): characterization of the imported module.
-Known bugs are `xfail(strict=True)` tests named after their id in the plan: fixing a bug flips its test.
+Regression tests of the bugs fixed in phase 1 are labelled with their id in PLAN_elastix.md (B1, B2...).
 """
 import numpy as np
 import pytest
@@ -52,6 +51,29 @@ def rotated(shape, angle, shift, **kwargs):
     return phantom(shape, **kwargs), phantom(shape, inverse=inverse, **kwargs)
 
 
+def grid_points(shape, spacing=None, origin=None, direction=None):
+    """world coordinates of the pixels of a grid"""
+    geometry = ex.Geometry(shape, spacing, origin, direction)
+    return geometry.points
+
+
+def world_phantom(points, box=40.0, seed=0, nblob=12):
+    """sum of gaussian blobs defined in world coordinates (in [0, box]^ndim)"""
+    rng = np.random.default_rng(seed)
+    ndim = points.shape[1]
+    centers = rng.uniform(0.2, 0.8, size=(nblob, ndim)) * box
+    widths = rng.uniform(0.08, 0.15, size=(nblob, 1)) * box
+    weights = rng.uniform(0.5, 1, size=nblob)
+    dist2 = (((points[:, np.newaxis] - centers) / widths) ** 2).sum(axis=-1)
+    return (weights * np.exp(-0.5 * dist2)).sum(axis=1)
+
+
+def sample_phantom(shape, spacing=None, origin=None, direction=None, shift=0):
+    """world phantom sampled on a grid, translated by `shift` (moving(y) = fixed(y - shift))"""
+    points = grid_points(shape, spacing, origin, direction)
+    return world_phantom(points - np.asarray(shift)).reshape(shape)
+
+
 def inner_error(registered, fixed, margin=6):
     """mean absolute difference away from the borders"""
     inner = tuple(slice(margin, -margin) if n > 2 * margin else slice(None) for n in fixed.shape)
@@ -75,15 +97,11 @@ def finite_gradient(func, params, step=1e-5):
     return np.array([(func(params + step * e) - func(params - step * e)) / (2 * step) for e in np.eye(len(params))])
 
 
-def known_bug(bug_id, reason):
-    return pytest.mark.xfail(strict=True, reason=f"{bug_id}: {reason}")
-
-
 TRANSLATION = {"Transform": "TransformTranslation"}
 MI = {"Metric": "MetricMutualInformation"}
 
 
-# characterization: what works today
+# registration
 
 @pytest.mark.parametrize("shape, shift", [((48, 48), (2.5, -1.5)), ((32, 32, 16), (1.5, -1.0, 0.5))])
 def test_translation_mse(shape, shift):
@@ -94,7 +112,7 @@ def test_translation_mse(shape, shift):
     assert inner_error(registered, fixed) < 1e-2
 
 
-@known_bug("B10", "the rotation center changes between pyramid levels: translation not recovered")
+# B10 (fixed): the rotation center changes between pyramid levels: translation not recovered
 def test_rigid_mse_3d():
     fixed, moving = rotated((32, 32, 16), 0.05, (1.5, -1.0, 0.5))
     registered = ex.register(fixed, moving)
@@ -165,9 +183,9 @@ def test_config_defaults():
         ex.Config({"Transform": None}).setup("Unknown")
 
 
-# known bugs (PLAN_elastix.md, phase 1)
+# regression tests (PLAN_elastix.md, phase 1)
 
-@known_bug("B1", "Elastix.execute ignores `init`")
+# B1 (fixed): Elastix.execute ignores `init`
 def test_execute_uses_init():
     fixed, moving = shifted((32, 32), (1.0, 0.5))
     config = ex.Config({**TRANSLATION, "Pyramid": "PyramidDummy", "OptimizerGeneric": {"options": {"maxiter": 0}}})
@@ -175,7 +193,7 @@ def test_execute_uses_init():
     assert np.allclose(trans.parameters, [0.7, 0.3])
 
 
-@known_bug("B2", "transform(ref=...) uses `ref.geom`")
+# B2 (fixed): transform(ref=...) uses `ref.geom`
 def test_transform_with_ref():
     fixed, moving = shifted((32, 32), (1.0, 0.5))
     _, trans = ex.register(fixed, moving, config=TRANSLATION, return_transform=True)
@@ -183,7 +201,7 @@ def test_transform_with_ref():
     assert np.asarray(out).shape == (20, 24)
 
 
-@known_bug("B3", "serialize uses the bound method `self.init`")
+# B3 (fixed): serialize uses the bound method `self.init`
 @pytest.mark.parametrize("transform, init", [("TransformRigid", [0.1, 1.0, 2.0]), ("TransformAffine", [1, 0, 0, 1, 1.0, 2.0])])
 def test_serialize_with_init(transform, init):
     trans = ex.Transformation(transform, ex.Geometry((8, 8)), init, init=np.asarray(init))
@@ -191,13 +209,13 @@ def test_serialize_with_init(transform, init):
     assert np.allclose(data["Settings"]["init"], init)
 
 
-@known_bug("B4", "TransformTranslation.serialize drops `axis`")
+# B4 (fixed): TransformTranslation.serialize drops `axis`
 def test_serialize_translation_axis():
     transform = ex.Transform.deserialize(ex.TransformTranslation(axis=2).serialize())
     assert transform.axis == 2
 
 
-@known_bug("B5", "linear interpolation gradient lacks the 1/spacing factor")
+# B5 (fixed): linear interpolation gradient lacks the 1/spacing factor
 def test_gradient_anisotropic_spacing():
     spacing = (1.0, 1.0, 5.0)
     fixed, moving = shifted((24, 24, 12), (1.0, -1.0, 2.0), spacing=spacing)
@@ -207,7 +225,7 @@ def test_gradient_anisotropic_spacing():
     assert np.allclose(gradient, finite_gradient(objective, params), rtol=1e-2, atol=1e-6)
 
 
-@known_bug("B6", "MI gradient lacks the intensity normalization factor")
+# B6 (fixed): MI gradient lacks the intensity normalization factor
 def test_gradient_mi_intensity_scale():
     fixed, moving = shifted((40, 40), (1.5, 1.0), scale=100)
     objective = make_objective(fixed, moving, {**TRANSLATION, **MI})
@@ -216,33 +234,33 @@ def test_gradient_mi_intensity_scale():
     assert np.allclose(gradient, finite_gradient(objective, params), rtol=1e-2, atol=1e-6)
 
 
-@known_bug("B7", "B-spline interpolator gradient has the wrong shape")
+# B7 (fixed): B-spline interpolator gradient has the wrong shape
 def test_register_bspline_interpolator():
     fixed, moving = shifted((32, 32), (1.0, 0.5))
     _, trans = ex.register(fixed, moving, config={**TRANSLATION, "Interpolator": "InterpolatorBSpline"}, return_transform=True)
     assert np.allclose(trans.parameters, (1.0, 0.5), atol=0.05)
 
 
-@known_bug("B8", "out-of-FOV moving samples count as 0")
+# B8 (fixed): out-of-FOV moving samples count as 0
 def test_cost_out_of_fov():
     fixed, moving = shifted((32, 32), (1.0, 0.5))
     objective = make_objective(fixed, moving, TRANSLATION)
     assert objective([1000.0, 0.0]) == np.inf  # no valid sample
 
 
-@known_bug("B8", "out-of-FOV samples make the cost discontinuous at the image border (full sampling)")
+# B8 (fixed): out-of-FOV samples make the cost discontinuous at the image border (full sampling)
 def test_register_full_sampler():
     fixed, moving = shifted((32, 32), (1.0, 0.5))
     _, trans = ex.register(fixed, moving, config={**TRANSLATION, "Sampler": "SamplerFull"}, return_transform=True)
     assert np.allclose(trans.parameters, (1.0, 0.5), atol=0.05)
 
 
-@known_bug("B10", "Geometry.center is off by half a voxel")
+# B10 (fixed): Geometry.center is off by half a voxel
 def test_geometry_center():
     assert np.allclose(ex.Geometry((3, 5), spacing=(2, 1), origin=(10, 0)).center, (12, 2))
 
 
-@known_bug("B11", "3D rigid transform is not rigid when |n| != 1")
+# B11 (fixed): 3D rigid transform is not rigid when |n| != 1
 def test_rigid_3d_is_rigid():
     transform = ex.TransformRigid()
     params = np.random.default_rng(0).normal(size=len(transform.init(3)))
@@ -253,12 +271,12 @@ def test_rigid_3d_is_rigid():
     assert np.allclose(dist, newdist)
 
 
-@known_bug("B13", "TransformRigid(axis=<ndarray>) raises")
+# B13 (fixed): TransformRigid(axis=<ndarray>) raises
 def test_rigid_array_axis():
     assert np.allclose(ex.TransformRigid(axis=np.array([0, 0, 2])).axis, [0, 0, 1])
 
 
-@known_bug("B14", "the default pyramid goes down to a few pixels")
+# B14 (fixed): the default pyramid goes down to a few pixels
 def test_pyramid_default_levels():
     image = ex.Image(phantom((48, 48, 12)))
     levels, images = ex.Config().setup("Pyramid")(image)
@@ -266,7 +284,7 @@ def test_pyramid_default_levels():
     assert min(images[0][0].shape) >= 4
 
 
-@known_bug("B16", "agd keeps rejected steps")
+# B16 (fixed): agd keeps rejected steps
 def test_agd_rejected_step():
     def func(x, gradient=True):
         return float(x @ x), 2 * x
@@ -275,16 +293,110 @@ def test_agd_rejected_step():
     assert np.abs(x[0]) <= 1
 
 
-@known_bug("B18", "Image.__array__ does not accept dtype")
+# B18 (fixed): Image.__array__ does not accept dtype
 def test_image_asarray_dtype():
     assert np.asarray(ex.Image(np.zeros((4, 4))), dtype=np.float32).dtype == np.float32
 
 
-@known_bug("B20", "spline0 kernel drops values on bin boundaries")
+# B20 (fixed): spline0 kernel drops values on bin boundaries
 def test_parzen_spline0_boundary():
     values = np.full(10, 0.5 / 3)  # (nbin - 1) * v = 0.5 for nbin=4
     pdf = ex.parzen2d(values, np.full(10, 0.5), nbin=4)
     assert np.isclose(pdf.sum(), 1)
+
+
+GRADIENT_TRANSFORMS = {
+    "TransformTranslation": [0.3, 0.2, 0.7],
+    "TransformRigid": [0.02, -0.01, 0.03, 0.3, 0.2, 0.7],
+    "TransformAffine": [1.01, 0.02, -0.01, 0.01, 0.99, 0.02, -0.02, 0.01, 1.02, 0.3, 0.2, 0.7],
+}
+
+
+# B5, B6, B7 (fixed): gradients of all components, anisotropic spacing and intensity range
+@pytest.mark.parametrize("transform", list(GRADIENT_TRANSFORMS))
+@pytest.mark.parametrize("interpolator", ["InterpolatorLinear", "InterpolatorBSpline"])
+@pytest.mark.parametrize("metric", ["MetricMeanSquares", "MetricMutualInformation"])
+def test_gradient_components(transform, interpolator, metric):
+    spacing = (1.0, 1.5, 4.0)
+    fixed, moving = shifted((16, 16, 8), (1.0, -1.0, 2.0), spacing=spacing, scale=50)
+    config = {"Transform": transform, "Interpolator": interpolator, "Metric": metric}
+    objective = make_objective(fixed, moving, config, spacing=spacing)
+    params = GRADIENT_TRANSFORMS[transform]
+    _, gradient = objective(params, gradient=True)
+    assert np.allclose(gradient, finite_gradient(objective, params), rtol=1e-2, atol=1e-6)
+
+
+# B23 (fixed): oblique grids
+def test_register_oblique():
+    angle = 0.4
+    direction = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+    origin, shift = (20, -5), (1.5, -1.0)
+    fixed = sample_phantom((40, 40), origin=origin, direction=direction)
+    moving = sample_phantom((40, 40), origin=origin, direction=direction, shift=shift)
+    im_fixed = ex.Image(fixed, origin=origin, direction=direction)
+    im_moving = ex.Image(moving, origin=origin, direction=direction)
+    registered, trans = ex.register(im_fixed, im_moving, config=TRANSLATION, return_transform=True)
+    # translation in world coordinates
+    assert np.allclose(trans.parameters, shift, atol=0.05)
+    assert np.allclose(registered.direction, direction)
+    assert inner_error(registered, fixed) < 1e-2
+
+
+def test_image_from_volume():
+    """tomio Volume: transform = rows of axis directions (columns of the ITK direction matrix)"""
+    from tomio import Volume
+
+    direction = np.array([[0, 1, 0], [0, 0, 1], [1, 0, 0]], dtype=float)
+    vol = Volume(np.zeros((4, 5, 6)), spacing=(1, 2, 3), origin=(1, 1, 1), transform=direction.T)
+    image = ex.Image(vol)
+    assert np.allclose(image.direction, direction)
+    assert np.allclose(image.geometry.to_points([[1, 1, 1]]), vol.get_coords([1, 1, 1]))
+    # tomio convention
+    assert np.allclose(image.transform, vol.transform)
+
+
+def test_image_keeps_mask():
+    image = ex.Image(np.zeros((4, 4)), mask=np.eye(4))
+    assert np.array_equal(ex.Image(image).mask, np.eye(4, dtype=bool))
+
+
+# B10 (fixed): the transform found at a coarse level is applied on the full resolution grid
+def test_register_minlevel():
+    fixed, moving = rotated((48, 48), 0.05, (2.5, -1.5))
+    config = {**MI, "PyramidGaussian": {"minlevel": 1}}
+    registered = ex.register(fixed, moving, config=config)
+    assert inner_error(registered, fixed) < 0.2 * inner_error(moving, fixed)
+
+
+# B2, B10 (fixed): transform(ref=...) keeps the center of rotation
+def test_transform_ref_keeps_center():
+    fixed, moving = rotated((40, 40), 0.1, (1.5, -1.0))
+    registered, trans = ex.register(fixed, moving, return_transform=True)
+    ref = ex.Image(np.zeros((20, 30)), origin=(5, 10))
+    out = ex.transform(trans, moving, ref=ref)
+    assert np.allclose(np.asarray(out), np.asarray(registered)[5:25, 10:40], atol=1e-6)
+
+
+# B8 (fixed): fixed image larger than the moving image (moving: thick slab)
+def test_register_moving_slab():
+    shift = (1.5, -1.0, 2.0)
+    fixed = sample_phantom((32, 32, 32))
+    slab = dict(spacing=(1, 1, 4), origin=(0, 0, 10))
+    moving = sample_phantom((32, 32, 4), shift=shift, **slab)
+    _, trans = ex.register(ex.Image(fixed), ex.Image(moving, **slab), config=TRANSLATION, return_transform=True)
+    assert np.allclose(trans.parameters, shift, atol=0.1)
+
+
+# B8 (fixed): fixed image is a thick slab inside the moving image
+def test_register_fixed_slab():
+    shift = (1.5, -1.0, 2.0)
+    slab = dict(spacing=(1, 1, 6), origin=(0, 0, 8))
+    fixed = sample_phantom((32, 32, 4), **slab)
+    moving = sample_phantom((32, 32, 32), shift=shift)
+    # samples on the fixed grid (random coordinates interpolate the fixed image between thick slices)
+    config = {**TRANSLATION, **MI, "Sampler": "SamplerRandom"}
+    _, trans = ex.register(ex.Image(fixed, **slab), ex.Image(moving), config=config, return_transform=True)
+    assert np.allclose(trans.parameters, shift, atol=0.05)
 
 
 # tests ported from mutools (test/registration/test_elastix.py)
@@ -315,12 +427,23 @@ def test_pyramid_class():
     assert pyr(im) == ([0], [(im,)])
 
     # nearest neighbour, isotropic
-    pyr = elastix.PyramidGaussian(scale_ratio=1.5, order=0, sigma=0, minsize=3)
+    pyr = elastix.PyramidGaussian(scale_ratio=1.5, order=1, sigma=0, minsize=2, maxlevel=1)
     levels, reduced = pyr(im)
-    assert levels == [1, 0]  # only one reduction was possible
+    assert levels == [1, 0]
     assert np.allclose(reduced[0][0].shape, (2, 3))
-    assert np.allclose(reduced[0][0].array, arr[::2, ::2])
+    # centered grid with spacing 1.5 (arr is linear: exact interpolation)
+    rows, cols = np.array([0.25, 1.75]), np.array([0.5, 2, 3.5])
+    assert np.allclose(reduced[0][0].array, 5 * rows[:, None] + cols)
     assert np.allclose(reduced[0][0].spacing, (1.5, 1.5))
+    # same center
+    assert np.allclose(reduced[0][0].center, im.center)
+
+    # minsize: minimum size of the reduced axes (axis 0 is not reduced)
+    pyr = elastix.PyramidGaussian(scale_ratio=1.5, order=1, sigma=0, minsize=3)
+    levels, reduced = pyr(im)
+    assert levels == [1, 0]
+    assert reduced[0][0].shape == (3, 3)
+    assert np.allclose(reduced[0][0].array, 5 * np.arange(3)[:, None] + cols)
 
     # scaling < 2, spline
     # pyr = elastix.PyramidGaussian(maxlevel=1, scale_ratio=1.2, order=2, sigma=1.5, minsize=1)
@@ -440,13 +563,20 @@ def test_transform_class():
     params = transform.init(3)
     assert np.allclose(transform(params, points), points)  # no change
 
-    params = transform.pack(phi=np.pi, n=[1, 0, 0], b=[0, 0, 0])
+    # Euler angles: rotation of pi about x
+    params = transform.pack(angles=[np.pi, 0, 0], b=[0, 0, 0])
     assert np.allclose(transform(params, [1, 0, 0]), [1, 0, 0])  # fixed point
     assert np.allclose(transform(params, [0, 1, 1]), [0, -1, -1])  # moving point
 
+    # same rotation matrix as ITK's Euler3DTransform: R = Rz @ Rx @ Ry
+    angles = [0.3, -0.5, 0.7]
+    R = elastix.euler_to_matrix(angles)
+    assert np.allclose(transform(np.r_[angles, 0, 0, 0], np.eye(3)), R.T)
+    assert np.allclose(elastix.matrix_to_euler(R), angles)
+
     # centered
     transform = elastix.TransformRigid()
-    params = transform.pack(phi=np.pi / 2, n=[1, 0, 0], b=[0, 0, 0])
+    params = transform.pack(angles=[np.pi / 2, 0, 0], b=[0, 0, 0])
     assert np.allclose(
         transform(params, [[0, 1, 1], [0, -1, 1]], center=[0, 0, 1]),
         [[0, 0, 2], [0, 0, 0]],
@@ -454,9 +584,7 @@ def test_transform_class():
 
     # jacobian
     for i in range(100):
-        params = np.random.normal(
-            loc=[np.pi] + [i % 3, (i + 1) % 3, (i + 2) % 3] + [0, 0, 0]
-        )
+        params = np.random.normal(loc=[np.pi, 0, 0, 0, 0, 0])
         moved, jac = transform(params, points, jac=True)
         vec = np.random.uniform(size=params.size)
         finitediff = (transform(params + 1e-10 * vec, points) - moved) * 1e10
@@ -464,10 +592,8 @@ def test_transform_class():
 
     # centered
     for i in range(100):
-        center = np.random.uniform(3)
-        params = np.random.normal(
-            loc=[np.pi] + [i % 3, (i + 1) % 3, (i + 2) % 3] + [0, 0, 0]
-        )
+        center = np.random.uniform(size=3)
+        params = np.random.normal(loc=[np.pi, 0, 0, 0, 0, 0])
         moved, jac = transform(params, points, jac=True, center=center)
         vec = np.random.uniform(size=params.size)
         finitediff = (
@@ -476,14 +602,13 @@ def test_transform_class():
         assert np.allclose(jac @ vec, finitediff, atol=1e-3)
 
     # inverse
-    # for i in range(100):
-    #     points = np.random.uniform(size=[10,3])
-    #     params = np.random.uniform(
-    #         low=[-np.pi, -1, -1, -1, -1, -1, -1],
-    #         high=[np.pi, 1, 1, 1, 1, 1, 1],
-    #     )
-    #     iparams = transform.inverse(params)
-    #     assert np.allclose(transform(iparams, transform(params, points)), points)
+    for i in range(100):
+        points = np.random.uniform(size=[10, 3])
+        center = np.random.uniform(size=3)
+        params = np.random.uniform(low=[-np.pi, -np.pi / 2, -np.pi, -1, -1, -1], high=[np.pi, np.pi / 2, np.pi, 1, 1, 1])
+        iparams = transform.inverse(params)
+        moved = transform(params, points, center=center)
+        assert np.allclose(transform(iparams, moved, center=center), points)
 
     # fixed axis
     transform = elastix.TransformRigid(axis=[0, 0, 1])
@@ -558,20 +683,6 @@ def test_transformation_class():
     assert transf2.transform.center is None
     assert transf2.transform._init is None
 
-    # test deserialize with wrong parameters
-    with pytest.warns(UserWarning):
-        transf3 = transf.deserialize(
-            {
-                **data,
-                "Transform": {
-                    "Settings": {"center": "None", "init": "None"},
-                    "TransformType": "TransformRigid",
-                },
-            }
-        )
-    assert np.allclose(transf3.parameters, [0, 1, 2])
-    assert transf3.transform.center is None
-    assert transf3.transform._init is None
 
 
 def test_sampler_class():
@@ -723,6 +834,9 @@ def test_objective_class():
     # normalize values
     moving.update(fixed.normalize(moving.values))
     fixed.update(fixed.normalize())
+
+    # sample in the center: the transformed samples stay inside the moving image
+    fixed.mask = arr > 0
 
     objective0 = elastix.Objective(
         fixed, fixed, transform, sampler, metric, interpolator

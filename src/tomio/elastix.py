@@ -103,9 +103,6 @@ def transform(
     if not isinstance(config, Config):
         config = Config(config)
 
-    # interpolation order
-    config["ResampleInterpolator"]["order"] = interpolation_order
-
     # get pipeline
     pipeline = Elastix(config, loglevel=loglevel)
 
@@ -120,14 +117,22 @@ def transform(
             trans = Transformation.deserialize(trans)
         if ref is not None:
             # select source of geometrical information (spacing, origin, etc.)
-            trans = Transformation(trans.transform, ref.geom, trans.parameters)
+            trans = Transformation(trans.transform, ref, trans.parameters, center=trans.center)
         # apply transformation
-        new = pipeline.apply(trans, im, label="transformed")
+        new = pipeline.apply(trans, im, label="transformed", order=interpolation_order)
         transformed.append(new)
 
     if single:
         transformed = transformed[0]
     return transformed
+
+
+def _tolist(value):
+    """serializable value: None, scalar or (nested) list"""
+    if value is None:
+        return None
+    value = np.asarray(value)
+    return value.item() if value.ndim == 0 else value.tolist()
 
 
 # Decorators
@@ -181,6 +186,10 @@ def splitcomplex(narg=1, how="add", **opts):
 
 
 class Geometry:
+    """Image grid: point = origin + direction @ (spacing * coords)
+
+    direction: ITK direction matrix (columns: world directions of the array axes)
+    """
 
     @property
     def ndim(self):
@@ -203,35 +212,80 @@ class Geometry:
 
     @property
     def center(self):
-        return self.origin + (self.spacing * self.shape) / 2
+        """world coordinates of the grid center"""
+        return self.to_points((self.shape - 1) / 2)
 
-    def __init__(self, shape, spacing=None, origin=None):
+    @property
+    def matrix(self):
+        """matrix from unit-less coordinates to points (without origin)"""
+        return self.direction * self.spacing
+
+    def __init__(self, shape, spacing=None, origin=None, direction=None):
         self.shape = np.asarray(shape)
+        ndim = len(self.shape)
         if spacing is None:
-            spacing = [1] * len(shape)
+            spacing = [1] * ndim
         if origin is None:
-            origin = [0] * len(shape)
-        self.spacing = np.asarray(spacing)
-        self.origin = np.asarray(origin)
+            origin = [0] * ndim
+        self.spacing = np.asarray(spacing, dtype=float)
+        self.origin = np.asarray(origin, dtype=float)
+        self.direction = np.eye(ndim) if direction is None else np.asarray(direction, dtype=float).reshape(ndim, ndim)
+
+    @property
+    def is_oblique(self):
+        return not np.allclose(self.direction, np.eye(self.ndim))
 
     def to_points(self, coords):
         """convert set of unit-less coordinates into points"""
-        return coords * self.spacing + self.origin
+        coords = np.asarray(coords)
+        if not self.is_oblique:
+            return coords * self.spacing + self.origin
+        return coords @ self.matrix.T + self.origin
 
     def to_coords(self, points):
         """convert set of points into unit-less coordinates"""
-        return (points - self.origin) / self.spacing
+        points = np.asarray(points)
+        if not self.is_oblique:
+            return (points - self.origin) / self.spacing
+        return (points - self.origin) @ np.linalg.inv(self.matrix).T
+
+    def coords_jacobian(self):
+        """jacobian of `to_coords` (ndim x ndim)"""
+        return np.linalg.inv(self.matrix)
+
+    def contains(self, points, margin=0.5):
+        """points inside the grid extent (pixel centers +/- `margin` pixel, as ITK's IsInsideBuffer)"""
+        coords = self.to_coords(points)
+        return np.all((coords >= -margin) & (coords <= self.shape - 1 + margin), axis=1)
 
     def serialize(self):
-        return {
+        data = {
             "shape": self.shape.tolist(),
             "spacing": self.spacing.tolist(),
             "origin": self.origin.tolist(),
         }
+        if self.is_oblique:
+            data["direction"] = self.direction.tolist()
+        return data
 
     @classmethod
     def deserialize(cls, data):
-        return cls(data["shape"], data.get("spacing"), data.get("origin"))
+        return cls(data["shape"], data.get("spacing"), data.get("origin"), data.get("direction"))
+
+
+def get_direction(obj, ndim):
+    """ITK direction matrix of an image-like object (or None)
+
+    obj.direction: direction matrix (columns: axis directions)
+    obj.transform: tomio convention (rows: axis directions)
+    """
+    direction = getattr(obj, "direction", None)
+    if direction is not None:
+        return np.asarray(direction, dtype=float).reshape(ndim, ndim)
+    transform = getattr(obj, "transform", None)
+    if transform is not None and np.size(transform) == ndim**2:
+        return np.asarray(transform, dtype=float).reshape(ndim, ndim).T
+    return None
 
 
 class Image:
@@ -293,13 +347,25 @@ class Image:
         return self.geometry.origin
 
     @property
+    def direction(self):
+        return self.geometry.direction
+
+    @property
+    def transform(self):
+        """axis directions (tomio convention: rows), e.g. for `tomio.asvolume(image)`"""
+        return self.geometry.direction.T
+
+    @property
     def center(self):
         return self.geometry.center
 
     def __init__(
-        self, im, mask=None, spacing=None, origin=None, dtype=None, label=None
+        self, im, mask=None, spacing=None, origin=None, dtype=None, label=None, direction=None
     ):
-        """init Image object"""
+        """init Image object
+
+        im: array, Image, or array-like with spacing/origin and direction (or tomio's transform)
+        """
         # array
         array = np.asarray(im, dtype=dtype)
 
@@ -307,21 +373,37 @@ class Image:
             spacing = getattr(im, "spacing", [1] * array.ndim)
         if origin is None:
             origin = getattr(im, "origin", [0] * array.ndim)
+        if direction is None:
+            direction = get_direction(im, array.ndim)
+        if mask is None and isinstance(im, Image):
+            mask = im.mask
 
         if mask is not None:
             mask = np.asarray(mask, dtype=bool)
             assert mask.shape == array.shape
 
-        self.geometry = Geometry(array.shape, spacing, origin)
+        self.geometry = Geometry(array.shape, spacing, origin, direction)
         self.label = label
         self._array = array
         self._mask = mask
-        self._min = min(array.real.min(), array.imag.min())
-        self._max = max(array.real.max(), array.imag.max())
+        self._update_range()
 
-    def __array__(self):
+    def _update_range(self):
+        """intensity range (of the masked values), used for normalization"""
+        values = self.values
+        if np.iscomplexobj(values):
+            values = np.r_[values.real, values.imag]
+        values = values[np.isfinite(values)]
+        if not values.size:
+            self._min, self._max = 0.0, 1.0
+        else:
+            self._min, self._max = float(values.min()), float(values.max())
+
+    def __array__(self, dtype=None, copy=None):
         """used by np.array(im) and np.asarray(im)"""
-        return self.array
+        if copy:
+            return np.array(self.array, dtype=dtype)
+        return np.asarray(self.array, dtype=dtype)
 
     def __repr__(self):
         shape = "x".join(map(str, self.shape))
@@ -337,11 +419,11 @@ class Image:
         return (values - self._min) / (self._max - self._min + tol)
 
     def update(self, values):
-        """update array values"""
-        self._array = np.asarray(self._array, dtype=values.dtype)
+        """update array values (the array is copied: the input array is never modified)"""
+        values = np.asarray(values)
+        self._array = np.array(self._array, dtype=np.result_type(self._array, values))
         self._array.flat[self.indices] = values
-        self._min = min(self._array.real.min(), self._array.imag.min())
-        self._max = max(self._array.real.max(), self._array.imag.max())
+        self._update_range()
 
     def summary(self):
         return {
@@ -368,6 +450,7 @@ class Image:
             mask=kwargs.get("mask", self.mask),
             spacing=kwargs.get("spacing", self.spacing),
             origin=kwargs.get("origin", self.origin),
+            direction=kwargs.get("direction", self.direction),
             label=kwargs.get("label", self.label),
         )
         # update values
@@ -404,18 +487,31 @@ class PyramidDummy(Pyramid):
 
 
 class PyramidGaussian(Pyramid):
-    """Gaussian image pyramid"""
+    """Gaussian image pyramid
+
+    At level k, the target spacing is `scale_ratio**k` times the smallest spacing of all images;
+    axes with a larger spacing are not reduced, and no axis is reduced below `minsize` pixels.
+    The reduced grids have the exact target spacing and the same center as the original images.
+
+    scale_ratio: spacing ratio between consecutive levels
+    minsize: minimum number of pixels of a reduced axis
+    minlevel: finest level used (0: original images)
+    maxlevel: coarsest level
+    order: interpolation order for downsampling
+    sigma: gaussian smoothing in pixels of the original image (None: 0.5 * reduction factor of each axis)
+    magnitude: use the magnitude of complex images
+    """
 
     def __init__(
         self,
-        scale_ratio=1.5,
-        minsize=5,
+        scale_ratio=2,
+        minsize=8,
         minlevel=0,
-        maxlevel=1000,
+        maxlevel=3,
         order=3,
-        sigma=1,
+        sigma=None,
         magnitude=True,
-    ):  # sigma=0.6667):
+    ):
         self.maxlevel = maxlevel
         self.minlevel = minlevel
         self.scale_ratio = scale_ratio
@@ -424,58 +520,62 @@ class PyramidGaussian(Pyramid):
         self.minsize = minsize
         self.magnitude = magnitude
 
+    def reduced_grid(self, image, target):
+        """spacing and shape of an image reduced to a target spacing"""
+        shape = image.geometry.shape
+        spacing = np.maximum(image.spacing, target)
+        # no reduction below `minsize` pixels
+        minsize = np.minimum(shape, self.minsize)
+        maxspacing = np.where(minsize > 1, (shape - 1) * image.spacing / np.maximum(minsize - 1, 1), np.inf)
+        spacing = np.where(shape > 1, np.minimum(spacing, np.maximum(maxspacing, image.spacing)), image.spacing)
+        newshape = np.floor((shape - 1) * image.spacing / spacing + 1e-8).astype(int) + 1
+        return spacing, newshape
+
+    def reduce(self, image, spacing, shape):
+        """reduced image, with the same center"""
+        ratio = spacing / image.spacing
+        # coordinates of the new grid in the original grid
+        offset = ((image.geometry.shape - 1) - (shape - 1) * ratio) / 2
+        axes = [offset[i] + ratio[i] * np.arange(shape[i]) for i in range(image.ndim)]
+        grid = np.meshgrid(*axes, indexing="ij")
+
+        # blur image
+        if self.sigma is None:
+            sigma = np.where(ratio > 1, 0.5 * ratio, 0)
+        else:
+            sigma = self.sigma
+        array = np.asarray(image.array, dtype=float)
+        blurred = ndimage.gaussian_filter(array, sigma=sigma) if np.any(sigma) else array
+
+        # downsample
+        reduced = ndimage.map_coordinates(blurred, grid, order=self.order, mode="nearest")
+
+        # mask
+        mask = None
+        if image.mask is not None:
+            dilated = ndimage.binary_dilation(image.mask) if np.any(ratio > 1) else image.mask
+            mask = ndimage.map_coordinates(dilated.astype(np.uint8), grid, order=0, mode="nearest") > 0
+
+        origin = image.geometry.to_points(offset)
+        return Image(reduced, mask=mask, spacing=spacing, origin=origin, direction=image.direction)
+
     def pyramid(self, *images):
         if self.magnitude:
             images = [im.copy(np.abs(im.array)) for im in images]
         pyramid = [tuple(images)]
+        min_spacing = np.min([im.spacing for im in images])
 
-        for level in range(self.maxlevel):
-            previous = pyramid[-1]
-            if np.max([im.shape for im in previous]) <= self.minsize:
+        shapes = [tuple(im.shape) for im in images]
+        for level in range(1, self.maxlevel + 1):
+            target = min_spacing * self.scale_ratio**level
+            grids = [self.reduced_grid(im, target) for im in images]
+            newshapes = [tuple(shape) for _, shape in grids]
+            if newshapes == shapes:
+                # no further reduction
                 break
-
-            # get image spacings
-            spacings = np.r_[[im.spacing for im in previous]]
-
-            # minimum spacing target
-            min_spacing = np.min(spacings) * self.scale_ratio
-
-            # downsample all images at that level
-            newlevel = []
-            for im in previous:
-                # break if image is sufficiently small
-
-                # new spacing
-                spacing = np.maximum(im.spacing, min_spacing)
-                dimratio = im.spacing / spacing
-
-                # new shape
-                # shape = np.maximum(np.rint(im.shape * dimratio).astype(int), 1)
-                shape = np.maximum((im.shape * dimratio + 0.5).astype(int), 1)
-
-                # grid coordinates in each directions
-                maxcoord = np.array(im.shape) - 1
-                coords = [np.linspace(0, maxcoord[i], shape[i]) for i in range(im.ndim)]
-                grid = np.meshgrid(*coords, indexing="ij")
-
-                # blur image
-                blurred = ndimage.gaussian_filter(im.array, sigma=self.sigma)
-
-                # downsample
-                reduced = ndimage.map_coordinates(blurred, grid, order=self.order)
-
-                # mask
-                if im.mask is not None:
-                    dilated = ndimage.binary_dilation(im.mask)
-                    mask = ndimage.map_coordinates(dilated, grid, order=0) > 0
-                else:
-                    mask = None
-
-                # store new Image
-                newim = Image(reduced, mask=mask, spacing=spacing, origin=im.origin)
-                newlevel.append(newim)
-
-            pyramid.append(tuple(newlevel))
+            shapes = newshapes
+            # reduce the original images
+            pyramid.append(tuple(self.reduce(im, *grid) for im, grid in zip(images, grids)))
 
         # return levels and reduced images
         nlevel = len(pyramid)
@@ -487,7 +587,13 @@ class PyramidGaussian(Pyramid):
 class Transformation:
     """Container for transformation parameters"""
 
-    def __init__(self, transform, geometry, parameters, **kwargs):
+    def __init__(self, transform, geometry, parameters, center=None, **kwargs):
+        """
+        transform: Transform object or name (`kwargs`: its settings)
+        geometry: output grid (fixed image)
+        parameters: transform parameters
+        center: rotation center (default: center of `geometry`)
+        """
         if isinstance(transform, str):
             transform = Transform.deserialize(
                 {"Settings": kwargs, "TransformType": transform}
@@ -498,6 +604,11 @@ class Transformation:
         self.transform = transform
         self.geometry = geometry
         self.parameters = np.asarray(parameters)
+        self._center = None if center is None else np.asarray(center, dtype=float)
+
+    @property
+    def center(self):
+        return self.geometry.center if self._center is None else self._center
 
     def __repr__(self):
         clsname = type(self.transform).__name__
@@ -509,6 +620,8 @@ class Transformation:
         data["Transform"] = self.transform.serialize()
         data["Geometry"] = self.geometry.serialize()
         data["Parameters"] = self.parameters.tolist()
+        if self._center is not None:
+            data["Center"] = self._center.tolist()
         return data
 
     @classmethod
@@ -516,13 +629,12 @@ class Transformation:
         transform = Transform.deserialize(data["Transform"])
         geometry = Geometry.deserialize(data["Geometry"])
         parameters = data["Parameters"]
-        return cls(transform, geometry, parameters)
+        return cls(transform, geometry, parameters, center=data.get("Center"))
 
     def __call__(self, **kwargs):
         """transform points"""
         points = self.geometry.points
-        center = self.geometry.center
-        return self.transform(self.parameters, points, center=center, **kwargs)
+        return self.transform(self.parameters, points, center=self.center, **kwargs)
 
     def __array__(self):
         """numpy converter"""
@@ -541,17 +653,7 @@ class Transform(ABC):
         transformtype = data["TransformType"]
         transform = globals()[transformtype]
         assert issubclass(transform, cls)
-        # settings
-        settings = data.get("Settings", {})
-        if any(isinstance(value, str) for value in settings.values()):
-            # fix wrong values in settings
-            warnings.warn(
-                f"Invalid string values in Transformation.deserialize converted to None"
-            )
-            settings = {
-                key: None if isinstance(value, str) else value
-                for key, value in settings.items()
-            }
+        settings = data.get("Settings") or {}
         return transform(**settings)
 
     def parse(self, parameters):
@@ -589,7 +691,10 @@ class TransformTranslation(Transform):
         return b
 
     def serialize(self):
-        return {"TransformType": "TransformTranslation"}
+        return {
+            "TransformType": "TransformTranslation",
+            "Settings": {"axis": _tolist(self.axis), "init": _tolist(self._init)},
+        }
 
     def init(self, ndim):
         if self._init is not None:
@@ -608,11 +713,17 @@ class TransformTranslation(Transform):
 
 
 class TransformRigid(Transform):
-    """Rigid transform"""
+    """Rigid transform
+
+    parameters:
+        2d: (phi, bx, by)
+        3d: Euler angles and translation (ax, ay, az, bx, by, bz), with R = Rz @ Rx @ Ry (as ITK's Euler3DTransform)
+        3d with fixed axis: (phi, b1, b2), rotation about `axis` and translation normal to it
+    """
 
     def __init__(self, axis=None, center=None, init=None):
         self.center = None if center is None else np.asarray(center)
-        if axis in [0, 1, 2]:
+        if np.isscalar(axis) and axis in [0, 1, 2]:
             axis = np.eye(3)[axis]
         elif np.isscalar(axis):
             raise ValueError(axis)
@@ -623,9 +734,9 @@ class TransformRigid(Transform):
         return {
             "TransformType": "TransformRigid",
             "Settings": {
-                "axis": None if self.axis is None else self.axis.tolist(),
-                "center": None if self.center is None else self.center.tolist(),
-                "init": None if self._init is None else self.init.tolist(),
+                "axis": _tolist(self.axis),
+                "center": _tolist(self.center),
+                "init": _tolist(self._init),
             },
         }
 
@@ -637,28 +748,24 @@ class TransformRigid(Transform):
         elif ndim == 3 and self.axis is not None:
             return self.pack(phi=0, b=[0, 0])
         elif ndim == 3:
-            return self.pack(phi=0, n=[0, 0, 1], b=[0, 0, 0])
+            return self.pack(angles=[0, 0, 0], b=[0, 0, 0])
         raise NotImplementedError(f"Invalid number of dimensions: {ndim}")
 
     def pack(self, **kwargs):
         ndim = len(kwargs["b"])
-        if ndim == 2:
+        if "angles" in kwargs:
+            return np.r_[kwargs["angles"], kwargs["b"]]
+        elif ndim == 2:
             return np.r_[kwargs["phi"], kwargs["b"]]
         elif ndim == 3 and self.axis is not None:
             return np.r_[kwargs["phi"], kwargs["b"]]
-        elif ndim == 3:
-            return np.r_[kwargs["phi"], kwargs["n"], kwargs["b"]]
         raise NotImplementedError(f"Invalid number of dimensions: {ndim}")
 
     def parse(self, parameters):
         if len(parameters) == 3:
             return {"phi": parameters[0], "b": parameters[1:]}
-        elif len(parameters) == 7:
-            return {
-                "phi": parameters[0],
-                "n": parameters[1:4],
-                "b": parameters[4:],
-            }
+        elif len(parameters) == 6:
+            return {"angles": parameters[:3], "b": parameters[3:]}
         raise NotImplementedError(f"Invalid parameters: {parameters}")
 
     def transform(self, parameters, points, center=None, jac=False, **kwargs):
@@ -692,12 +799,11 @@ class TransformRigid(Transform):
             raise NotImplementedError(f"Invalid number of dimensions: {ndim}")
 
     def inverse(self, parameters):
+        """parameters of the inverse transform (same center)"""
         if len(parameters) == 3:
-            # return self.inverse2d(parameters)
+            # 2d, or 3d with fixed axis (same formula in the plane normal to the axis)
             return rigidinverse2d(parameters)
-        else:
-            return rigidinverse3d(parameters, axis=self.axis)
-        raise NotImplementedError(f"Invalid number of dimensions: {parameters}")
+        return rigidinverse3d(parameters)
 
 
 class TransformAffine(Transform):
@@ -711,12 +817,8 @@ class TransformAffine(Transform):
         return {
             "TransformType": "TransformAffine",
             "Settings": {
-                "axis": (
-                    self.axis
-                    if isinstance(self.axis, (type(None), int))
-                    else self.axis.tolist()
-                ),
-                "init": None if self._init is None else self.init.tolist(),
+                "axis": _tolist(self.axis),
+                "init": _tolist(self._init),
             },
         }
 
@@ -842,11 +944,15 @@ class SamplerRandomCoordinates(Sampler):
         LOGGER.debug("Resample image")
         nsample = min(self._values.size, self.maxsample)
         maxcoord = np.array(self.image.shape) - 1
-        coords = self._rgen.uniform(
-            low=0.1 * maxcoord,
-            high=0.9 * maxcoord,
-            size=(nsample, self.image.ndim),
-        )
+        if self.image.mask is None:
+            # uniform in the image domain
+            coords = self._rgen.uniform(high=maxcoord, size=(nsample, self.image.ndim))
+        else:
+            # random pixels of the mask, with a random sub-pixel offset
+            pixels = np.c_[np.nonzero(self.image.mask)]
+            coords = pixels[self._rgen.choice(len(pixels), nsample, replace=nsample > len(pixels))]
+            coords = coords + self._rgen.uniform(-0.5, 0.5, size=coords.shape)
+            coords = np.clip(coords, 0, maxcoord)
         coords[:, maxcoord == 0] = 0  # quantize points in single valued dimensions
         points = self.image.geometry.to_points(coords)
         values = ndspline_interpolation(self.image.array, coords, **self._interp_opts)
@@ -863,9 +969,25 @@ class Interpolator(ABC):
         pass
 
     def __call__(self, image: Image, points, jac=False):
-        arr = 1.0 * image.array
+        """interpolate image at points
+
+        jac:
+            False: return values
+            True: also return the gradient w/r to the points (npoint x npoint x ndim)
+            array (npoint x ndim x nparam): jacobian of the points w/r to parameters,
+                return the jacobian of the values w/r to the parameters (npoint x nparam)
+        """
         coords = image.geometry.to_coords(points)
-        return self.interpolate(arr, coords, jac=jac)
+        dcoords = image.geometry.coords_jacobian()
+        if isinstance(jac, np.ndarray):
+            # jacobian w/r to the points -> w/r to the coordinates
+            jac = np.einsum("ij,njk->nik", dcoords, jac)
+            return self.interpolate(image.array, coords, jac=jac)
+        elif jac:
+            values, jacmat = self.interpolate(image.array, coords, jac=True)
+            # gradient w/r to the coordinates -> w/r to the points
+            return values, jacmat @ dcoords
+        return self.interpolate(image.array, coords)
 
     def __str__(self):
         return str(type(self).__name__)
@@ -885,9 +1007,13 @@ class InterpolatorNearestNeighbor(Interpolator):
 
 
 class InterpolatorLinear(Interpolator):
-    """Linear interpolation"""
+    """Linear interpolation
 
-    def __init__(self, mode="constant", cval=0):
+    mode: extension beyond the edges (cf scipy.ndimage); "nearest" keeps the cost continuous for
+        samples within half a pixel of the edges (the samples further away are discarded by the Objective)
+    """
+
+    def __init__(self, mode="nearest", cval=0):
         self.opts = {"mode": mode, "cval": cval}
 
     @splitcomplex(how=["complex", "concatenate"], axis=0)
@@ -898,7 +1024,7 @@ class InterpolatorLinear(Interpolator):
 class InterpolatorBSpline(Interpolator):
     """general B-Spline interpolation"""
 
-    def __init__(self, order=3, mode="constant", cval=0):
+    def __init__(self, order=3, mode="nearest", cval=0):
         self.opts = {"order": order, "mode": mode, "cval": cval}
 
     @splitcomplex(how=["complex", "concatenate"], axis=0)
@@ -949,9 +1075,31 @@ class MetricMutualInformation(Metric):
     def __init__(self, nbin=32):
         self.nbin = nbin
 
-    def measure(self, values1, values2, gradient2=False, **kwargs):
+    def measure(self, values1, values2, gradient2=False, normalize=False, **kwargs):
+        """mutual information (negative, to be minimized)
+
+        normalize:
+            False: values are already in [0, 1]
+            True: normalize each set of values by its own range (gradient: range taken as constant)
+            callable: normalize(values1, values2), affine in values2 (e.g. using the images' ranges)
+        """
         opts = {"windows": ["spline0", "spline3"], "nbin": self.nbin, **kwargs}
-        return mutualinfo(values1, values2, gradient2=gradient2, **opts)
+        scale = 1.0
+        if callable(normalize):
+            # derivative of the (affine) normalization of values2
+            ref = normalize(np.zeros(2), np.array([0.0, 1.0]))[1]
+            scale = ref[1] - ref[0]
+            values1, values2 = normalize(values1, values2)
+        elif normalize:
+            scale = 1 / (np.ptp(values2) + 1e-8)
+            values1, values2 = normalize_values(values1), normalize_values(values2)
+        # values out of the histogram range (e.g. spline overshoot): clipped, no gradient
+        inside = (values2 >= 0) & (values2 <= 1)
+        values1, values2 = np.clip(values1, 0, 1), np.clip(values2, 0, 1)
+        if not gradient2:
+            return mutualinfo(values1, values2, **opts)
+        cost, grad = mutualinfo(values1, values2, gradient2=True, **opts)
+        return cost, grad * scale * inside
 
 
 #
@@ -971,16 +1119,20 @@ class Optimizer(ABC):
 
 
 class OptimizerGeneric(Optimizer):
-    """Scipy minimizer"""
+    """Scipy minimizer
 
-    def __init__(self, method=None, jac=True, **opts):
+    resample: draw new samples at each iteration (the cost function is then not deterministic,
+        which breaks the line searches of quasi-Newton methods)
+    """
+
+    def __init__(self, method=None, jac=True, resample=False, **opts):
         self.opts = {**opts, "method": method, "jac": jac, "args": (jac,)}
+        self.resample = resample
 
     def optimize(self, objective, init):
         # scipy minimize
-        res = optimize.minimize(
-            objective, init, callback=objective.callback, **self.opts
-        )
+        callback = objective.callback if self.resample else None
+        res = optimize.minimize(objective, init, callback=callback, **self.opts)
         return res.x, res
 
 
@@ -1044,9 +1196,10 @@ class Config:
     # Component settings
 
     PyramidGaussian:
-        # minlevel: 0 # min downsampling level
-        # maxlevel: 5 # max downsampling level
-        # minsize: 5 # minimum size in any axis
+        # scale_ratio: 2 # spacing ratio between levels
+        # minlevel: 0 # finest level used
+        # maxlevel: 3 # coarsest level
+        # minsize: 8 # minimum number of pixels of a reduced axis
 
     # TransformTranslation:
     # TransformAffine:
@@ -1124,23 +1277,32 @@ class Objective:
         sampler: Sampler,
         metric: Metric,
         interpolator: Interpolator,
+        center=None,
     ):
+        """
+        center: center of rotation (default: center of the fixed image)
+        """
         self.fixed = fixed
         self.moving = moving
         self.transform = transform
         self.sampler = sampler
         self.interpolator = interpolator
         self.metric = metric
+        self.center = fixed.geometry.center if center is None else np.asarray(center)
         self.normalize = lambda f, m: (fixed.normalize(f), moving.normalize(m))
 
+    def valid(self, points2, values2):
+        """samples inside the moving image, with finite values"""
+        return self.moving.geometry.contains(points2) & np.isfinite(values2)
+
     def __call__(self, parameters, gradient=False, **kwargs):
-        transform_args = {"center": self.fixed.geometry.center}
+        transform_args = {"center": self.center}
         metric_args = {"normalize": self.normalize, **kwargs}
         points1, values1 = self.sampler(self.fixed)
         if not gradient:
             points2 = self.transform(parameters, points1, **transform_args)
             values2 = self.interpolator(self.moving, points2)
-            isvalid = np.isfinite(values2)
+            isvalid = self.valid(points2, values2)
             cost = self.metric(values1[isvalid], values2[isvalid], **metric_args)
             LOGGER.debug(f"parameters: {parameters}, cost: {cost:.4}")
             return cost
@@ -1150,7 +1312,7 @@ class Objective:
             parameters, points1, jac=True, **transform_args
         )
         values2, jinterp = self.interpolator(self.moving, points2, jac=jtrans)
-        isvalid = np.isfinite(values2)
+        isvalid = self.valid(points2, values2)
         cost, gmetric = self.metric(
             values1[isvalid], values2[isvalid], gradient2=True, **metric_args
         )
@@ -1161,7 +1323,7 @@ class Objective:
         return cost, gradient
 
     def gradient(self, parameters, **kwargs):
-        _, gradient = self(parameters, {**kwargs, "gradient": True})
+        _, gradient = self(parameters, gradient=True, **kwargs)
         return gradient
 
     def callback(self, parameters, *args):
@@ -1174,22 +1336,29 @@ class Elastix:
 
     def __init__(self, config, loglevel=None):
         self.config = config
-        self.logger = LOGGER.getChild("elastix")
+        self.logger = LOGGER
         loglevel = loglevel if loglevel else "WARN"  # default log-level
         self.logger.setLevel(getattr(logging, str(loglevel), loglevel))
 
-    def apply(self, transformation: Transformation, moving: Image, label=None):
-        """generate transformed image"""
+    def apply(self, transformation: Transformation, moving: Image, label=None, order=None):
+        """generate transformed image
+
+        order: interpolation order (default: config["ResampleInterpolator"])
+        """
         assert isinstance(transformation, Transformation)
-        interpolator = InterpolatorBSpline(**self.config["ResampleInterpolator"])
+        options = {"mode": "constant", "cval": 0, **(self.config.settings.get("ResampleInterpolator") or {})}
+        if order is not None:
+            options["order"] = order
+        interpolator = InterpolatorBSpline(**options)
 
         points2 = transformation()
         values = interpolator(moving, points2)
-        geom = transformation.geometry.serialize()
+        geom = transformation.geometry
         return Image(
-            values.reshape(geom["shape"]),
-            spacing=geom["spacing"],
-            origin=geom["origin"],
+            values.reshape(geom.shape),
+            spacing=geom.spacing,
+            origin=geom.origin,
+            direction=geom.direction,
             label=label,
         )
 
@@ -1205,7 +1374,9 @@ class Elastix:
         # compute pyramid
         levels = pyramid(fixed, moving)
 
-        parameters = None
+        # same center of rotation at all levels
+        center = fixed.geometry.center
+        parameters = None if init is None else np.asarray(init, dtype=float)
         for level, images in zip(*levels):
             _fixed, _moving = images
 
@@ -1227,7 +1398,7 @@ class Elastix:
 
             # objective
             objective = Objective(
-                _fixed, _moving, transform, sampler, metric, interpolator
+                _fixed, _moving, transform, sampler, metric, interpolator, center=center
             )
 
             # initial parameter values
@@ -1244,7 +1415,7 @@ class Elastix:
             if callback:
                 callback(_fixed, _moving, parameters, self.config, level=level)
 
-        transformation = Transformation(transform, fixed.geometry, parameters)
+        transformation = Transformation(transform, fixed.geometry, parameters, center=center)
         self.logger.info(f"Found transformation: {transformation}")
         self.logger.info(f"Done.")
         return transformation, info
@@ -1317,19 +1488,51 @@ def rigidinverse2d(parameters):
     return [-phi, b_[0], b_[1]]
 
 
+def euler_matrices(angles):
+    """rotation matrices about x, y, z"""
+    ca, cb, cg = np.cos(angles)
+    sa, sb, sg = np.sin(angles)
+    Rx = np.array([[1, 0, 0], [0, ca, -sa], [0, sa, ca]])
+    Ry = np.array([[cb, 0, sb], [0, 1, 0], [-sb, 0, cb]])
+    Rz = np.array([[cg, -sg, 0], [sg, cg, 0], [0, 0, 1]])
+    dRx = np.array([[0, 0, 0], [0, -sa, -ca], [0, ca, -sa]])
+    dRy = np.array([[-sb, 0, cb], [0, 0, 0], [-cb, 0, -sb]])
+    dRz = np.array([[-sg, -cg, 0], [cg, -sg, 0], [0, 0, 0]])
+    return (Rx, Ry, Rz), (dRx, dRy, dRz)
+
+
+def euler_to_matrix(angles):
+    """rotation matrix R = Rz @ Rx @ Ry (ITK's Euler3DTransform)"""
+    (Rx, Ry, Rz), _ = euler_matrices(angles)
+    return Rz @ Rx @ Ry
+
+
+def matrix_to_euler(R):
+    """Euler angles (ax, ay, az) of a rotation matrix R = Rz @ Rx @ Ry"""
+    ax = np.arcsin(np.clip(R[2, 1], -1, 1))
+    ay = np.arctan2(-R[2, 0], R[2, 2])
+    az = np.arctan2(-R[0, 1], R[1, 1])
+    return np.array([ax, ay, az])
+
+
 def rigidtransform3d(parameters, points, axis=None, jac=False):
-    """3d Rigid transform"""
-    if axis is not None:
-        assert len(parameters) == 3  # 4
-        n = np.asarray(axis)
-        nx = np.c_[normalaxes3d(axis)]
-        phi = (parameters[:1],)
-        _b = parameters[1:]
-        b = nx @ _b
-    else:
-        assert len(parameters) == 7
-        nx = np.eye(3)
-        phi, n, b = parameters[:1], parameters[1:4], parameters[4:7]
+    """3d Rigid transform
+
+    parameters:
+        axis is None: Euler angles (ax, ay, az) and translation (bx, by, bz), R = Rz @ Rx @ Ry
+        axis is set: angle (phi) about `axis`, translation (b1, b2) in the plane normal to `axis`
+    """
+    parameters = np.asarray(parameters, dtype=float)
+    if axis is None:
+        assert len(parameters) == 6
+        return eulertransform3d(parameters, points, jac=jac)
+
+    assert len(parameters) == 3
+    n = np.asarray(axis, dtype=float)
+    n = n / np.linalg.norm(n)
+    nx = np.c_[normalaxes3d(n)]
+    phi = parameters[0]
+    b = nx @ parameters[1:]
 
     cosphi = np.cos(phi)
     sinphi = np.sin(phi)
@@ -1343,40 +1546,30 @@ def rigidtransform3d(parameters, points, axis=None, jac=False):
 
     # else, compute jacobian
     jacphi = -sinphi * points + sinphi * projnX + cosphi * crossnX
-    if axis is not None:
-        jacn = []
-    else:
-        select = np.eye(3)
-        jacn = [
-            (1 - cosphi) * (np.c_[np.dot(points, sel)] * n + np.c_[dotnX] * sel)
-            + sinphi * np.cross(sel, points)
-            for sel in select
-        ]
-
-    # jacb = [np.outer(np.ones(len(points)), row) for row in np.eye(3)]
     npoint = len(points)
-    jacb = [np.broadcast_to(n, (npoint, 3)) for n in nx.T]
-    jac = np.stack([jacphi] + jacn + jacb, axis=2)
-    return new, jac
+    jacb = [np.broadcast_to(vec, (npoint, 3)) for vec in nx.T]
+    return new, np.stack([jacphi] + jacb, axis=2)
 
 
-def rigidinverse3d(parameters, axis=None):
-    """Return parameters of inverse 3d rigid transform"""
-    if axis is not None:
-        assert len(parameters) == 4
-        n = np.asarray(axis)
-        phi, b = parameters[:1], parameters[1:4]
-    else:
-        assert len(parameters) == 7
-        phi, n, b = parameters[:1], parameters[1:4], parameters[4:7]
-    n = np.asarray(n)
-    Nc = np.array([[0, -n[2], n[1]], [n[2], 0, -n[0]], [-n[1], n[0], 0]])
-    A = np.cos(phi) * np.eye(3) + (1 - np.cos(phi)) * np.outer(n, n) + np.sin(phi) * Nc
-    invA = np.linalg.inv(A)
-    if axis is not None:
-        return np.r_[-phi, -invA @ b]
-    else:
-        return np.r_[-phi, n / np.linalg.norm(n) ** 2, -invA @ b]
+def eulertransform3d(parameters, points, jac=False):
+    """3d rigid transform with Euler angles: R = Rz @ Rx @ Ry, parameters (ax, ay, az, bx, by, bz)"""
+    (Rx, Ry, Rz), (dRx, dRy, dRz) = euler_matrices(parameters[:3])
+    b = parameters[3:]
+    new = points @ (Rz @ Rx @ Ry).T + b
+    if not jac:
+        return new
+    dR = [Rz @ dRx @ Ry, Rz @ Rx @ dRy, dRz @ Rx @ Ry]
+    npoint = len(points)
+    jacR = [points @ mat.T for mat in dR]
+    jacb = [np.broadcast_to(vec, (npoint, 3)) for vec in np.eye(3)]
+    return new, np.stack(jacR + jacb, axis=2)
+
+
+def rigidinverse3d(parameters):
+    """Return parameters of inverse 3d rigid transform (Euler angles)"""
+    parameters = np.asarray(parameters, dtype=float)
+    R = euler_to_matrix(parameters[:3])
+    return np.r_[matrix_to_euler(R.T), -R.T @ parameters[3:]]
 
 
 def affinetransform2d3d(parameters, points, axis=None, jac=False):
@@ -1429,46 +1622,59 @@ def ndspline_interpolation(arr, coords, order=3, jac=False, **kwargs):
         coords: Kxd coordinates array
 
     """
-    arr = 1.0 * np.asarray(arr)
-    coords = np.asarray(coords)
-    values = ndimage.map_coordinates(arr, coords.T, order=order, **kwargs)
+    arr = np.asarray(arr, dtype=float)
+    coords = np.asarray(coords, dtype=float)
+    if order > 1:
+        # spline coefficients: computed once for the values and the derivatives
+        mode = kwargs.get("mode", "constant")
+        coeffs = ndimage.spline_filter(arr, order=order, mode=mode)
+        opts = dict(kwargs, order=order, prefilter=False)
+    else:
+        coeffs = arr
+        opts = dict(kwargs, order=order)
+
+    def evaluate(coords):
+        return ndimage.map_coordinates(coeffs, coords.T, **opts)
+
+    values = evaluate(coords)
     if jac is False:
         return values
 
     if order == 0:
         raise ValueError("Cannot compute jacobian nearest-neighbor mode")
 
-    # jacobian (npoint x npoint x ndim)
+    # gradient w/r to the coordinates (npoint x ndim)
     npoint = len(coords)
     ndim = arr.ndim
-    opts = dict(**kwargs, order=order)
+    grad = np.zeros((npoint, ndim))
     if order == 1:
-        opts = dict(opts, cval=0, mode="nearest")
-        # exact calculation
-        jacvalues = np.zeros((npoint, ndim))
+        # exact: difference of the neighboring values along each axis (right-sided on the grid nodes)
+        nearest = {**kwargs, "mode": "nearest"}
+        nearest.pop("cval", None)
         for d in range(ndim):
+            if arr.shape[d] < 2:
+                continue
             coords1 = np.copy(coords)
-            coords1[:, d] = np.round(coords1[:, d] + 0.5)
+            coords1[:, d] = np.clip(np.floor(coords[:, d]), 0, arr.shape[d] - 2) + 1
             coords2 = coords1 - np.eye(ndim)[d]
-            jacvalues[:, d] = ndimage.map_coordinates(
-                arr, coords1.T, **opts
-            ) - ndimage.map_coordinates(arr, coords2.T, **opts)
-        if isinstance(jac, np.ndarray):
-            # jacmat = (jacvalues[..., np.newaxis] * jac).sum(axis=1)
-            jacmat = np.nansum(jacvalues[..., np.newaxis] * jac, axis=1)
-        else:
-            jacmat = np.zeros((npoint, npoint, ndim), dtype=arr.dtype)
-            indices = np.arange(npoint)
-            jacmat[indices, indices, :] = jacvalues
+            grad[:, d] = ndimage.map_coordinates(arr, coords1.T, order=1, **nearest)
+            grad[:, d] -= ndimage.map_coordinates(arr, coords2.T, order=1, **nearest)
+            # outside the grid: constant extension
+            grad[(coords[:, d] < 0) | (coords[:, d] > arr.shape[d] - 1), d] = 0
     else:
-        # finite difference
-        select = np.eye(ndim * npoint).reshape(npoint * ndim, npoint, ndim).astype(bool)
-        eps = 1e-10
-        coords1 = coords + 0.5 * eps * select
-        coords2 = coords - 0.5 * eps * select
-        jacmat = ndimage.map_coordinates(arr, coords1.reshape(-1, ndim).T, **opts)
-        jacmat -= ndimage.map_coordinates(arr, coords2.reshape(-1, ndim).T, **opts)
-        jacmat = 1e10 * np.moveaxis(jacmat.reshape(npoint, ndim, npoint), 1, 2)
+        # central finite differences on the spline
+        step = 1e-3
+        for d in range(ndim):
+            delta = step * np.eye(ndim)[d]
+            grad[:, d] = (evaluate(coords + delta) - evaluate(coords - delta)) / (2 * step)
+
+    if isinstance(jac, np.ndarray):
+        # jacobian w/r to parameters (npoint x nparam)
+        return values, np.einsum("nd,ndk->nk", grad, jac)
+    # jacobian w/r to the coordinates of all points (npoint x npoint x ndim)
+    jacmat = np.zeros((npoint, npoint, ndim))
+    indices = np.arange(npoint)
+    jacmat[indices, indices, :] = grad
     return values, jacmat
 
 
@@ -1508,7 +1714,7 @@ class Kernel:
     @staticmethod
     def spline0(x):
         """0-order spline window"""
-        return 1.0 * (np.abs(x) < 0.5)  # ((x >= -0.5) & (x < 0.5))
+        return 1.0 * ((x >= -0.5) & (x < 0.5))
 
     @staticmethod
     def spline2(x):
@@ -1670,7 +1876,9 @@ def mutualinfo(values1, values2, gradient2=False, **kwargs):
     p1p2 = np.outer(p12.sum(axis=1), p12.sum(axis=0))
 
     # mutual information
-    log12 = np.ma.log(np.ma.divide(p12, p1p2))
+    nonzero = (p12 > 0) & (p1p2 > 0)
+    log12 = np.zeros_like(p12)
+    log12[nonzero] = np.log(p12[nonzero] / p1p2[nonzero])
     mi = -(p12 * log12).sum()
 
     if not gradient2:
@@ -1690,51 +1898,45 @@ def agd(
 
     Based on 'adagrad' as seen in github.com/antonAce/adaptive-gradient-descent
     """
-    init = np.asarray(init)
+    x = np.asarray(init, dtype=float)
     G = 0
+    scale = 1.0  # step reduction after rejected steps
 
-    def step(x):
-        """gradient step"""
-        nonlocal G
+    # last accepted point
+    xbest, cbest, gbest, lr = x, np.inf, None, None
 
+    res = {"success": False, "message": "Maximum number of iterations reached"}
+    nit = 0
+    for nit in range(1, niter + 1):
         # compute current cost and gradient
         cost, grad = func(x, **args)
 
-        # adaptive learning rate
-        G = G + grad**2
-        lr = alpha / np.sqrt(G + eps)
-
-        return x - lr * grad, cost, grad
-
-    res = {}
-    x = init
-    prev = np.inf
-    for i in range(niter):
-        _x, cost, grad = step(x)
-
-        if cost > prev:
+        if cost > cbest:
+            # rejected step: smaller step from the last accepted point
+            scale *= 0.5
+            x = xbest - scale * lr * gbest
             continue
-        x = _x
 
-        if np.abs((cost - prev) / cost) < rtol:
+        stationary = np.abs(cost - cbest) <= rtol * np.abs(cost)
+        xbest, cbest, gbest = x, cost, grad
+        LOGGER.debug(f"iter: {nit}, cost: {cost:3.3}, grad: {grad}")
+        if stationary:
             res["success"] = True
             res["message"] = "Stationnary cost"
             break
 
-        prev = cost
-        LOGGER.debug(f"iter: {iter}, cost: {cost:3.3}, grad: {grad}")
-
         if callback:
             callback(x)
 
-    else:
-        res["success"] = False
-        res["message"] = "Maximum number of iterations reached"
+        # adaptive learning rate
+        G = G + grad**2
+        lr = alpha / np.sqrt(G + eps)
+        x = x - scale * lr * grad
 
-    res["nit"] = i
-    res["fun"] = cost
+    res["nit"] = nit
+    res["fun"] = cbest
 
-    return x, res
+    return xbest, res
 
 
 class OptimResults(SimpleNamespace):

@@ -46,4 +46,4 @@ Remaining work and future features. Details, measurements and history: `PLAN_ela
 ## Future features
 
 - [ ] GPU backend (torch or cupy).
-- [ ] Top-level aliases in `tomio/__init__.py` (e.g. `io.register`).
+- [x] Top-level aliases: `io.register`, `io.warp`, `io.interpolate_slices`, `io.check_folding`.

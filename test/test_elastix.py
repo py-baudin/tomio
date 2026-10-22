@@ -1880,3 +1880,11 @@ def test_interpolate_slices_registration():
     registration = ex.interpolate_slices(sparse, image, method="registration", config=config)
     assert dice(np.asarray(shape)[..., 2], truth[..., 2]) < 0.3
     assert dice(np.asarray(registration)[..., 2], truth[..., 2]) > 0.8
+
+
+def test_toplevel_aliases():
+    assert io.register is ex.register and io.warp is ex.transform
+    assert io.interpolate_slices is ex.interpolate_slices and io.check_folding is ex.check_folding
+    fixed, moving = shifted((24, 24), (1.0, -0.5))
+    registered, trans = io.register(fixed, moving, transform="translation", return_transform=True)
+    assert np.allclose(np.asarray(io.warp(trans, moving)), np.asarray(registered))

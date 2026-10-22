@@ -33,3 +33,4 @@ MANIFEST
 *.spec
 
 PLAN*.md
+benchmarks/data/

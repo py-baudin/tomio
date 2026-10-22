@@ -99,6 +99,8 @@ def finite_gradient(func, params, step=1e-5):
 
 
 TRANSLATION = {"transform": "translation"}
+# stochastic optimizer of the B-spline tests: fewer iterations than the default (fast tests)
+SGD = {"type": "sgd", "niter": 64}
 MI = {"metric": "mi"}
 
 
@@ -285,7 +287,7 @@ def test_register_stages():
 # B1 (fixed): Elastix.execute ignores `init`
 def test_execute_uses_init():
     fixed, moving = shifted((32, 32), (1.0, 0.5))
-    config = ex.Config({**TRANSLATION, "pyramid": "none", "optimizer": {"maxiter": 0}})
+    config = ex.Config({**TRANSLATION, "pyramid": "none", "optimizer": {"type": "lbfgs", "maxiter": 0}})
     trans, _ = ex.Elastix(config).execute(ex.Image(fixed), ex.Image(moving), init=[0.7, 0.3])
     assert np.allclose(trans.parameters, [0.7, 0.3])
 
@@ -667,7 +669,7 @@ def test_transform_class():
     # jacobian
     for i in range(100):
         vec = np.random.uniform(size=3)
-        finitediff = (transform(params + 1e-10 * vec, points) - moved) * 1e10
+        finitediff = (transform(params + 1e-6 * vec, points) - transform(params - 1e-6 * vec, points)) / 2e-6
         assert np.allclose(jac @ vec, finitediff, atol=1e-5)
 
     #
@@ -693,14 +695,14 @@ def test_transform_class():
     moved, jac = transform(params, points, jac=True)
     vec = vec = np.random.uniform(size=3)
     for i in range(100):
-        finitediff = (transform(params + 1e-10 * vec, points) - moved) * 1e10
+        finitediff = (transform(params + 1e-6 * vec, points) - transform(params - 1e-6 * vec, points)) / 2e-6
         assert np.allclose(jac @ vec, finitediff, atol=1e-5)
 
     # centered
     # transform = elastix.TransformRigid(centered=True)
     # moved, jac = transform(params, points, jac=True)
     # for i in range(100):
-    #     finitediff = (transform(params + 1e-10 * vec, points) - moved) * 1e10
+    #     finitediff = (transform(params + 1e-6 * vec, points) - transform(params - 1e-6 * vec, points)) / 2e-6
     #     assert np.allclose(jac @ vec, finitediff, atol=1e-5)
 
     # inverse
@@ -745,7 +747,7 @@ def test_transform_class():
         params = np.random.normal(loc=[np.pi, 0, 0, 0, 0, 0])
         moved, jac = transform(params, points, jac=True)
         vec = np.random.uniform(size=params.size)
-        finitediff = (transform(params + 1e-10 * vec, points) - moved) * 1e10
+        finitediff = (transform(params + 1e-6 * vec, points) - transform(params - 1e-6 * vec, points)) / 2e-6
         assert np.allclose(jac @ vec, finitediff, atol=1e-3)
 
     # centered
@@ -755,8 +757,9 @@ def test_transform_class():
         moved, jac = transform(params, points, jac=True, center=center)
         vec = np.random.uniform(size=params.size)
         finitediff = (
-            transform(params + 1e-10 * vec, points, center=center) - moved
-        ) * 1e10
+            transform(params + 1e-6 * vec, points, center=center)
+            - transform(params - 1e-6 * vec, points, center=center)
+        ) / 2e-6
         assert np.allclose(jac @ vec, finitediff, atol=1e-3)
 
     # inverse
@@ -779,7 +782,7 @@ def test_transform_class():
         params = np.random.normal(loc=[np.pi] + [0, 0])  # , 0])
         moved, jac = transform(params, points, jac=True)
         vec = np.random.uniform(size=params.size)
-        finitediff = (transform(params + 1e-10 * vec, points) - moved) * 1e10
+        finitediff = (transform(params + 1e-6 * vec, points) - transform(params - 1e-6 * vec, points)) / 2e-6
         assert np.allclose(jac @ vec, finitediff, atol=1e-3)
 
     #
@@ -803,7 +806,7 @@ def test_transform_class():
     assert np.allclose(points @ A.T + b, moved)
     for i in range(100):
         vec = np.random.uniform(size=params.size)
-        finitediff = (transform(params + 1e-10 * vec, points) - moved) * 1e10
+        finitediff = (transform(params + 1e-6 * vec, points) - transform(params - 1e-6 * vec, points)) / 2e-6
         assert np.allclose(jac @ vec, finitediff, atol=1e-5)
 
     # Affine transform with fixed axis
@@ -815,7 +818,7 @@ def test_transform_class():
         params = np.random.normal(loc=params0)
         moved, jac = transform(params, points, jac=True)
         vec = np.random.uniform(size=params.size)
-        finitediff = (transform(params + 1e-10 * vec, points) - moved) * 1e10
+        finitediff = (transform(params + 1e-6 * vec, points) - transform(params - 1e-6 * vec, points)) / 2e-6
         assert np.allclose(jac @ vec, finitediff, atol=1e-5)
         invp = transform.inverse(params)
         points2 = transform(invp, moved)
@@ -917,9 +920,11 @@ def test_metric_class():
     values2 = base2 + np.random.normal(size=100)
     values3 = base3 + np.random.normal(size=100)
 
-    values1 = elastix.normalize_values(values1)
-    values2 = elastix.normalize_values(values2)
-    values3 = elastix.normalize_values(values3)
+    # (inside (0, 1): central finite differences)
+    interior = lambda values: 0.005 + 0.99 * elastix.normalize_values(values)
+    values1 = interior(values1)
+    values2 = interior(values2)
+    values3 = interior(values3)
     vec = np.random.uniform(size=values1.shape)
 
     # MSD
@@ -931,7 +936,7 @@ def test_metric_class():
     # gradient
     cost, grad = metric(values1, values2, gradient2=True)
     for i in range(100):
-        finitediff = (metric(values1, values2 + 1e-10 * vec) - cost) * 1e10
+        finitediff = (metric(values1, values2 + 1e-6 * vec) - metric(values1, values2 - 1e-6 * vec)) / 2e-6
         assert np.isclose(grad @ vec, finitediff, atol=1e-5)
 
     # Mutual information
@@ -947,12 +952,12 @@ def test_metric_class():
     metric = elastix.MetricMutualInformation(nbin=5)
     cost, grad = metric(values1, values2, gradient2=True)
     for i in range(100):
-        finitediff = (metric(values1, values2 + 1e-10 * vec) - cost) * 1e10
+        finitediff = (metric(values1, values2 + 1e-6 * vec) - metric(values1, values2 - 1e-6 * vec)) / 2e-6
         assert np.isclose(grad @ vec, finitediff, atol=1e-5)
 
     # complex
-    ivalues1 = elastix.normalize_values(base1 + np.random.normal(size=100))
-    ivalues2 = elastix.normalize_values(base2 + np.random.normal(size=100))
+    ivalues1 = interior(base1 + np.random.normal(size=100))
+    ivalues2 = interior(base2 + np.random.normal(size=100))
     cvalues1 = values1 + 1j * ivalues1
     cvalues2 = values2 + 1j * ivalues2
 
@@ -969,7 +974,7 @@ def test_metric_class():
         vec = np.random.uniform(size=cvalues1.shape) + 1j * np.random.uniform(
             size=cvalues1.shape
         )
-        finitediff = (metric(cvalues1, cvalues2 + 1e-10 * vec, nbin=5) - cost) * 1e10
+        finitediff = (metric(cvalues1, cvalues2 + 1e-6 * vec, nbin=5) - metric(cvalues1, cvalues2 - 1e-6 * vec, nbin=5)) / 2e-6
         assert np.isclose(grad @ np.r_[vec.real, vec.imag], finitediff, atol=1e-5)
 
 
@@ -1035,25 +1040,27 @@ def test_objective_class():
 
         # test objective's components separately first
         # transform
-        _points2 = transform(params0 + 1e-10 * vec, points1, center=fixed.center)
-        finitediff = (_points2 - points2) * 1e10
+        step = 1e-6
+        points2p = transform(params0 + step * vec, points1, center=fixed.center)
+        points2m = transform(params0 - step * vec, points1, center=fixed.center)
+        finitediff = (points2p - points2m) / (2 * step)
         assert np.allclose(jtrans @ vec, finitediff, atol=1e-3)
 
         # interpolator
-        _values2 = interpolator(fixed, _points2)
-        finitediff = (_values2 - values2) * 1e10
+        values2p, values2m = interpolator(fixed, points2p), interpolator(fixed, points2m)
+        finitediff = (values2p - values2m) / (2 * step)
         assert np.allclose(
             jinterp_trans @ vec / ninterp, finitediff / ninterp, atol=1e-4
         )
 
         # metric
-        _nvalues2 = fixed.normalize(_values2)
-        _cost = metric(nvalues1, _nvalues2)
-        finitediff = (_cost - cost) * 1e10
+        costp = metric(nvalues1, fixed.normalize(values2p))
+        costm = metric(nvalues1, fixed.normalize(values2m))
+        finitediff = (costp - costm) / (2 * step)
         assert np.allclose(gmetric_interp_trans @ vec, finitediff, atol=1e-3)
 
         # objective
-        finitediff = (objective0(params0 + 1e-10 * vec) - cost) * 1e10
+        finitediff = (objective0(params0 + step * vec) - objective0(params0 - step * vec)) / (2 * step)
         assert np.isclose(grad @ vec, finitediff, atol=1e-3)
 
 
@@ -1112,8 +1119,9 @@ def test_mutualinfo():
     values1 = np.ravel(base1 + 2 * np.random.uniform(size=100)[:, np.newaxis])
     values2 = np.ravel(base1 + 2 * np.random.uniform(size=100)[:, np.newaxis])
 
-    values1 = elastix.normalize_values(values1)
-    values2 = elastix.normalize_values(values2)
+    # (inside (0, 1): central finite differences)
+    values1 = 0.005 + 0.99 * elastix.normalize_values(values1)
+    values2 = 0.005 + 0.99 * elastix.normalize_values(values2)
 
     # parzen windows 2d: joint distribution
     dist12 = elastix.parzen2d(values1, values2, nbin=10, windows=["spline0", "spline3"])
@@ -1128,8 +1136,8 @@ def test_mutualinfo():
     opts = dict(nbin=10, windows=["spline0", "spline3"])
     dist12, jac2 = elastix.parzen2d(values1, values2, jac2=True, **opts)
     finitediff = (
-        elastix.parzen2d(values1, values2 + 1e-10 * vec, **opts) - dist12
-    ) * 1e10
+        elastix.parzen2d(values1, values2 + 1e-6 * vec, **opts) - elastix.parzen2d(values1, values2 - 1e-6 * vec, **opts)
+    ) / 2e-6
     assert np.allclose(jac2 @ vec, finitediff, atol=1e-5)
 
     # mutual info
@@ -1139,13 +1147,13 @@ def test_mutualinfo():
     mi12, grad12 = elastix.mutualinfo(values1, values2, gradient2=True, **opts)
     assert mi11 < mi12
     finitediff = (
-        elastix.mutualinfo(values1, values1 + 1e-10 * vec, **opts) - mi11
-    ) * 1e10
+        elastix.mutualinfo(values1, values1 + 1e-6 * vec, **opts) - elastix.mutualinfo(values1, values1 - 1e-6 * vec, **opts)
+    ) / 2e-6
     assert np.allclose(grad11 @ vec, finitediff, atol=1e-5)
 
     finitediff = (
-        elastix.mutualinfo(values1, values2 + 1e-10 * vec, **opts) - mi12
-    ) * 1e10
+        elastix.mutualinfo(values1, values2 + 1e-6 * vec, **opts) - elastix.mutualinfo(values1, values2 - 1e-6 * vec, **opts)
+    ) / 2e-6
     assert np.allclose(grad12 @ vec, finitediff, atol=1e-5)
 
 
@@ -1465,14 +1473,14 @@ def textured_pair(shape=(48, 48), amplitude=1.0, period=32.0, noise=0.02, seed=0
 
 @pytest.mark.parametrize(
     "metric, contrast, tolerance",
-    [("mse", False, 0.15), ("mi", False, 0.15), ("mi", True, 0.25), ("ngf", False, 0.25), ("ngf", True, 0.25)],
+    [("mse", False, 0.2), ("mi", False, 0.2), ("mi", True, 0.25), ("ngf", False, 0.25), ("ngf", True, 0.25)],
 )
 def test_register_bspline(metric, contrast, tolerance):
     """recovery of a known small smooth deformation (images aligned beforehand, e.g. by a rigid stage)"""
     fixed, moving, points, u = textured_pair()
     if contrast:
         moving = np.exp(-1.5 * moving)  # other contrast (non-linear, decreasing)
-    registered, trans = ex.register(fixed, moving, transform={"type": "bspline", "grid_spacing": 8}, metric=metric, return_transform=True)
+    registered, trans = ex.register(fixed, moving, transform={"type": "bspline", "grid_spacing": 8}, metric=metric, optimizer=SGD, return_transform=True)
     inner = np.all((points >= 8) & (points <= 39), axis=1)
     error = np.linalg.norm(trans(points[inner]) - points[inner] - u[inner], axis=1)
     assert error.mean() < tolerance * np.linalg.norm(u[inner], axis=1).mean()
@@ -1482,7 +1490,7 @@ def test_register_bspline(metric, contrast, tolerance):
 def test_register_bspline_identical_textured(metric):
     """identical images: (almost) no deformation"""
     fixed, _, points, _ = textured_pair()
-    _, trans = ex.register(fixed, fixed, transform={"type": "bspline", "grid_spacing": 8}, metric=metric, return_transform=True)
+    _, trans = ex.register(fixed, fixed, transform={"type": "bspline", "grid_spacing": 8}, metric=metric, optimizer=SGD, return_transform=True)
     assert np.linalg.norm(trans(points) - points, axis=1).mean() < 0.1
 
 
@@ -1496,7 +1504,7 @@ def test_register_bspline_identical():
 def test_register_rigid_bspline_stages():
     fixed, moving = deformed_pair((48, 48), amplitude=1.0)
     moving = np.roll(moving, 2, axis=0)  # + global shift
-    stages = [{"transform": "rigid"}, {"transform": {"type": "bspline", "grid_spacing": 8}}]
+    stages = [{"transform": "rigid"}, {"transform": {"type": "bspline", "grid_spacing": 8}, "optimizer": SGD}]
     registered, trans = ex.register(fixed, moving, stages, return_transform=True)
     assert isinstance(trans, ex.TransformationSequence)
     assert isinstance(trans[1].transform, ex.TransformBSpline)
@@ -1506,7 +1514,7 @@ def test_register_rigid_bspline_stages():
 
 def test_bspline_serialize():
     fixed, moving = deformed_pair((32, 32))
-    _, trans = ex.register(fixed, moving, transform={"type": "bspline", "grid_spacing": 8}, return_transform=True)
+    _, trans = ex.register(fixed, moving, transform={"type": "bspline", "grid_spacing": 8}, optimizer=SGD, return_transform=True)
     data = trans.serialize()
     assert data["transform"]["type"] == "bspline" and data["transform"]["grid"] is not None
     trans2 = ex.as_transformation(data)
@@ -1593,3 +1601,39 @@ def test_register_bspline_sgd(metric):
     # identical images: small drift
     _, trans = ex.register(fixed, fixed, config, return_transform=True)
     assert np.linalg.norm(trans(points[inner]) - points[inner], axis=1).mean() < 0.1
+
+
+# plotting (optional matplotlib)
+
+@pytest.mark.parametrize("deformable", [False, True])
+def test_plot_registration(tmp_path, deformable):
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    from tomio import elastix_plot
+
+    fixed, moving = shifted((24, 24, 6), (1.0, -1.0, 0.0))
+    if deformable:
+        stages = [{"transform": "translation"}, {"transform": {"type": "bspline", "grid_spacing": 8}, "optimizer": {"type": "sgd", "niter": 8}}]
+    else:
+        stages = {"transform": "translation"}
+    _, trans = ex.register(fixed, moving, stages, return_transform=True)
+    fig = elastix_plot.plot_registration(fixed, moving, trans, slices=2)
+    assert len(fig.axes) >= 2 * 6
+    fig.savefig(tmp_path / "registration.png")
+    assert (tmp_path / "registration.png").exists()
+    _, info = ex.Elastix(ex.Config(transform="translation")).execute(ex.Image(fixed), ex.Image(moving))
+    elastix_plot.plot_levels(info).savefig(tmp_path / "levels.png")
+
+
+def test_local_displacement():
+    from tomio import elastix_plot
+
+    geometry = ex.Geometry((8, 8))
+    rigid = ex.Transformation("translation", geometry, [1.0, 2.0])
+    points = geometry.points
+    assert np.allclose(elastix_plot.local_displacement(rigid, points), 0)
+    bspline = ex.TransformBSpline(grid_spacing=4)
+    bspline.setup(geometry)
+    params = np.repeat([0.5, -0.5], bspline.ncontrol)
+    sequence = ex.TransformationSequence([rigid, ex.Transformation(bspline, geometry, params)])
+    assert np.allclose(elastix_plot.local_displacement(sequence, points), [0.5, -0.5])

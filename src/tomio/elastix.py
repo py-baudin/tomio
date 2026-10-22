@@ -555,11 +555,26 @@ class Image:
             args.append(f"'{self.label}'")
         return f"Image({', '.join(args)})"
 
-    def normalize(self, values=None, tol=1e-8):
-        """normalize given (or image's own) values using image scale"""
+    def normalize(self, values=None, tol=1e-8, limits=None):
+        """normalize given (or image's own) values using image scale
+
+        limits: (low, high) percentiles of the (masked) values used as range (default: min and max)
+        """
         if values is None:
             values = self.values
-        return (values - self._min) / (self._max - self._min + tol)
+        vmin, vmax = (self._min, self._max) if limits is None else self.percentiles(limits)
+        return (values - vmin) / (vmax - vmin + tol)
+
+    def percentiles(self, limits):
+        """percentiles of the (masked, finite) values (cached)"""
+        key = ("percentiles", tuple(limits))
+        if key not in self._coefficients:
+            values = self.values
+            if np.iscomplexobj(values):
+                values = np.abs(values)
+            values = values[np.isfinite(values)]
+            self._coefficients[key] = tuple(float(v) for v in np.percentile(values, limits)) if values.size else (0.0, 1.0)
+        return self._coefficients[key]
 
     def update(self, values):
         """update array values (the array is copied: the input array is never modified)"""
@@ -629,6 +644,10 @@ class PyramidGaussian(Pyramid):
     order: interpolation order for downsampling
     sigma: gaussian smoothing in pixels of the original image (None: 0.5 * reduction factor of each axis)
     magnitude: use the magnitude of complex images
+    downsample: False: smoothing only, the images keep their grid at all levels (as Elastix's default smoothing
+        pyramids); avoids tiny coarse images (e.g. for B-spline transforms, whose coarse levels on a few voxels
+        can diverge); with random samples, the cost of an iteration does not depend on the image size.
+        None (default): set by the registration: downsampling for global transforms, smoothing only otherwise
     """
 
     def __init__(
@@ -640,7 +659,9 @@ class PyramidGaussian(Pyramid):
         order=1,
         sigma=None,
         magnitude=True,
+        downsample=None,
     ):
+        self.downsample = downsample
         self.maxlevel = maxlevel
         self.minlevel = minlevel
         self.scale_ratio = scale_ratio
@@ -673,6 +694,8 @@ class PyramidGaussian(Pyramid):
             sigma = self.sigma
         array = np.asarray(image.array, dtype=float)
         blurred = gaussian_filter(array, sigma) if np.any(sigma) else array
+        if self.downsample is False:
+            return Image(blurred, mask=image.mask, spacing=image.spacing, origin=image.origin, direction=image.direction)
 
         # downsample
         reduced = resample_grid(blurred, offset, ratio, shape, order=self.order)
@@ -1328,8 +1351,16 @@ class Sampler(ABC):
 class SamplerFull(Sampler):
     """Sample all pixels"""
 
+    def __init__(self):
+        self.image = None
+        self._samples = None
+
     def sample(self, image):
-        return image.points, image.values
+        # same arrays at each call (identify the sample set)
+        if image is not self.image:
+            self.image = image
+            self._samples = image.points, image.values
+        return self._samples
 
 
 class SamplerRandom(Sampler):
@@ -1564,10 +1595,16 @@ class MetricNormalizedGradientFields(Metric):
 
 
 class MetricMutualInformation(Metric):
-    """Mutual information"""
+    """Mutual information
 
-    def __init__(self, nbin=32):
+    nbin: number of histogram bins
+    limits: intensity range of each image (percentiles), e.g. (0.5, 99.5); values outside are clipped to the
+        first / last bin; default (None): min and max (outliers can squeeze the values into a few bins)
+    """
+
+    def __init__(self, nbin=32, limits=None):
         self.nbin = nbin
+        self.limits = None if limits is None else tuple(limits)
 
     def measure(self, values1, values2, gradient2=False, normalize=False, **kwargs):
         """mutual information (negative, to be minimized)
@@ -1665,6 +1702,20 @@ class OptimizerSGD(Optimizer):
         return x, OptimResults(fun=cost, nit=k + 1, nfev=k + 1, message="Number of iterations reached", success=True)
 
 
+class OptimizerAuto(Optimizer):
+    """Default optimizer: "lbfgs" for global transforms, "sgd" (new samples at each iteration) otherwise"""
+
+    def select(self, transform):
+        return OptimizerLBFGS() if transform.is_global else OptimizerSGD()
+
+    def optimize(self, objective, init):
+        transform = getattr(getattr(objective, "objective", objective), "transform")
+        return self.select(transform).optimize(objective, init)
+
+    def __str__(self):
+        return "OptimizerAuto"
+
+
 # component registry: section -> {type name: class}
 COMPONENTS = {
     "transform": {
@@ -1693,6 +1744,7 @@ COMPONENTS = {
         "ngf": MetricNormalizedGradientFields,
     },
     "optimizer": {
+        "auto": OptimizerAuto,
         "lbfgs": OptimizerLBFGS,
         "sgd": OptimizerSGD,
     },
@@ -1757,7 +1809,7 @@ class Config:
         "sampler": "random_coordinates",
         "interpolator": "linear",
         "metric": "mse",
-        "optimizer": "lbfgs",
+        "optimizer": "auto",
         "initialize": {"method": None},
         "resample": {"method": None},
     }
@@ -1902,12 +1954,49 @@ class Objective:
             self._moving_mask = Image(
                 moving.mask.astype(float), spacing=moving.spacing, origin=moving.origin, direction=moving.direction
             )
-        self.normalize = lambda f, m: (fixed.normalize(f), moving.normalize(m))
+        limits = getattr(metric, "limits", None)
+        self.normalize = lambda f, m: (fixed.normalize(f, limits=limits), moving.normalize(m, limits=limits))
 
     def resample(self):
         """draw new samples (stochastic optimizers)"""
         if getattr(self.sampler, "image", None) is not None:
             self.sampler.update()
+
+    def overlap(self, samples, points1, parameters):
+        """samples of the current set that are used: those mapped inside the moving image (pixel centers range) by
+        the parameters of the first evaluation (start of the optimization), cached per sample set
+
+        samples: sample points (identify the set), points1: after the initial transform"""
+        if getattr(self, "_reference", None) is None:
+            self._reference = np.array(parameters, dtype=float)
+        cached = getattr(self, "_overlap", (None, None))
+        if cached[0] is not samples:
+            points2 = self.transform(self._reference, points1, center=self.center)
+            self._overlap = (samples, self.moving.geometry.contains(points2, margin=0))
+        return self._overlap[1]
+
+    def padded(self, inset, points2, values2, grad2=None):
+        """values of the samples of the current set (`inset`, see `overlap`): padding value (moving minimum) and
+        zero gradient for the samples that left the moving image
+
+        The sample set is defined at the start of the optimization: otherwise the transform could improve the cost by
+        moving badly aligned samples out of the moving image.
+        returns: values, samples used [, gradients]
+        """
+        outside = ~self.moving.geometry.contains(points2)
+        values2 = np.where(outside, self.moving._min, values2) if np.any(outside) else values2
+        used = inset & np.isfinite(values2)
+        if self._moving_mask is not None:
+            used &= outside | (InterpolatorNearestNeighbor()(self._moving_mask, points2) > 0)
+        if grad2 is None:
+            return values2, used
+        if np.any(outside):
+            grad2 = np.array(grad2)
+            npoint = len(points2)
+            grad2[:npoint][outside] = 0
+            if len(grad2) > npoint:  # complex: imaginary part
+                grad2[npoint:][outside] = 0
+        return values2, used, grad2
 
     def valid(self, points2, values2):
         """samples inside the moving image (and its mask), with finite values"""
@@ -1974,13 +2063,14 @@ class Objective:
         transform_args = {"center": self.center}
         metric_args = {"normalize": self.normalize, **kwargs}
         points1, values1 = self.sampler(self.fixed)
+        samples = points1  # identifies the sample set
         if self.initial is not None:
             points1 = self.initial(points1)
         penalty = getattr(self.transform, "penalty", None)
         if not gradient:
             points2 = self.transform(parameters, points1, **transform_args)
             values2 = self.interpolator(self.moving, points2)
-            isvalid = self.valid(points2, values2)
+            values2, isvalid = self.padded(self.overlap(samples, points1, parameters), points2, values2)
             cost = self.metric(values1[isvalid], values2[isvalid], **metric_args)
             if penalty is not None:
                 cost = cost + penalty(parameters)
@@ -1992,7 +2082,7 @@ class Objective:
             parameters, points1, jac=True, **transform_args
         )
         values2, grad2 = self.interpolator(self.moving, points2, jac="points")
-        isvalid = self.valid(points2, values2)
+        values2, isvalid, grad2 = self.padded(self.overlap(samples, points1, parameters), points2, values2, grad2)
         cost, gmetric = self.metric(
             values1[isvalid], values2[isvalid], gradient2=True, **metric_args
         )
@@ -2050,6 +2140,9 @@ class Elastix:
         LOGGER.info("Execute pipeline")
 
         pyramid = self.config.setup("pyramid")
+        if getattr(pyramid, "downsample", False) is None:
+            # downsampling for global transforms, smoothing only otherwise
+            pyramid.downsample = self.config.setup("transform").is_global
         optimizer = self.config.setup("optimizer")
         self.logger.info(f"Using pyramid: {pyramid}")
         self.logger.info(f"Using optimizer: {optimizer}")

@@ -14,6 +14,13 @@
   (sparse for B-splines).
 - Defaults: `SamplerRandomCoordinates(order=1)`, `OptimizerLBFGS(maxiter=500)`.
 - Added: elastix optimizer "sgd" (stochastic gradient descent, new samples every iteration).
+- Added: `tomio.elastix_plot` (registration figures; optional extra `tomio[plot]`, matplotlib).
+- Added: MI option `limits` (intensity range from percentiles).
+- Added: pyramid option `downsample` (False: smoothing only, as Elastix's default pyramids).
+- Changed: default optimizer "auto" ("lbfgs" for global transforms, "sgd" for B-splines).
+- Changed: B-spline stages use a smoothing-only pyramid by default (coarse levels diverged on tiny images).
+- Fixed: constant sample set; samples leaving the moving image are padded, no longer discarded.
+- Added: benchmarks `phantom_elastix.py`, `bench_elastix_ffd.py` (synthetic pair with known deformation).
 - Known limitation: on real data (dixon → T1), the B-spline stage does not yet improve on the rigid result
   (see `TODO.md`).
 

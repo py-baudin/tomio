@@ -107,7 +107,8 @@ def transform(transformations, moving, *, ref=None, method=None):
     method: interpolation method (as `tomio.resample`):
         None: 'nearest' for integer and bool data, 'spline3' otherwise
         'nearest', 'linear', 'spline<n>'
-        'roi', 'labels': ROI / label map interpolation (global transforms of 3d images only)
+        'roi', 'labels': ROI / label map interpolation (global transforms of 3d images: `tomio.resample`,
+            otherwise `warp_roi` / `warp_labels`)
 
     returns: transformed image(s) (tomio Volume in 3d, Image in 2d)
     """
@@ -166,8 +167,10 @@ def _apply(transformation, moving, *, geometry=None, method=None, label=None):
         }
         vol = _volume.Volume(moving.array, spacing=moving.spacing, origin=moving.origin, transform=moving.transform)
         values = np.asarray(_interp.resample(vol, geometry=mapped, method=method))
-    elif method in ("roi", "labels"):
-        raise NotImplementedError(f"Method '{method}' requires a global transform of a real 3d image")
+    elif method == "roi":
+        values = warp_roi(moving, transformation(), geometry).reshape(tuple(geometry.shape))
+    elif method == "labels":
+        values = warp_labels(moving, transformation()).reshape(tuple(geometry.shape))
     else:
         order = _interp.get_order(method)
         interpolator = InterpolatorBSpline(order=order, mode="constant", cval=0)
@@ -178,6 +181,51 @@ def _apply(transformation, moving, *, geometry=None, method=None, label=None):
     if geometry.ndim == 3:
         return _volume.Volume(values, spacing=geometry.spacing, origin=geometry.origin, transform=geometry.direction.T)
     return Image(values, spacing=geometry.spacing, origin=geometry.origin, direction=geometry.direction, label=label)
+
+
+def warp_labels(labelmap, points):
+    """label map at points: linear interpolation of each label's mask, label with the largest value"""
+    array = np.asarray(labelmap.array)
+    coords = labelmap.geometry.to_coords(points)
+    best = np.full(len(points), -np.inf)
+    out = np.zeros(len(points), dtype=array.dtype)
+    for label in np.unique(array):
+        mask = (array == label).astype(float)
+        values = ndspline_interpolation(mask, coords, order=1, mode="constant", cval=float(label == 0))
+        better = values > best
+        out[better], best[better] = label, values[better]
+    return out
+
+
+def warp_roi(roi, points, geometry):
+    """ROI at the points of an output grid, for ROIs drawn on some slices only (as `tomio.resample(method="roi")`)
+
+    Along the slice axis (most labelled axis), each point takes the nearest labelled slice if it lies within
+    the output voxel's extent; nearest neighbor otherwise.
+    """
+    array = np.asarray(roi.array)
+    coords = roi.geometry.to_coords(points)
+    ndim = array.ndim
+    mask = array > 0
+    if not np.any(mask):
+        return np.zeros(len(points), dtype=array.dtype)
+    # slice axis and labelled slices (as interp.interpolate_roi)
+    counts = [mask.sum(axis=tuple(j for j in range(ndim) if j != i)) for i in range(ndim)]
+    axis = int(np.argmax([np.max(c) for c in counts]))
+    labelled = np.flatnonzero(counts[axis])
+    # nearest labelled slice
+    position = np.clip(np.searchsorted(labelled, coords[:, axis]), 1, max(len(labelled) - 1, 1))
+    candidates = np.stack([labelled[position - 1], labelled[np.minimum(position, len(labelled) - 1)]], axis=1)
+    distance = np.abs(candidates - coords[:, axis, np.newaxis])
+    nearest = candidates[np.arange(len(points)), np.argmin(distance, axis=1)]
+    # half extent of an output voxel along the slice axis (in ROI pixels)
+    matrix = np.linalg.inv(roi.geometry.matrix) @ geometry.matrix
+    half = max(0.5 * np.sum(np.abs(matrix[axis])), 0.5)
+    snapped = np.array(coords)
+    snapped[:, axis] = nearest
+    values = ndspline_interpolation(array, snapped, order=0, mode="constant", cval=0)
+    values[np.abs(nearest - coords[:, axis]) > half + 1e-6] = 0
+    return values.astype(array.dtype)
 
 
 def make_stages(config=None, **sections):
@@ -462,6 +510,21 @@ class Image:
         self._coefficients = {}
         self._update_range()
 
+    def gradient_images(self):
+        """gradient of the image in world coordinates: one Image per world axis (cached)"""
+        if "gradient" not in self._coefficients:
+            array = np.abs(self.array) if np.iscomplexobj(self.array) else np.asarray(self.array, dtype=float)
+            # derivatives along the array axes (per mm), then world axes: grad = D @ (dI / d(index * spacing))
+            derivatives = [
+                np.gradient(array, self.spacing[d], axis=d) if array.shape[d] > 1 else np.zeros(array.shape)
+                for d in range(array.ndim)
+            ]
+            world = np.einsum("ij,j...->i...", self.direction, np.stack(derivatives))
+            self._coefficients["gradient"] = [
+                Image(component, spacing=self.spacing, origin=self.origin, direction=self.direction) for component in world
+            ]
+        return self._coefficients["gradient"]
+
     def spline_coefficients(self, order):
         """B-spline interpolation coefficients of the array (cached)"""
         if order not in self._coefficients:
@@ -678,6 +741,8 @@ class Transformation:
 
     def __repr__(self):
         clsname = type(self.transform).__name__
+        if self.parameters.size > 12:
+            return f"{clsname}({self.parameters.size} parameters, max |p| = {np.abs(self.parameters).max():.2})"
         values = ", ".join([f"{float(val):.2}" for val in self.parameters])
         return f"{clsname}([{values}])"
 
@@ -825,6 +890,16 @@ class Transform(ABC):
 
     def init(self, ndim):
         raise NotImplementedError("'init' is not implemented for this transform")
+
+    def setup(self, geometry, level=0):
+        """prepare the transform for a fixed image geometry (e.g. a control grid)
+
+        level: pyramid level, relative to the finest level used (0)
+        """
+
+    def refine(self, previous, parameters):
+        """parameters of this transform equivalent to `parameters` of the transform of the previous level"""
+        return parameters
 
     def with_translation(self, parameters, offset):
         """parameters with the given translation (None if not supported)"""
@@ -1035,6 +1110,202 @@ class TransformAffine(Transform):
         return np.r_[invA.ravel(), -invb]
 
 
+class TransformBSpline(Transform):
+    """Free-form deformation: cubic B-spline displacement, T(x) = x + u(x)
+
+    u(x) = sum_k beta3((x - x_k) / h) d_k, on a control grid aligned with the fixed image axes, covering its
+    domain (with one control point before and two after along each axis, as ITK's BSplineTransform)
+
+    grid_spacing: control point spacing (mm), scalar or per axis; adjusted so that the grid fits the domain
+    schedule: grid spacing factor at pyramid level k: schedule ** k (as Elastix's default GridSpacingSchedule);
+        the displacement of each level initializes the (finer) grid of the next level; 1: same grid at all levels
+    bending: weight of the bending energy penalty (smoothness regularization, relative to the metric)
+    grid: control grid (dict: origin, spacing, shape, direction), set from the fixed image by `setup`
+    init: initial parameters (displacements of the control points, mm)
+
+    parameters: displacements (ndim x number of control points), in mm
+    """
+
+    is_global = False
+
+    def __init__(self, grid_spacing=20.0, schedule=2.0, bending=0.0, grid=None, init=None):
+        self.grid_spacing = grid_spacing
+        self.schedule = float(schedule)
+        self.bending = float(bending)
+        self.grid = None if grid is None else {key: np.asarray(value, dtype=float) for key, value in grid.items()}
+        if self.grid is not None:
+            self.grid["shape"] = self.grid["shape"].astype(int)
+        self._init = None if init is None else np.asarray(init, dtype=float)
+
+    def settings(self):
+        grid = None if self.grid is None else {key: _tolist(value) for key, value in self.grid.items()}
+        return {
+            "grid_spacing": _tolist(self.grid_spacing), "schedule": self.schedule, "bending": self.bending,
+            "grid": grid, "init": _tolist(self._init),
+        }
+
+    def setup(self, geometry, level=0):
+        if self.grid is not None:
+            return
+        ndim = geometry.ndim
+        extent = (geometry.shape - 1) * geometry.spacing  # first to last pixel centers
+        spacing = np.broadcast_to(np.asarray(self.grid_spacing, dtype=float), (ndim,))
+        if self._init is None:
+            spacing = spacing * self.schedule**level
+        mesh = np.maximum(np.ceil(extent / spacing - 1e-6), 1).astype(int)
+        spacing = np.where(extent > 0, extent / mesh, 1.0)
+        origin = geometry.origin - geometry.direction @ spacing  # one control point before
+        self.grid = {"origin": origin, "spacing": spacing, "shape": mesh + 3, "direction": geometry.direction}
+
+    @property
+    def ncontrol(self):
+        return int(np.prod(self.grid["shape"]))
+
+    def control_points(self):
+        """world coordinates of the control points"""
+        shape = self.grid["shape"]
+        indices = np.reshape(np.indices(shape), (len(shape), -1)).T
+        return self.grid["origin"] + (indices * self.grid["spacing"]) @ self.grid["direction"].T
+
+    def refine(self, previous, parameters):
+        """coefficients interpolating the displacement of the previous (coarser) grid at the control points"""
+        if previous.grid is not None and all(
+            np.allclose(previous.grid[key], self.grid[key]) for key in ("origin", "spacing", "shape")
+        ):
+            return parameters
+        shape = tuple(self.grid["shape"])
+        disp = previous.displacement(parameters, self.control_points())
+        coeffs = [bspline_coefficients(disp[:, a].reshape(shape), 3) for a in range(len(shape))]
+        return np.concatenate([c.ravel() for c in coeffs])
+
+    def init(self, ndim):
+        if self.grid is None:
+            raise ValueError("TransformBSpline: no control grid (call `setup` with the fixed image geometry)")
+        if self._init is not None:
+            return self._init
+        return np.zeros(ndim * self.ncontrol)
+
+    def grid_coordinates(self, points):
+        """control grid coordinates of points (clipped: the 4 taps of each point stay in the grid)"""
+        coords = (points - self.grid["origin"]) @ self.grid["direction"] / self.grid["spacing"]
+        return np.clip(coords, 1, self.grid["shape"] - 3)
+
+    def weights(self, points):
+        """flat control point indices and weights of the points (npoint x 4^ndim)"""
+        coords = self.grid_coordinates(points)
+        npoint, ndim = coords.shape
+        shape = self.grid["shape"]
+        strides = [int(np.prod(shape[d + 1:])) for d in range(ndim)]
+        flat = np.zeros((npoint,) + (1,) * ndim, dtype=np.intp)
+        weights = np.ones((npoint,) + (1,) * ndim)
+        for d in range(ndim):
+            first, w, _ = _spline_weights(coords[:, d], 3, shape[d])
+            index = first[:, np.newaxis].astype(np.intp) + np.arange(4)
+            newshape = [npoint] + [1] * ndim
+            newshape[d + 1] = 4
+            flat = flat + (index * strides[d]).reshape(newshape)
+            weights = weights * w.reshape(newshape)
+        return flat.reshape(npoint, -1), weights.reshape(npoint, -1)
+
+    def displacement(self, parameters, points, chunk=2**15):
+        """displacement u(x) at points"""
+        ndim = points.shape[1]
+        coeffs = np.reshape(parameters, (ndim, -1))
+        disp = np.empty(points.shape)
+        for start in range(0, len(points), chunk):
+            index = slice(start, start + chunk)
+            flat, weights = self.weights(points[index])
+            disp[index] = np.stack([(coeffs[a][flat] * weights).sum(axis=1) for a in range(ndim)], axis=1)
+        return disp
+
+    def transform(self, parameters, points, jac=False, **kwargs):
+        if not jac:
+            return points + self.displacement(parameters, points)
+        ndim = points.shape[1]
+        flat, weights = self.weights(points)
+        coeffs = np.reshape(parameters, (ndim, -1))
+        disp = np.stack([(coeffs[a][flat] * weights).sum(axis=1) for a in range(ndim)], axis=1)
+        return points + disp, SparseJacobian(flat, weights, self.ncontrol, ndim)
+
+    def penalty(self, parameters, gradient=False):
+        """bending energy: weight x mean squared second derivatives of the displacement at the control points"""
+        if not self.bending:
+            return (0.0, np.zeros(len(parameters))) if gradient else 0.0
+        shape = tuple(self.grid["shape"])
+        ndim = len(shape)
+        coeffs = np.reshape(parameters, (ndim,) + shape)
+        spacing = self.grid["spacing"]
+        norm = self.bending / self.ncontrol
+        energy = 0.0
+        grad = np.zeros_like(coeffs)
+        for i in range(ndim):
+            for j in range(i, ndim):
+                factor = norm * (1 if i == j else 2) / (spacing[i] * spacing[j]) ** 2
+                for a in range(ndim):
+                    diff = _second_difference(coeffs[a], i, j)
+                    if diff is None:
+                        continue
+                    energy += factor * np.sum(diff**2)
+                    if gradient:
+                        grad[a] += _second_difference_adjoint(2 * factor * diff, i, j, shape)
+        return (energy, grad.ravel()) if gradient else energy
+
+
+def _second_difference(array, i, j):
+    """second (i == j) or mixed (i != j) central difference along axes i, j (interior), None if too small"""
+    if array.shape[i] < 3 or array.shape[j] < 3:
+        return None
+    ndim = array.ndim
+    if i == j:
+        def sl(offset):
+            index = [slice(None)] * ndim
+            index[i] = slice(1 + offset, array.shape[i] - 1 + offset)
+            return tuple(index)
+        return array[sl(-1)] - 2 * array[sl(0)] + array[sl(1)]
+
+    def sl(oi, oj):
+        index = [slice(None)] * ndim
+        index[i] = slice(1 + oi, array.shape[i] - 1 + oi)
+        index[j] = slice(1 + oj, array.shape[j] - 1 + oj)
+        return tuple(index)
+    return (array[sl(1, 1)] - array[sl(1, -1)] - array[sl(-1, 1)] + array[sl(-1, -1)]) / 4
+
+
+def _second_difference_adjoint(residual, i, j, shape):
+    """adjoint of `_second_difference`"""
+    out = np.zeros(shape)
+    ndim = len(shape)
+    if i == j:
+        for offset, factor in [(-1, 1), (0, -2), (1, 1)]:
+            index = [slice(None)] * ndim
+            index[i] = slice(1 + offset, shape[i] - 1 + offset)
+            out[tuple(index)] += factor * residual
+        return out
+    for oi, oj, factor in [(1, 1, 0.25), (1, -1, -0.25), (-1, 1, -0.25), (-1, -1, 0.25)]:
+        index = [slice(None)] * ndim
+        index[i] = slice(1 + oi, shape[i] - 1 + oi)
+        index[j] = slice(1 + oj, shape[j] - 1 + oj)
+        out[tuple(index)] += factor * residual
+    return out
+
+
+class SparseJacobian:
+    """jacobian of the transformed points w/r to B-spline coefficients: point n, axis a depends on the
+    coefficients (a, flat[n, t]) with weights[n, t]"""
+
+    def __init__(self, flat, weights, ncontrol, ndim):
+        self.flat, self.weights, self.ncontrol, self.ndim = flat, weights, ncontrol, ndim
+
+    def rmatvec(self, gpoints, valid=None):
+        """J^T g: gpoints (nvalid x ndim) gradient w/r to the (valid) points -> gradient w/r to the parameters"""
+        flat, weights = (self.flat, self.weights) if valid is None else (self.flat[valid], self.weights[valid])
+        grad = [
+            np.bincount(flat.ravel(), weights=(weights * gpoints[:, a, np.newaxis]).ravel(), minlength=self.ncontrol)
+            for a in range(self.ndim)
+        ]
+        return np.concatenate(grad)
+
+
 #
 # Sampler
 class Sampler(ABC):
@@ -1091,12 +1362,13 @@ class SamplerRandomCoordinates(Sampler):
     """Sample random values at non grid coordinates
 
     maxsample: number of samples
-    order: interpolation order of the fixed image
+    order: interpolation order of the fixed image (default 1: as the default (linear) interpolator of the
+        moving image, so that identical images match exactly at the identity)
     thick_ratio: along axes with a spacing >= thick_ratio x the smallest spacing (thick slices),
         samples stay on the grid (interpolating between thick slices gives inaccurate values); None: never
     """
 
-    def __init__(self, maxsample=3000, order=3, thick_ratio=2.0):
+    def __init__(self, maxsample=3000, order=1, thick_ratio=2.0):
         self.maxsample = maxsample
         self.thick_ratio = thick_ratio
         self.image = None
@@ -1156,6 +1428,7 @@ class Interpolator(ABC):
 
         jac:
             False: return values
+            "points": also return the gradient of each value w/r to its point (npoint x ndim)
             True: also return the gradient w/r to the points (npoint x npoint x ndim)
             array (npoint x ndim x nparam): jacobian of the points w/r to parameters,
                 return the jacobian of the values w/r to the parameters (npoint x nparam)
@@ -1167,6 +1440,10 @@ class Interpolator(ABC):
             # jacobian w/r to the points -> w/r to the coordinates
             jac = np.einsum("ij,njk->nik", dcoords, jac)
             return self.interpolate(coeffs, coords, jac=jac)
+        elif isinstance(jac, str) and jac == "points":
+            # gradient of each value w/r to its point (npoint x ndim)
+            values, grad = self.interpolate(coeffs, coords, jac="points")
+            return values, grad @ dcoords
         elif jac:
             values, jacmat = self.interpolate(coeffs, coords, jac=True)
             # gradient w/r to the coordinates -> w/r to the points
@@ -1235,7 +1512,7 @@ class Metric(ABC):
         values1 = np.asarray(values1)
         values2 = np.asarray(values2)
         if not len(values1):
-            return np.inf if not gradient2 else (np.inf, np.array([]))
+            return np.inf if not gradient2 else (np.inf, np.zeros(values2.shape))
         return self.measure(values1, values2, gradient2, **kwargs)
 
     def __str__(self):
@@ -1256,6 +1533,34 @@ class MetricMeanSquares(Metric):
         # jacobian
         grad2 = (-2 * diff) / len(diff)
         return msd, grad2
+
+
+class MetricNormalizedGradientFields(Metric):
+    """Normalized gradient fields (Haber & Modersitzki 2006): 1 - mean (n_f . n_m)^2, n = grad / sqrt(|grad|^2 + eps^2)
+
+    Multimodal (compares edge directions, independent of the contrast), well suited to free-form deformations.
+    eta: edge parameter, eps = eta x mean gradient magnitude of each image (small eta: less bias towards
+        transforms increasing the moving gradients, more sensitivity to noise)
+    samples mapped outside the moving image count as unaligned (not discarded)
+    """
+
+    uses_gradients = True
+
+    def __init__(self, eta=0.01):
+        self.eta = eta
+
+    def measure(self, values1, values2, gradient2=False, eps=(1.0, 1.0), **kwargs):
+        """values1, values2: gradients of the fixed and moving images at the samples (nsample x ndim)"""
+        r1 = np.sqrt(np.sum(values1**2, axis=1) + eps[0] ** 2)
+        r2 = np.sqrt(np.sum(values2**2, axis=1) + eps[1] ** 2)
+        n1 = values1 / r1[:, np.newaxis]
+        dot = np.sum(n1 * values2, axis=1) / r2
+        cost = 1 - np.mean(dot**2)
+        if not gradient2:
+            return cost
+        # d(dot) / d(values2) = n1 / r2 - (n1 . values2) values2 / r2^3
+        ddot = n1 / r2[:, np.newaxis] - (dot / r2**2)[:, np.newaxis] * values2
+        return cost, -2 / len(dot) * dot[:, np.newaxis] * ddot
 
 
 class MetricMutualInformation(Metric):
@@ -1320,7 +1625,7 @@ class OptimizerLBFGS(Optimizer):
     maxstep: largest parameter change of the first iteration (~ mm)
     """
 
-    def __init__(self, maxiter=100, memory=10, gtol=1e-8, ftol=1e-7, xtol=1e-3, maxstep=1.0):
+    def __init__(self, maxiter=500, memory=10, gtol=1e-8, ftol=1e-7, xtol=1e-3, maxstep=1.0):
         self.opts = {"maxiter": maxiter, "memory": memory, "gtol": gtol, "ftol": ftol, "xtol": xtol, "maxstep": maxstep}
 
     def optimize(self, objective, init):
@@ -1334,6 +1639,7 @@ COMPONENTS = {
         "translation": TransformTranslation,
         "rigid": TransformRigid,
         "affine": TransformAffine,
+        "bspline": TransformBSpline,
     },
     "pyramid": {
         "gaussian": PyramidGaussian,
@@ -1352,6 +1658,7 @@ COMPONENTS = {
     "metric": {
         "mse": MetricMeanSquares,
         "mi": MetricMutualInformation,
+        "ngf": MetricNormalizedGradientFields,
     },
     "optimizer": {
         "lbfgs": OptimizerLBFGS,
@@ -1571,33 +1878,101 @@ class Objective:
             valid &= InterpolatorNearestNeighbor()(self._moving_mask, points2) > 0
         return valid
 
+    def _edge_scale(self, image):
+        """mean gradient magnitude of an image (for gradient-based metrics)"""
+        magnitude = np.sqrt(sum(np.asarray(component.array) ** 2 for component in image.gradient_images()))
+        values = magnitude[image.mask] if image.mask is not None else magnitude
+        return float(np.mean(values)) or 1.0
+
+    def _call_gradients(self, parameters, gradient=False, **kwargs):
+        """objective with a metric of the image gradients (e.g. NGF)"""
+        transform_args = {"center": self.center}
+        points1, _ = self.sampler(self.fixed)
+        if self.initial is not None:
+            points1_moved = self.initial(points1)
+        else:
+            points1_moved = points1
+        if getattr(self, "_fixed_samples", (None,))[0] is not points1:
+            # fixed gradients at the samples (unchanged until the samples change)
+            values1 = np.stack([self.interpolator(component, points1) for component in self.fixed.gradient_images()], axis=1)
+            eta = getattr(self.metric, "eta", 1.0)
+            eps = (eta * self._edge_scale(self.fixed), eta * self._edge_scale(self.moving))
+            self._fixed_samples = (points1, values1, eps)
+        _, values1, eps = self._fixed_samples
+        metric_args = {"eps": eps, **kwargs}
+        penalty = getattr(self.transform, "penalty", None)
+        components = self.moving.gradient_images()
+
+        # samples outside the moving image are kept with a zero gradient (no alignment): discarding them would
+        # let the transform improve the cost by pushing badly aligned samples out of the image
+        if not gradient:
+            points2 = self.transform(parameters, points1_moved, **transform_args)
+            values2 = np.stack([self.interpolator(component, points2) for component in components], axis=1)
+            values2[~self.valid(points2, np.sum(values2, axis=1))] = 0
+            cost = self.metric(values1, values2, **metric_args)
+            return cost + penalty(parameters) if penalty is not None else cost
+
+        points2, jtrans = self.transform(parameters, points1_moved, jac=True, **transform_args)
+        interpolated = [self.interpolator(component, points2, jac="points") for component in components]
+        values2 = np.stack([values for values, _ in interpolated], axis=1)
+        dvalues2 = np.stack([grad for _, grad in interpolated], axis=1)  # npoint x component x ndim
+        isvalid = self.valid(points2, np.sum(values2, axis=1))
+        values2[~isvalid] = 0
+        cost, gmetric = self.metric(values1, values2, gradient2=True, **metric_args)
+        gmetric = gmetric[isvalid]
+        gpoints = np.einsum("nc,ncd->nd", gmetric, dvalues2[isvalid])
+        if isinstance(jtrans, np.ndarray):
+            gradient = np.einsum("nd,ndk->k", gpoints, jtrans[isvalid])
+        else:
+            gradient = jtrans.rmatvec(gpoints, isvalid)
+        if penalty is not None:
+            pcost, pgrad = penalty(parameters, gradient=True)
+            cost, gradient = cost + pcost, gradient + pgrad
+        return cost, gradient
+
     def __call__(self, parameters, gradient=False, **kwargs):
+        if getattr(self.metric, "uses_gradients", False):
+            return self._call_gradients(parameters, gradient=gradient, **kwargs)
         transform_args = {"center": self.center}
         metric_args = {"normalize": self.normalize, **kwargs}
         points1, values1 = self.sampler(self.fixed)
         if self.initial is not None:
             points1 = self.initial(points1)
+        penalty = getattr(self.transform, "penalty", None)
         if not gradient:
             points2 = self.transform(parameters, points1, **transform_args)
             values2 = self.interpolator(self.moving, points2)
             isvalid = self.valid(points2, values2)
             cost = self.metric(values1[isvalid], values2[isvalid], **metric_args)
-            LOGGER.debug(f"parameters: {parameters}, cost: {cost:.4}")
+            if penalty is not None:
+                cost = cost + penalty(parameters)
+            LOGGER.debug(f"cost: {cost:.4}")
             return cost
 
         # else, also return gradient
         points2, jtrans = self.transform(
             parameters, points1, jac=True, **transform_args
         )
-        values2, jinterp = self.interpolator(self.moving, points2, jac=jtrans)
+        values2, grad2 = self.interpolator(self.moving, points2, jac="points")
         isvalid = self.valid(points2, values2)
         cost, gmetric = self.metric(
             values1[isvalid], values2[isvalid], gradient2=True, **metric_args
         )
+        # gradient of the cost w/r to the (valid) moving points
         if np.iscomplexobj(values2):
-            isvalid = np.r_[isvalid, isvalid]
-        gradient = np.dot(gmetric, jinterp[isvalid])
-        LOGGER.debug(f"parameters: {parameters}, cost: {cost:.4}, gradient: {gradient}")
+            npoint, nvalid = len(values2), np.count_nonzero(isvalid)
+            gpoints = gmetric[:nvalid, None] * grad2[:npoint][isvalid] + gmetric[nvalid:, None] * grad2[npoint:][isvalid]
+        else:
+            gpoints = gmetric[:, None] * grad2[isvalid]
+        # chain rule through the transform
+        if isinstance(jtrans, np.ndarray):
+            gradient = np.einsum("nd,ndk->k", gpoints, jtrans[isvalid])
+        else:
+            gradient = jtrans.rmatvec(gpoints, isvalid)
+        if penalty is not None:
+            pcost, pgrad = penalty(parameters, gradient=True)
+            cost, gradient = cost + pcost, gradient + pgrad
+        LOGGER.debug(f"cost: {cost:.4}")
         return cost, gradient
 
 class ScaledObjective:
@@ -1647,8 +2022,11 @@ class Elastix:
         parameters = None if init is None else np.asarray(init, dtype=float)
         method = self.config["initialize"].get("method")
         if parameters is None and initial is None and method is not None:
-            parameters = initialize(self.config.setup("transform"), fixed, moving, method)
+            transform = self.config.setup("transform")
+            transform.setup(fixed.geometry)
+            parameters = initialize(transform, fixed, moving, method)
         results = []
+        previous = None  # transform of the previous level
         for level, images in zip(*levels):
             _fixed, _moving = images
 
@@ -1659,6 +2037,8 @@ class Elastix:
             )
 
             transform = self.config.setup("transform")
+            # full resolution fixed image (e.g. same center at all levels); level relative to the finest one
+            transform.setup(fixed.geometry, level=level - levels[0][-1])
             sampler = self.config.setup("sampler")
             interpolator = self.config.setup("interpolator")
             metric = self.config.setup("metric")
@@ -1674,7 +2054,13 @@ class Elastix:
             )
 
             # initial parameter values
-            init = transform.init(fixed.ndim) if parameters is None else parameters
+            if parameters is None:
+                init = transform.init(fixed.ndim)
+            elif previous is not None:
+                init = transform.refine(previous, parameters)
+            else:
+                init = parameters
+            previous = transform
             self.logger.debug(f"Initialization: {init}")
 
             # optimize scaled parameters (one unit ~ 1 mm displacement)
@@ -2010,6 +2396,7 @@ def ndspline_interpolation(arr, coords, order=3, jac=False, mode="constant", cva
         order: spline order (0: nearest neighbor, 1: linear)
         jac:
             False: return values
+            "points": also return the gradient of each value w/r to its coordinates (K x d)
             True: also return the gradient w/r to the coordinates (K x K x d)
             array (K x d x P): jacobian of the coordinates w/r to parameters, return the K x P jacobian
         mode: values beyond the edges (coordinates outside [0, N - 1]):
@@ -2059,7 +2446,10 @@ def ndspline_interpolation(arr, coords, order=3, jac=False, mode="constant", cva
     else:
         grad *= sign
 
-    if isinstance(jac, np.ndarray):
+    if isinstance(jac, str) and jac == "points":
+        # gradient of each value w/r to its coordinates (npoint x ndim)
+        return values, grad
+    elif isinstance(jac, np.ndarray):
         # jacobian w/r to parameters (npoint x nparam)
         return values, np.einsum("nd,ndk->nk", grad, jac)
     # jacobian w/r to the coordinates of all points (npoint x npoint x ndim)

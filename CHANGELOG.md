@@ -4,6 +4,18 @@
 
 - Added `tomio.elastix`: registration framework imported from mutools (`mutools.registration.elastix`), with its test suite.
 
+### tomio.elastix: free-form deformation (phase 5 of `PLAN_elastix.md`, in progress)
+
+- New transform `"bspline"` (`TransformBSpline`): cubic B-spline displacement on a control grid fitted to the
+  fixed image, grid spacing schedule across the pyramid levels (`schedule`), bending energy penalty (`bending`).
+- New metric `"ngf"` (normalized gradient fields), multimodal.
+- `transform(..., method="roi" | "labels")` works for any transform (`warp_roi`, `warp_labels`).
+- The cost gradient uses the image gradient at the moving points and the transposed transform Jacobian
+  (sparse for B-splines).
+- Defaults: `SamplerRandomCoordinates(order=1)`, `OptimizerLBFGS(maxiter=500)`.
+- Known limitation: on real data (dixon → T1), the B-spline stage does not yet improve on the rigid result
+  (see `TODO.md`).
+
 ### tomio.elastix: accelerations (phase 4 of `PLAN_elastix.md`)
 
 - Optimized parameters are scaled (rotations and matrix coefficients × the radius of the fixed image):

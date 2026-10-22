@@ -539,11 +539,14 @@ def test_transform_default_method():
     assert set(np.unique(out)) <= {0, 3}
 
 
-def test_transform_roi_2d_not_supported():
+def test_transform_roi_2d():
+    """non-global path (2d): warp_roi"""
+    roi = np.zeros((8, 8), dtype=np.uint8)
+    roi[2:6, 3:5] = 2
     trans = ex.Transformation("translation", ex.Geometry((8, 8)), [1.0, 0.0])
-    with pytest.raises(NotImplementedError):
-        ex.transform(trans, np.zeros((8, 8), dtype=np.uint8), method="roi")
-
+    out = ex.transform(trans, roi, method="roi")
+    assert np.array_equal(np.asarray(out)[1:5, 3:5], np.full((4, 2), 2))
+    assert np.asarray(out).sum() == 2 * 8
 
 def test_transform_complex_3d():
     """complex images: own interpolation (not tomio.resample)"""
@@ -1359,3 +1362,203 @@ def test_parameter_scales():
     assert np.allclose(ex.TransformTranslation().scales(np.zeros(3), radius), [1, 1, 1])
     geometry = ex.Geometry((10, 20), spacing=(2, 1))
     assert np.isclose(geometry.radius(), np.sqrt((20**2 + 20**2) / 12))
+
+
+# phase 5: free-form deformation (B-spline)
+
+def smooth_displacement(points, amplitude=1.5, period=24.0):
+    """known smooth displacement field u(x)"""
+    u = np.zeros_like(points)
+    u[:, 0] = amplitude * np.sin(2 * np.pi * points[:, 1] / period)
+    u[:, 1] = amplitude * np.cos(2 * np.pi * points[:, 0] / period)
+    return u
+
+
+def deformed_pair(shape=(48, 48), **kwargs):
+    """fixed(x) = moving(x + u(x)): T(x) = x + u(x)"""
+    points = grid_points(shape)
+    moving = world_phantom(points).reshape(shape)
+    fixed = world_phantom(points + smooth_displacement(points, **kwargs)).reshape(shape)
+    return fixed, moving
+
+
+def bspline_objective(fixed, moving, metric="mse", bending=0.0, grid_spacing=8.0):
+    config = ex.Config(transform={"type": "bspline", "grid_spacing": grid_spacing, "bending": bending}, metric=metric)
+    objective = make_objective(fixed, moving, config)
+    objective.transform.setup(objective.fixed.geometry)
+    return objective
+
+
+def test_bspline_grid():
+    transform = ex.TransformBSpline(grid_spacing=10)
+    geometry = ex.Geometry((41, 21, 1), spacing=(1, 2, 5), origin=(5, 0, 0))
+    transform.setup(geometry)
+    grid = transform.grid
+    assert grid["shape"].tolist() == [7, 7, 4]  # 4 + 3 control points (40 mm / 10), single-slice axis: 1 + 3
+    assert np.allclose(grid["spacing"][:2], [10, 10])
+    assert np.allclose(grid["origin"][:2], [-5, -10])
+    params = np.zeros(transform.init(3).size)
+    assert params.size == 3 * 7 * 7 * 4
+    points = geometry.points
+    assert np.allclose(transform(params, points), points)
+    # constant displacement: B-splines sum to 1
+    params = np.repeat([1.0, -2.0, 0.5], transform.ncontrol)
+    assert np.allclose(transform(params, points), points + [1.0, -2.0, 0.5])
+
+
+@pytest.mark.parametrize("metric", ["mse", "mi", "ngf"])
+@pytest.mark.parametrize("bending", [0.0, 50.0])
+def test_bspline_gradient(metric, bending):
+    fixed, moving = deformed_pair((32, 32))
+    objective = bspline_objective(fixed, moving * 50, metric=metric, bending=bending)
+    rng = np.random.default_rng(0)
+    params = rng.normal(scale=0.5, size=objective.transform.init(2).size)
+    _, gradient = objective(params, gradient=True)
+    check = rng.choice(params.size, 12, replace=False)
+    step = 1e-5
+    for k in check:
+        delta = np.zeros(params.size)
+        delta[k] = step
+        fd = (objective(params + delta) - objective(params - delta)) / (2 * step)
+        assert np.isclose(gradient[k], fd, rtol=1e-2, atol=1e-7), (k, gradient[k], fd)
+
+
+def test_bspline_penalty():
+    transform = ex.TransformBSpline(grid_spacing=5, bending=2.0)
+    transform.setup(ex.Geometry((20, 16, 12)))
+    rng = np.random.default_rng(1)
+    params = rng.normal(size=transform.init(3).size)
+    energy, grad = transform.penalty(params, gradient=True)
+    assert energy > 0
+    # quadratic: E(p) = p.grad / 2
+    assert np.isclose(energy, params @ grad / 2)
+    # affine displacements have no bending energy
+    grid = transform.grid
+    coords = np.stack(np.meshgrid(*[np.arange(n) for n in grid["shape"]], indexing="ij"), -1).reshape(-1, 3)
+    affine = (coords @ rng.normal(size=(3, 3))).T.ravel()
+    assert np.isclose(transform.penalty(affine), 0, atol=1e-12)
+
+
+def textured_pair(shape=(48, 48), amplitude=1.0, period=32.0, noise=0.02, seed=0):
+    """textured noisy images (as MRI), aligned up to a small smooth deformation: fixed(x) = moving(x + u(x))
+
+    (smooth noise-free phantoms are degenerate for MI and NGF with free-form deformations: intensity plateaus
+    let the deformation "improve" the histograms or edge magnitudes)
+    """
+    rng = np.random.default_rng(seed)
+    points = grid_points(shape)
+    extent = np.array(shape, dtype=float)
+    nblob = int(np.prod(shape) / 14)
+    centers = rng.uniform(2, extent - 2, size=(nblob, 2))
+    widths = rng.uniform(1.0, 3.0, size=(nblob, 1))
+    weights = rng.uniform(0.2, 1, size=nblob)
+
+    def texture(p):
+        dist2 = (((p[:, np.newaxis] - centers) / widths) ** 2).sum(axis=-1)
+        return (weights * np.exp(-0.5 * dist2)).sum(axis=1).reshape(shape)
+
+    u = smooth_displacement(points, amplitude=amplitude, period=period)
+    moving = texture(points) + noise * rng.normal(size=shape)
+    fixed = texture(points + u) + noise * rng.normal(size=shape)
+    return fixed, moving, points, u
+
+
+@pytest.mark.parametrize(
+    "metric, contrast, tolerance",
+    [("mse", False, 0.15), ("mi", False, 0.15), ("mi", True, 0.25), ("ngf", False, 0.25), ("ngf", True, 0.25)],
+)
+def test_register_bspline(metric, contrast, tolerance):
+    """recovery of a known small smooth deformation (images aligned beforehand, e.g. by a rigid stage)"""
+    fixed, moving, points, u = textured_pair()
+    if contrast:
+        moving = np.exp(-1.5 * moving)  # other contrast (non-linear, decreasing)
+    registered, trans = ex.register(fixed, moving, transform={"type": "bspline", "grid_spacing": 8}, metric=metric, return_transform=True)
+    inner = np.all((points >= 8) & (points <= 39), axis=1)
+    error = np.linalg.norm(trans(points[inner]) - points[inner] - u[inner], axis=1)
+    assert error.mean() < tolerance * np.linalg.norm(u[inner], axis=1).mean()
+
+
+@pytest.mark.parametrize("metric", ["mse", "mi", "ngf"])
+def test_register_bspline_identical_textured(metric):
+    """identical images: (almost) no deformation"""
+    fixed, _, points, _ = textured_pair()
+    _, trans = ex.register(fixed, fixed, transform={"type": "bspline", "grid_spacing": 8}, metric=metric, return_transform=True)
+    assert np.linalg.norm(trans(points) - points, axis=1).mean() < 0.1
+
+
+def test_register_bspline_identical():
+    """identical images: no deformation (MSE)"""
+    image = sample_phantom((40, 40))
+    _, trans = ex.register(image, image, transform={"type": "bspline", "grid_spacing": 8}, return_transform=True)
+    assert np.abs(trans.parameters).max() < 1e-3
+
+
+def test_register_rigid_bspline_stages():
+    fixed, moving = deformed_pair((48, 48), amplitude=1.0)
+    moving = np.roll(moving, 2, axis=0)  # + global shift
+    stages = [{"transform": "rigid"}, {"transform": {"type": "bspline", "grid_spacing": 8}}]
+    registered, trans = ex.register(fixed, moving, stages, return_transform=True)
+    assert isinstance(trans, ex.TransformationSequence)
+    assert isinstance(trans[1].transform, ex.TransformBSpline)
+    assert not trans.is_global
+    assert inner_error(registered, fixed, margin=8) < 0.2 * inner_error(moving, fixed, margin=8)
+
+
+def test_bspline_serialize():
+    fixed, moving = deformed_pair((32, 32))
+    _, trans = ex.register(fixed, moving, transform={"type": "bspline", "grid_spacing": 8}, return_transform=True)
+    data = trans.serialize()
+    assert data["transform"]["type"] == "bspline" and data["transform"]["grid"] is not None
+    trans2 = ex.as_transformation(data)
+    points = grid_points((32, 32))
+    assert np.allclose(trans2(points), trans(points))
+    assert np.allclose(np.asarray(ex.transform(data, moving)), np.asarray(ex.transform(trans, moving)))
+
+
+def test_warp_roi_matches_tomio():
+    """warp_roi (backward, any transform) vs tomio.resample(method="roi") (identity)"""
+    roi = np.zeros((20, 20, 24), dtype=np.uint8)
+    roi[5:15, 5:15, ::4] = 1
+    roi[8:12, 8:12, ::4] = 2
+    roi = io.Volume(roi, spacing=(1, 1, 5))
+    for spacing, origin in [((1, 1, 20), (0, 0, 10)), ((1, 1, 30), (0, 0, 7.5)), ((2, 2, 5), (0.5, 0.5, 0))]:
+        target = io.Volume(np.zeros((10, 10, 4)), spacing=spacing, origin=origin)
+        geometry = ex.Image(target).geometry
+        out = ex.warp_roi(ex.Image(roi), geometry.points, geometry).reshape(target.shape)
+        expected = io.resample(roi, like=target, method="roi")
+        agreement = np.mean(out == np.asarray(expected))
+        assert agreement > 0.97, (spacing, agreement)
+
+
+def test_warp_labels():
+    labels = np.zeros((16, 16), dtype=np.uint8)
+    labels[4:12, 4:8] = 1
+    labels[4:12, 8:12] = 2
+    image = ex.Image(labels)
+    out = ex.warp_labels(image, image.geometry.points).reshape(labels.shape)
+    assert np.array_equal(out, labels)
+    out = ex.warp_labels(image, image.geometry.points + [0, 0.4]).reshape(labels.shape)
+    assert set(np.unique(out)) == {0, 1, 2}
+
+
+@pytest.mark.parametrize("transform, params", [("translation", [0.3, -0.2]), ("rigid", [0.02, 0.3, -0.2]), ("affine", [1.01, 0.02, -0.01, 0.99, 0.3, -0.2])])
+def test_gradient_ngf(transform, params):
+    fixed, moving, _, _ = textured_pair((32, 32))
+    # (B-spline interpolation of the gradient images: smooth cost for the finite differences)
+    config = {"transform": transform, "metric": "ngf", "interpolator": "bspline"}
+    objective = make_objective(fixed, np.exp(-1.5 * moving), config)
+    _, gradient = objective(params, gradient=True)
+    assert np.allclose(gradient, finite_gradient(objective, params), rtol=1e-3, atol=1e-8)
+
+
+def test_ngf_metric():
+    rng = np.random.default_rng(0)
+    g1 = rng.normal(size=(50, 2))
+    metric = ex.MetricNormalizedGradientFields()
+    assert metric(g1, g1, eps=(1e-6, 1e-6)) < 1e-6  # aligned
+    assert np.isclose(metric(g1, -3 * g1, eps=(1e-6, 1e-6)), 0, atol=1e-6)  # polarity and scale invariant
+    g2 = np.c_[-g1[:, 1], g1[:, 0]]  # orthogonal
+    assert np.isclose(metric(g1, g2, eps=(1e-6, 1e-6)), 1)
+    cost, grad = metric(g1, g2 + 0.1, gradient2=True, eps=(0.1, 0.2))
+    delta = 1e-6 * rng.normal(size=g2.shape)
+    assert np.isclose(metric(g1, g2 + 0.1 + delta, eps=(0.1, 0.2)) - cost, np.sum(grad * delta), rtol=1e-3)

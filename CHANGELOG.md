@@ -13,6 +13,7 @@
 - The cost gradient uses the image gradient at the moving points and the transposed transform Jacobian
   (sparse for B-splines).
 - Defaults: `SamplerRandomCoordinates(order=1)`, `OptimizerLBFGS(maxiter=500)`.
+- Added: elastix optimizer "sgd" (stochastic gradient descent, new samples every iteration).
 - Known limitation: on real data (dixon → T1), the B-spline stage does not yet improve on the rigid result
   (see `TODO.md`).
 

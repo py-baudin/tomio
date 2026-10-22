@@ -1633,6 +1633,38 @@ class OptimizerLBFGS(Optimizer):
         return sol, OptimResults(**info)
 
 
+class OptimizerSGD(Optimizer):
+    """Stochastic gradient descent with new samples at each iteration (as Elastix's stochastic optimizers)
+
+    Iteration k moves the (scaled) parameters by -gain_k * gradient / max(|gradient|, g0), with
+    gain_k = a / (k + 1 + A)^alpha, |.| the largest component and g0 that of the first gradient: no step is larger
+    than gain_k (~ mm), and the steps shrink when the gradient becomes smaller than at the start. New samples at each iteration avoid fitting
+    the transform to a fixed set of samples (needed for transforms with many parameters, e.g. B-splines);
+    fixed number of iterations.
+
+    niter: number of iterations (per pyramid level)
+    a, A, alpha: gain sequence (A: stability constant, alpha: decay exponent; 0.602 as in Elastix)
+    """
+
+    def __init__(self, niter=256, a=4.0, A=20, alpha=0.602):
+        self.niter, self.a, self.A, self.alpha = niter, a, A, alpha
+
+    def optimize(self, objective, init):
+        x = np.asarray(init, dtype=float).copy()
+        cost, norm = np.nan, None
+        for k in range(self.niter):
+            if k:
+                objective.resample()
+            cost, grad = objective(x, gradient=True)
+            current = np.max(np.abs(grad))
+            if norm is None:
+                norm = current
+            if not np.isfinite(cost) or max(current, norm) == 0:
+                break
+            x -= self.a / (k + 1 + self.A) ** self.alpha * grad / max(current, norm)
+        return x, OptimResults(fun=cost, nit=k + 1, nfev=k + 1, message="Number of iterations reached", success=True)
+
+
 # component registry: section -> {type name: class}
 COMPONENTS = {
     "transform": {
@@ -1662,6 +1694,7 @@ COMPONENTS = {
     },
     "optimizer": {
         "lbfgs": OptimizerLBFGS,
+        "sgd": OptimizerSGD,
     },
 }
 
@@ -1871,6 +1904,11 @@ class Objective:
             )
         self.normalize = lambda f, m: (fixed.normalize(f), moving.normalize(m))
 
+    def resample(self):
+        """draw new samples (stochastic optimizers)"""
+        if getattr(self.sampler, "image", None) is not None:
+            self.sampler.update()
+
     def valid(self, points2, values2):
         """samples inside the moving image (and its mask), with finite values"""
         valid = self.moving.geometry.contains(points2) & np.isfinite(values2)
@@ -1988,6 +2026,9 @@ class ScaledObjective:
             return self.objective(parameters, **kwargs)
         cost, grad = self.objective(parameters, gradient=True, **kwargs)
         return cost, grad / self.scales
+
+    def resample(self):
+        self.objective.resample()
 
 
 class Elastix:

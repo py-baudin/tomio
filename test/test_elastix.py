@@ -1562,3 +1562,34 @@ def test_ngf_metric():
     cost, grad = metric(g1, g2 + 0.1, gradient2=True, eps=(0.1, 0.2))
     delta = 1e-6 * rng.normal(size=g2.shape)
     assert np.isclose(metric(g1, g2 + 0.1 + delta, eps=(0.1, 0.2)) - cost, np.sum(grad * delta), rtol=1e-3)
+
+
+# stochastic gradient descent
+
+def test_register_sgd_translation():
+    fixed, moving = shifted((48, 48), (2.5, -1.5))
+    _, trans = ex.register(fixed, moving, transform="translation", metric="mi", optimizer="sgd", return_transform=True)
+    assert np.allclose(trans.parameters, (2.5, -1.5), atol=0.1)
+
+
+def test_sgd_resamples():
+    """new samples at each iteration"""
+    fixed, moving = shifted((32, 32), (1.0, 0.5))
+    config = ex.Config(transform="translation", sampler={"maxsample": 100})
+    objective = make_objective(fixed, moving, config)
+    first = objective.sampler(objective.fixed)[0].copy()
+    objective.resample()
+    assert not np.allclose(objective.sampler(objective.fixed)[0], first)
+
+
+@pytest.mark.parametrize("metric", ["mse", "mi"])
+def test_register_bspline_sgd(metric):
+    fixed, moving, points, u = textured_pair()
+    config = {"transform": {"type": "bspline", "grid_spacing": 8}, "metric": metric, "optimizer": {"type": "sgd", "niter": 64}, "pyramid": {"maxlevel": 1}}
+    _, trans = ex.register(fixed, moving, config, return_transform=True)
+    inner = np.all((points >= 8) & (points <= 39), axis=1)
+    error = np.linalg.norm(trans(points[inner]) - points[inner] - u[inner], axis=1)
+    assert error.mean() < 0.3 * np.linalg.norm(u[inner], axis=1).mean()
+    # identical images: small drift
+    _, trans = ex.register(fixed, fixed, config, return_transform=True)
+    assert np.linalg.norm(trans(points[inner]) - points[inner], axis=1).mean() < 0.1

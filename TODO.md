@@ -42,9 +42,11 @@ Remaining work and future features. Details, measurements and history: `PLAN_ela
 
 ## Command line interface
 
-- [ ] Import the mutools `utils/elastix` CLI into `tomio` (argparse subcommands `register`, `transform`, show
-  config, demo); output name templates, `--force`, YAML transform files, optional matplotlib plots.
-- [ ] Demo images (`legs`, `brain`, `dwi`, 2 MB): copy into tomio or download.
+- [x] mutools `utils/elastix` CLI imported: `tomio register`, `warp`, `interpolate-slices`, `register-config`
+  (name templates, `--force`, YAML transforms, `--plot`).
+- [ ] `demo` command (mutools' interactive plots of the iterations, `legs`/`brain`/`dwi` images, 2 MB): copy the
+  images into tomio or download; or drop.
+- [ ] Check the CLI commands on 2D images and single-slice volumes (only 3D volumes tested).
 - [ ] README section for `tomio.elastix`.
 
 ## Future features

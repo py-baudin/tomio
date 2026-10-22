@@ -170,5 +170,96 @@ def test_entry_point():
     env = dict(os.environ, PYTHONPATH=str(Path(__file__).parents[1] / "src") + os.pathsep + os.environ.get("PYTHONPATH", ""))
     result = subprocess.run([sys.executable, "-m", "tomio", "--help"], capture_output=True, text=True, env=env)
     assert result.returncode == 0
-    for command in ["convert", "resample", "info"]:
+    for command in ["convert", "resample", "info", "register", "warp", "interpolate-slices", "register-config"]:
         assert command in result.stdout
+
+
+# registration commands
+
+@pytest.fixture
+def pair_files(tmp_path):
+    """fixed and moving phantom volumes (moving shifted by (1.5, -1, 0.5) mm), as .nii.gz files"""
+    from test_elastix import shifted
+
+    fixed, moving = shifted((24, 24, 12), (1.5, -1.0, 0.5), spacing=(1.0, 1.0, 2.0))
+    files = []
+    for name, array in [("fixed", fixed), ("moving", moving)]:
+        filename = tmp_path / f"{name}.nii.gz"
+        volume.write(filename, Volume(array.astype(np.float32), spacing=(1.0, 1.0, 2.0)))
+        files.append(filename)
+    return files
+
+
+def test_register_warp(tmp_path, pair_files, capsys):
+    fixed, moving = pair_files
+    output = tmp_path / "reg_<moving>"
+    assert run("register", fixed, moving, "--transform", "translation", "--metric", "mse", "-o", output, "-t", tmp_path / "trans_<moving>.yml") == 0
+    assert "written" in capsys.readouterr().out
+    registered = volume.read(tmp_path / "reg_moving.nii.gz")  # extension of the moving file
+    assert registered.geometry.same_as(volume.read(fixed))
+    from tomio import elastix
+
+    trans = elastix.as_transformation(io_read_config(tmp_path / "trans_moving.yml"))
+    assert np.allclose(trans.parameters, [1.5, -1.0, 0.5], atol=0.2)
+    # warp with the saved transformation: same as the registered volume
+    assert run("warp", tmp_path / "trans_moving.yml", moving, "-o", tmp_path / "warped.nii.gz") == 0
+    assert np.allclose(volume.read(tmp_path / "warped.nii.gz"), registered, atol=1e-4)
+    # existing outputs
+    assert run("register", fixed, moving, "--transform", "translation", "-o", output) == 1
+    assert "use --force" in capsys.readouterr().err
+
+
+def io_read_config(filename):
+    from tomio import configfile
+
+    return configfile.read(filename)
+
+
+def test_register_config(tmp_path, pair_files, capsys):
+    assert run("register-config") == 0
+    out = capsys.readouterr().out
+    assert "bspline" in out and "mind" in out
+    config = tmp_path / "config.yml"
+    assert run("register-config", config) == 0
+    stages = io_read_config(config)
+    assert [stage["metric"] for stage in stages] == ["mi", "mi"]
+    # registration with a configuration file (two stages, short B-spline stage)
+    stages[0]["metric"] = "mse"
+    stages[1] = {"transform": {"type": "bspline", "grid_spacing": 12}, "metric": "mse", "optimizer": {"type": "sgd", "niter": 8}}
+    from tomio import configfile
+
+    configfile.write(tmp_path / "short.yml", stages)
+    fixed, moving = pair_files
+    assert run("register", fixed, moving, "-c", tmp_path / "short.yml", "-o", tmp_path / "<moving>_on_<fixed>", "-t", tmp_path / "t_<moving>.yml") == 0
+    assert (tmp_path / "moving_on_fixed.nii.gz").is_file()
+    # settings: a list of stages cannot be combined with --transform
+    assert run("register", fixed, moving, "-c", tmp_path / "short.yml", "--transform", "rigid", "-o", tmp_path / "x") == 1
+
+
+def test_register_plot(tmp_path, pair_files):
+    pytest.importorskip("matplotlib")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    fixed, moving = pair_files
+    assert run("register", fixed, moving, "--transform", "translation", "-o", tmp_path / "reg", "--plot", tmp_path / "fig_<moving>.png") == 0
+    assert (tmp_path / "fig_moving.png").is_file()
+
+
+def test_register_duplicate_outputs(tmp_path, pair_files, capsys):
+    fixed, moving = pair_files
+    assert run("register", fixed, moving, moving, "-o", tmp_path / "same.nii.gz") == 1
+    assert "duplicate" in capsys.readouterr().err
+
+
+def test_interpolate_slices(tmp_path):
+    roi = np.zeros((20, 20, 9), dtype=np.uint8)
+    roi[5:15, 5:15, 0] = 1
+    roi[7:13, 7:13, 8] = 1
+    roi[:, :, 1:8] = 14  # not annotated
+    volume.write(tmp_path / "roi.nii.gz", Volume(roi, spacing=(1.0, 1.0, 3.0)))
+    assert run("interpolate-slices", tmp_path / "roi.nii.gz", tmp_path / "full.nii.gz", "--drop-label", 14) == 0
+    full = volume.read(tmp_path / "full.nii.gz")
+    assert set(np.unique(full)) == {0, 1}
+    assert np.all([full[..., k].any() for k in range(9)])
+    assert run("interpolate-slices", tmp_path / "roi.nii.gz", tmp_path / "full.nii.gz") == 1  # exists

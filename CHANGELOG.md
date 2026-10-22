@@ -37,6 +37,8 @@
 - Changed: `interpolate_slices` registers slice pairs on 2 pyramid levels with 32 iterations (3x faster, same Dice).
 - Added: SGD option `adaptive` (Elastix's ASGD time adaptation, Klein et al. 2009; off: less accurate on the
   synthetic benchmark).
+- Added: CLI commands `tomio register` (config file or --transform/--metric, name templates, --save-transform,
+  --plot, masks), `tomio warp`, `tomio interpolate-slices` (--drop-label), `tomio register-config`.
 - Added: top-level aliases `io.register`, `io.warp` (`elastix.transform`), `io.interpolate_slices`,
   `io.check_folding`.
 - Added: `elastix.interpolate_slices` (sparse ROI slice interpolation: signed distances, optionally guided by

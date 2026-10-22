@@ -13,6 +13,8 @@ Remaining work and future features. Details, measurements and history: `PLAN_ela
 - [ ] NGF metric: drifts by a near-uniform translation on real data (not penalized by the bending energy);
   gradients of thick-slice images.
 - [ ] Runtime: 40–80 s for rigid + B-spline on dixon → T1 (SimpleElastix: 22 s).
+- [ ] MIND metric (Heinrich et al., Medical Image Analysis 2012): modality independent neighbourhood descriptor,
+  as a multi-channel image per pyramid level, compared by mean squared difference.
 - [ ] Export to `sitk.BSplineTransform` (fast resampling), `deformation_field()`, Jacobian determinant (folding check).
 
 ### Other

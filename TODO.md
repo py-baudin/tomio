@@ -30,8 +30,11 @@ Remaining work and future features. Details, measurements and history: `PLAN_ela
 
 ## Interpolation
 
-- [ ] Smart interpolation of sparse ROIs (labelled on some slices only), possibly guided by image cues
-  (gradients); literature search needed first (shape-based, registration-based, image-guided propagation).
+- [x] Smart interpolation of sparse ROIs: `elastix.interpolate_slices` (method "shape": signed distances;
+  "registration": guided by 2D registrations of consecutive slices, Ogier et al. 2017). Leave-one-slice-out on
+  dixon_0033 (40 mm gaps): Dice 0.62 nearest slice, 0.71 shape, 0.77 registration.
+- [ ] Faster registration method (≈ 1.7 s per slice pair); morphological contour interpolation (Albu 2008) for
+  topology changes; image-guided refinement (edges) of the fused labels.
 
 ## Command line interface
 

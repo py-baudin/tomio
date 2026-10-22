@@ -1816,3 +1816,67 @@ def test_check_folding():
     # other grid
     ref = ex.Image(np.zeros((12, 12)), spacing=2.0)
     assert ex.check_folding(ex.Transformation(transform, geometry, params), ref=ref).determinant.shape == (12, 12)
+
+
+# sparse ROI slice interpolation
+
+def disks(shape, centers, radii, label=1):
+    """2D disks stacked along the last axis (radius 0: empty slice)"""
+    x, y = np.indices(shape[:2])
+    out = np.zeros(shape, dtype=np.uint8)
+    for k, ((cx, cy), r) in enumerate(zip(centers, radii)):
+        out[..., k][(x - cx) ** 2 + (y - cy) ** 2 <= r**2] = label
+    return out
+
+
+def test_interpolate_slices_shape():
+    nz = 9
+    radii = np.linspace(4, 12, nz)
+    truth = disks((40, 40, nz), [(20, 20)] * nz, radii)
+    sparse = np.zeros_like(truth)
+    sparse[..., [0, 4, 8]] = truth[..., [0, 4, 8]]
+    filled = ex.interpolate_slices(sparse)
+    assert isinstance(filled, io.Volume) and filled.shape == truth.shape
+    assert np.array_equal(np.asarray(filled)[..., [0, 4, 8]], truth[..., [0, 4, 8]])
+    # radii interpolated linearly: area within a pixel ring of the truth
+    for k in range(nz):
+        area = np.count_nonzero(np.asarray(filled)[..., k])
+        assert abs(area - np.pi * radii[k] ** 2) < 2 * np.pi * radii[k], k
+
+
+def test_interpolate_slices_labels_axis():
+    # two labels, slices along axis 0, label 2 drawn on one side only: vanishes half-way
+    truth = np.zeros((5, 30, 30), dtype=np.uint8)
+    truth[0, 5:15, 5:15] = 1
+    truth[4, 8:18, 8:18] = 1
+    truth[0, 20:28, 20:28] = 2
+    filled = np.asarray(ex.interpolate_slices(truth, axis=0, slices=[0, 4]))
+    assert set(np.unique(filled[1])) == {0, 1, 2}
+    assert 2 not in filled[3] and np.count_nonzero(filled[3] == 1) > 50
+    # out of range slices: unchanged; 2D ROI: Image
+    out = ex.interpolate_slices(truth[:, :, 10], axis=0)
+    assert isinstance(out, ex.Image)
+    with pytest.raises(ValueError):
+        ex.interpolate_slices(truth, method="registration")
+
+
+def test_interpolate_slices_registration():
+    """a disk moving across the slices: the image guides the interpolation (shape-based fails: no overlap)"""
+    nz = 5
+    centers = [(12 + 4 * k, 20) for k in range(nz)]
+    truth = disks((40, 40, nz), centers, [5] * nz)
+    rng = np.random.default_rng(0)
+    image = truth * 100.0 + rng.normal(scale=2, size=truth.shape)
+    image = ex.gaussian_filter(image, (1, 1, 0))
+    sparse = np.zeros_like(truth)
+    sparse[..., [0, 4]] = truth[..., [0, 4]]
+
+    def dice(a, b):
+        a, b = np.asarray(a) > 0, b > 0
+        return 2 * (a & b).sum() / (a.sum() + b.sum())
+
+    config = {"transform": {"type": "bspline", "grid_spacing": 8}, "metric": "mse", "optimizer": {"type": "sgd", "niter": 64}}
+    shape = ex.interpolate_slices(sparse)
+    registration = ex.interpolate_slices(sparse, image, method="registration", config=config)
+    assert dice(np.asarray(shape)[..., 2], truth[..., 2]) < 0.3
+    assert dice(np.asarray(registration)[..., 2], truth[..., 2]) > 0.8

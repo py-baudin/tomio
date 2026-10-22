@@ -633,8 +633,10 @@ class PyramidDummy(Pyramid):
 class PyramidGaussian(Pyramid):
     """Gaussian image pyramid
 
-    At level k, the target spacing is `scale_ratio**k` times the smallest spacing of all images;
-    axes with a larger spacing are not reduced, and no axis is reduced below `minsize` pixels.
+    At level k, the target spacing is `scale_ratio**k` times the smallest spacing of all images, the same for all
+    the axes that are reduced (isotropic voxels first: axes with a larger spacing are not reduced); the target is
+    lowered (for all axes) so that no reduced axis has fewer than `minsize` pixels; axes with at most `minsize`
+    pixels are not reduced.
     The reduced grids have the exact target spacing and the same center as the original images.
 
     scale_ratio: spacing ratio between consecutive levels
@@ -647,8 +649,11 @@ class PyramidGaussian(Pyramid):
     downsample: False: smoothing only, the images keep their grid at all levels (as Elastix's default smoothing
         pyramids); avoids tiny coarse images (e.g. for B-spline transforms, whose coarse levels on a few voxels
         can diverge); with random samples, the cost of an iteration does not depend on the image size.
-        None (default): set by the registration: downsampling for global transforms, smoothing only otherwise
+        None (default): set by the registration: downsampling; for non-global transforms (B-splines), no axis
+        is reduced below `MINSIZE_DEFORMABLE` (32) pixels (small images: smoothing only)
     """
+
+    MINSIZE_DEFORMABLE = 32
 
     def __init__(
         self,
@@ -671,13 +676,15 @@ class PyramidGaussian(Pyramid):
         self.magnitude = magnitude
 
     def reduced_grid(self, image, target):
-        """spacing and shape of an image reduced to a target spacing"""
+        """spacing and shape of an image reduced to a target spacing (isotropic for the reduced axes)"""
         shape = image.geometry.shape
-        spacing = np.maximum(image.spacing, target)
-        # no reduction below `minsize` pixels
-        minsize = np.minimum(shape, self.minsize)
-        maxspacing = np.where(minsize > 1, (shape - 1) * image.spacing / np.maximum(minsize - 1, 1), np.inf)
-        spacing = np.where(shape > 1, np.minimum(spacing, np.maximum(maxspacing, image.spacing)), image.spacing)
+        # axes that can be reduced: more than `minsize` pixels, finer than the target
+        reducible = (shape > max(self.minsize, 1)) & (image.spacing < target)
+        if np.any(reducible):
+            # largest common spacing keeping `minsize` pixels along every reduced axis
+            caps = (shape - 1) * image.spacing / max(self.minsize - 1, 1)
+            target = min(target, np.min(caps[reducible]))
+        spacing = np.where(reducible, np.maximum(image.spacing, target), image.spacing)
         newshape = np.floor((shape - 1) * image.spacing / spacing + 1e-8).astype(int) + 1
         return spacing, newshape
 
@@ -1214,7 +1221,16 @@ class TransformBSpline(Transform):
         return np.clip(coords, 1, self.grid["shape"] - 3)
 
     def weights(self, points):
-        """flat control point indices and weights of the points (npoint x 4^ndim)"""
+        """flat control point indices and weights of the points (npoint x 4^ndim), cached for the last
+        points array (they do not depend on the parameters)"""
+        cached = getattr(self, "_weights", (None, None))
+        if cached[0] is points:
+            return cached[1]
+        result = self._weights_of(points)
+        self._weights = (points, result)
+        return result
+
+    def _weights_of(self, points):
         coords = self.grid_coordinates(points)
         npoint, ndim = coords.shape
         shape = self.grid["shape"]
@@ -1234,10 +1250,13 @@ class TransformBSpline(Transform):
         """displacement u(x) at points"""
         ndim = points.shape[1]
         coeffs = np.reshape(parameters, (ndim, -1))
+        if len(points) <= chunk:
+            flat, weights = self.weights(points)
+            return np.stack([(coeffs[a][flat] * weights).sum(axis=1) for a in range(ndim)], axis=1)
         disp = np.empty(points.shape)
         for start in range(0, len(points), chunk):
             index = slice(start, start + chunk)
-            flat, weights = self.weights(points[index])
+            flat, weights = self._weights_of(points[index])
             disp[index] = np.stack([(coeffs[a][flat] * weights).sum(axis=1) for a in range(ndim)], axis=1)
         return disp
 
@@ -1957,6 +1976,15 @@ class Objective:
         limits = getattr(metric, "limits", None)
         self.normalize = lambda f, m: (fixed.normalize(f, limits=limits), moving.normalize(m, limits=limits))
 
+    def moved_samples(self, samples):
+        """sample points through the initial transformation (cached per sample set)"""
+        if self.initial is None:
+            return samples
+        cached = getattr(self, "_moved", (None, None))
+        if cached[0] is not samples:
+            self._moved = (samples, self.initial(samples))
+        return self._moved[1]
+
     def resample(self):
         """draw new samples (stochastic optimizers)"""
         if getattr(self.sampler, "image", None) is not None:
@@ -2015,10 +2043,7 @@ class Objective:
         """objective with a metric of the image gradients (e.g. NGF)"""
         transform_args = {"center": self.center}
         points1, _ = self.sampler(self.fixed)
-        if self.initial is not None:
-            points1_moved = self.initial(points1)
-        else:
-            points1_moved = points1
+        points1_moved = self.moved_samples(points1)
         if getattr(self, "_fixed_samples", (None,))[0] is not points1:
             # fixed gradients at the samples (unchanged until the samples change)
             values1 = np.stack([self.interpolator(component, points1) for component in self.fixed.gradient_images()], axis=1)
@@ -2064,8 +2089,7 @@ class Objective:
         metric_args = {"normalize": self.normalize, **kwargs}
         points1, values1 = self.sampler(self.fixed)
         samples = points1  # identifies the sample set
-        if self.initial is not None:
-            points1 = self.initial(points1)
+        points1 = self.moved_samples(samples)
         penalty = getattr(self.transform, "penalty", None)
         if not gradient:
             points2 = self.transform(parameters, points1, **transform_args)
@@ -2141,8 +2165,10 @@ class Elastix:
 
         pyramid = self.config.setup("pyramid")
         if getattr(pyramid, "downsample", False) is None:
-            # downsampling for global transforms, smoothing only otherwise
-            pyramid.downsample = self.config.setup("transform").is_global
+            # downsampling; for non-global transforms, not below a minimum size (tiny levels can diverge)
+            pyramid.downsample = True
+            if not self.config.setup("transform").is_global:
+                pyramid.minsize = max(pyramid.minsize, pyramid.MINSIZE_DEFORMABLE)
         optimizer = self.config.setup("optimizer")
         self.logger.info(f"Using pyramid: {pyramid}")
         self.logger.info(f"Using optimizer: {optimizer}")
@@ -2486,6 +2512,14 @@ def _spline_weights(coords, order, size):
         t = (coords - first)[:, np.newaxis]
         weights = np.hstack([1 - t, t])
         dweights = np.broadcast_to([-1.0, 1.0], weights.shape)
+        return first, weights, dweights
+    elif order == 3:
+        # closed form of the cubic B-spline weights (taps first .. first + 3)
+        first = np.floor(coords) - 1
+        t = (coords - first - 1)[:, np.newaxis]
+        t2, t3 = t * t, t * t * t
+        weights = np.hstack([(1 - t) ** 3, 3 * t3 - 6 * t2 + 4, -3 * t3 + 3 * t2 + 3 * t + 1, t3]) / 6
+        dweights = np.hstack([-((1 - t) ** 2), 3 * t2 - 4 * t, -3 * t2 + 2 * t + 1, t2]) / 2
         return first, weights, dweights
     first = np.floor(coords - (order - 1) / 2)
     dist = coords[:, np.newaxis] - (first[:, np.newaxis] + np.arange(order + 1))

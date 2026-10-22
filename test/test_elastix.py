@@ -1497,7 +1497,8 @@ def test_register_bspline_identical_textured(metric):
 def test_register_bspline_identical():
     """identical images: no deformation (MSE)"""
     image = sample_phantom((40, 40))
-    _, trans = ex.register(image, image, transform={"type": "bspline", "grid_spacing": 8}, return_transform=True)
+    config = {"transform": {"type": "bspline", "grid_spacing": 8}, "optimizer": "lbfgs"}  # deterministic
+    _, trans = ex.register(image, image, config, return_transform=True)
     assert np.abs(trans.parameters).max() < 1e-3
 
 

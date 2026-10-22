@@ -34,6 +34,7 @@ classifiers = [
 [project.optional-dependencies]
 interp = ["scipy"]
 nibabel = ["nibabel"]
+plot = ["matplotlib"]
 test = ["pytest", "scipy", "nibabel"]
 
 [project.scripts]

@@ -1688,3 +1688,18 @@ def test_register_bspline_fixed_axis():
     _, trans = ex.register(ex.Image(fixed, spacing=spacing), ex.Image(moving, spacing=spacing), config, return_transform=True)
     moved = trans(points)
     assert np.allclose(moved[:, 2], points[:, 2])
+
+
+def test_warp_roi_whole_slices():
+    """a labelled slice midway between two output slices goes to one of them only; tilted mapping: no split"""
+    roi = np.zeros((16, 16, 12), dtype=np.uint8)
+    roi[4:12, 4:12, 6] = 1  # z = 30 mm
+    roi = ex.Image(roi, spacing=(1, 1, 5))
+    target = ex.Geometry((16, 16, 4), spacing=(1, 1, 10), origin=(0, 0, 5))  # slices at z = 5, 15, 25, 35, ...
+    out = ex.warp_roi(roi, target.points, target).reshape(target.shape)
+    labelled = [k for k in range(4) if out[..., k].any()]
+    assert len(labelled) == 1 and out[..., labelled[0]].sum() == 64
+    # small tilt of the mapping: still one output slice, whole
+    trans = ex.Transformation("rigid", target, [0.02, 0.0, 0.0, 0.0, 0.0, 0.0])
+    out = ex.warp_roi(roi, trans(), target).reshape(target.shape)
+    assert len([k for k in range(4) if out[..., k].any()]) == 1

@@ -200,10 +200,17 @@ def warp_labels(labelmap, points):
 def warp_roi(roi, points, geometry):
     """ROI at the points of an output grid, for ROIs drawn on some slices only (as `tomio.resample(method="roi")`)
 
-    Along the slice axis (most labelled axis), each point takes the nearest labelled slice if it lies within
-    the output voxel's extent; nearest neighbor otherwise.
+    Whole-slice logic: each labelled slice of the ROI (along its slice axis: the most labelled axis) goes to a
+    single output slice (along the output axis closest to the ROI slice axis): the one whose points map closest to
+    it on average, if within its extent. All the points of that output slice take the labels of that ROI slice
+    (nearest neighbor in-plane); output slices without a labelled slice are empty.
+
+    points: the output grid points, in the order of `geometry.points`, mapped into the ROI space
     """
     array = np.asarray(roi.array)
+    shape = tuple(int(n) for n in geometry.shape)
+    if len(points) != int(np.prod(shape)):
+        raise ValueError("warp_roi: the points must be the (transformed) points of the output grid")
     coords = roi.geometry.to_coords(points)
     ndim = array.ndim
     mask = array > 0
@@ -213,18 +220,29 @@ def warp_roi(roi, points, geometry):
     counts = [mask.sum(axis=tuple(j for j in range(ndim) if j != i)) for i in range(ndim)]
     axis = int(np.argmax([np.max(c) for c in counts]))
     labelled = np.flatnonzero(counts[axis])
-    # nearest labelled slice
-    position = np.clip(np.searchsorted(labelled, coords[:, axis]), 1, max(len(labelled) - 1, 1))
-    candidates = np.stack([labelled[position - 1], labelled[np.minimum(position, len(labelled) - 1)]], axis=1)
-    distance = np.abs(candidates - coords[:, axis, np.newaxis])
-    nearest = candidates[np.arange(len(points)), np.argmin(distance, axis=1)]
-    # half extent of an output voxel along the slice axis (in ROI pixels)
+    # output slice axis: the closest to the ROI slice axis
+    alignment = np.abs(geometry.direction.T @ roi.geometry.direction[:, axis])
+    out_axis = int(np.argmax(alignment))
+    slice_index = np.reshape(np.indices(shape)[out_axis], -1)
+    nslice = shape[out_axis]
+    # mean position of each output slice along the ROI slice axis (ROI pixels)
+    position = np.bincount(slice_index, weights=coords[:, axis], minlength=nslice) / np.bincount(slice_index, minlength=nslice)
+    # half extent of an output slice along the ROI slice axis (ROI pixels)
     matrix = np.linalg.inv(roi.geometry.matrix) @ geometry.matrix
     half = max(0.5 * np.sum(np.abs(matrix[axis])), 0.5)
+    # each labelled slice -> one output slice (the closest); each output slice keeps its closest labelled slice
+    assigned = np.full(nslice, -1)
+    distance = np.full(nslice, np.inf)
+    for label_slice in labelled:
+        k = int(np.argmin(np.abs(position - label_slice)))
+        d = abs(position[k] - label_slice)
+        if d <= half + 1e-6 and d < distance[k]:
+            assigned[k], distance[k] = label_slice, d
+    source = assigned[slice_index]
     snapped = np.array(coords)
-    snapped[:, axis] = nearest
+    snapped[:, axis] = np.maximum(source, 0)
     values = ndspline_interpolation(array, snapped, order=0, mode="constant", cval=0)
-    values[np.abs(nearest - coords[:, axis]) > half + 1e-6] = 0
+    values[source < 0] = 0
     return values.astype(array.dtype)
 
 

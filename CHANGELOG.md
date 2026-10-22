@@ -22,6 +22,9 @@
 - Changed: pyramid levels have isotropic voxels along all reduced axes.
 - Changed: faster B-spline stages (closed-form cubic weights, cached weights and moved samples).
 - Added: B-spline option `axis` (no displacement along that axis, e.g. in-plane only).
+- Fixed: `warp_roi` keeps whole slices (one output slice per labelled ROI slice).
+- Fixed: `resample(method="roi")` keeps whole slices with tilted geometries (`disjoint=True`).
+- Fixed: `resample(method="roi")` rounding of negative coordinates.
 - Fixed: constant sample set; samples leaving the moving image are padded, no longer discarded.
 - Added: benchmarks `phantom_elastix.py`, `bench_elastix_ffd.py` (synthetic pair with known deformation).
 - Known limitation: on real data (dixon → T1), the B-spline stage does not yet improve on the rigid result

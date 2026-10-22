@@ -30,6 +30,13 @@
 - Fixed: constant sample set; samples leaving the moving image are padded, no longer discarded.
 - Added: `spatial_jacobian`, `jacobian_determinant`, `check_folding` (folding check), `deformation_field`.
 - Fixed: B-spline displacement frozen in the last control cell of each axis (grid coordinates clipped too early).
+- Added: `elastix.to_sitk` (SimpleITK transform: affine, B-spline, composite), `Transformation.jacobian`
+  (analytic spatial Jacobian, chain rule for sequences).
+- Changed: non-global transforms resample images and label maps with SimpleITK through a displacement field
+  (labels 7x faster on a 2.9 M voxel grid); separable B-spline evaluation of large point sets.
+- Changed: `interpolate_slices` registers slice pairs on 2 pyramid levels with 32 iterations (3x faster, same Dice).
+- Added: SGD option `adaptive` (Elastix's ASGD time adaptation, Klein et al. 2009; off: less accurate on the
+  synthetic benchmark).
 - Added: top-level aliases `io.register`, `io.warp` (`elastix.transform`), `io.interpolate_slices`,
   `io.check_folding`.
 - Added: `elastix.interpolate_slices` (sparse ROI slice interpolation: signed distances, optionally guided by

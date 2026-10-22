@@ -13,11 +13,15 @@ Remaining work and future features. Details, measurements and history: `PLAN_ela
 - [ ] NGF metric: drifts by a near-uniform translation on real data (not penalized by the bending energy);
   gradients of thick-slice images.
 - [ ] Runtime: 40–80 s for rigid + B-spline on dixon → T1 (SimpleElastix: 22 s).
+- [x] Adaptive step size (ASGD time adaptation): option `adaptive`, less accurate than the fixed decay on the
+  synthetic benchmark (MI 1.22 vs 1.14 mm, MSE 0.52 vs 0.37 mm): kept off.
+- [ ] Finer grids now converge (10 mm: MI 1.11, MSE 0.33 mm vs 20 mm: 1.14, 0.37): check on real data before
+  changing the default grid spacing (20 mm).
 - [x] MIND metric (Heinrich et al., Medical Image Analysis 2012): done (`"mind"`).
 - [x] `deformation_field()`, Jacobian determinant, `check_folding()`: done (real data, bending 1: no folding,
   determinant 0.94–1.05).
-- [ ] Analytic B-spline spatial Jacobian (finite differences: 44 s on the 2.9 M T1 voxels).
-- [ ] Export to `sitk.BSplineTransform` (fast resampling).
+- [x] Analytic spatial Jacobian (T1 folding check 44 → 16 s), `to_sitk` export, SimpleITK resampling of
+  non-global transforms (labels 46 → 6 s). Remaining cost: mapping the points (≈ 6 s for 2.9 M points).
 - [ ] ROI warping through B-spline transforms (`warp_roi`): a z deformation spreads a labelled slice onto several
   output slices; keep the whole-slice logic of `tomio.resample(method="roi")` (one labelled slice per output slice).
   Simple fix available: in-plane deformation only (`{"type": "bspline", "axis": 2}`); general case still to do.
@@ -33,8 +37,8 @@ Remaining work and future features. Details, measurements and history: `PLAN_ela
 - [x] Smart interpolation of sparse ROIs: `elastix.interpolate_slices` (method "shape": signed distances;
   "registration": guided by 2D registrations of consecutive slices, Ogier et al. 2017). Leave-one-slice-out on
   dixon_0033 (40 mm gaps): Dice 0.62 nearest slice, 0.71 shape, 0.77 registration.
-- [ ] Faster registration method (≈ 1.7 s per slice pair); morphological contour interpolation (Albu 2008) for
-  topology changes; image-guided refinement (edges) of the fused labels.
+- [x] Faster registration method (0.3 s per slice pair, same Dice). Threads do not help (GIL).
+- [ ] Morphological contour interpolation (Albu 2008) for topology changes; image-guided refinement (edges) of the fused labels.
 
 ## Command line interface
 

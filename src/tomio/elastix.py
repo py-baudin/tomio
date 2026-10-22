@@ -170,6 +170,8 @@ def _apply(transformation, moving, *, geometry=None, method=None, label=None):
         values = np.asarray(_interp.resample(vol, geometry=mapped, method=method))
     elif method == "roi":
         values = warp_roi(moving, transformation(), geometry).reshape(tuple(geometry.shape))
+    elif method in SITK_INTERPOLATORS and moving.ndim >= 2 and not np.iscomplexobj(moving.array):
+        values = _resample_sitk(moving, transformation(), geometry, SITK_INTERPOLATORS[method])
     elif method == "labels":
         values = warp_labels(moving, transformation()).reshape(tuple(geometry.shape))
     else:
@@ -180,6 +182,43 @@ def _apply(transformation, moving, *, geometry=None, method=None, label=None):
             values = np.rint(values).astype(moving.array.dtype)
 
     return _output(values, geometry, label=label)
+
+
+# interpolation methods resampled by SimpleITK (multithreaded) through a displacement field
+SITK_INTERPOLATORS = {
+    "nearest": sitk.sitkNearestNeighbor,
+    "linear": sitk.sitkLinear,
+    "spline1": sitk.sitkLinear,
+    "spline3": sitk.sitkBSpline,
+    "labels": sitk.sitkLabelLinear,  # as `warp_labels`: linear interpolation of each label's mask
+}
+
+
+def _resample_sitk(moving, points, geometry, interpolator):
+    """values of a moving Image at the mapped points of an output grid (`sitk.Resample` with the displacement
+    field points - grid points, exact at the grid points); 0 outside the moving image"""
+    shape = tuple(int(n) for n in geometry.shape)
+    ndim = len(shape)
+
+    def as_sitk(array, geo, vector=False):
+        """sitk image of an (x, y, z) array (with a last vector axis)"""
+        axes = tuple(range(ndim))[::-1] + ((ndim,) if vector else ())
+        image = sitk.GetImageFromArray(np.ascontiguousarray(np.transpose(array, axes)), isVector=vector)
+        image.SetOrigin([float(v) for v in geo.origin])
+        image.SetSpacing([float(v) for v in geo.spacing])
+        image.SetDirection([float(v) for v in np.ravel(geo.direction)])
+        return image
+
+    field = as_sitk((points - geometry.points).reshape(shape + (ndim,)).astype(np.float64), geometry, vector=True)
+    reference = sitk.Image(field)  # output grid (copy: the transform takes the field's buffer)
+    transform = sitk.DisplacementFieldTransform(field)
+
+    array = np.asarray(moving.array)
+    dtype = array.dtype
+    source = as_sitk(array.astype(np.uint8) if dtype == bool else array, moving.geometry)
+    result = sitk.Resample(source, reference, transform, interpolator, 0.0, source.GetPixelID())
+    values = np.transpose(sitk.GetArrayFromImage(result), tuple(range(ndim))[::-1])
+    return values.astype(dtype)
 
 
 def _output(values, geometry, label=None):
@@ -196,7 +235,51 @@ def _output_geometry(transformation, ref=None):
     return transformation, transformation.geometry
 
 
-def spatial_jacobian(transformation, points=None, step=1e-2):
+def spatial_jacobian(transformation, points=None):
+    """spatial Jacobian dT/dx of a transformation at points (npoint x ndim x ndim, world axes): analytic (B-spline
+    weight derivatives, chain rule for sequences)
+
+    points: world points (default: the points of the transformation's grid)
+    """
+    return as_transformation(transformation).jacobian(points)
+
+
+def to_sitk(transformation):
+    """SimpleITK transform equivalent to a transformation (same mapping of world points, fixed -> moving)
+
+    global transforms: `sitk.AffineTransform`; B-splines: `sitk.BSplineTransform` (same control grid, padded;
+    displacements differ outside the domain, where `TransformBSpline` clips); sequences: `sitk.CompositeTransform`
+    """
+    transformation = as_transformation(transformation)
+    if isinstance(transformation, TransformationSequence):
+        # ITK composite transforms apply the last added transform first
+        return sitk.CompositeTransform([to_sitk(trans) for trans in transformation][::-1])
+    ndim = transformation.geometry.ndim
+    if transformation.is_global:
+        A, t = transformation.affine()
+        return sitk.AffineTransform([float(v) for v in A.ravel()], [float(v) for v in t])
+    transform = transformation.transform
+    if not isinstance(transform, TransformBSpline):
+        raise TypeError(f"No SimpleITK equivalent for {transform}")
+    grid = transform.grid
+    shape = tuple(int(n) for n in grid["shape"])
+    coeffs = np.reshape(transformation.parameters, (len(transform.components), -1))
+    world = transform.basis @ coeffs  # world displacement coefficients (ndim x ncontrol)
+    # one more control point on each side (edge values): same spline on the domain, which stays strictly inside
+    # ITK's valid region (half-open, the borders of the domain would be lost to rounding)
+    origin = grid["origin"] - grid["direction"] @ grid["spacing"]
+    images = []
+    for i in range(ndim):
+        padded = np.pad(world[i].reshape(shape), 1, mode="edge")
+        image = sitk.GetImageFromArray(np.ascontiguousarray(padded.T))
+        image.SetOrigin([float(v) for v in origin])
+        image.SetSpacing([float(v) for v in grid["spacing"]])
+        image.SetDirection([float(v) for v in np.ravel(grid["direction"])])
+        images.append(image)
+    return sitk.BSplineTransform(images, 3)
+
+
+def _finite_jacobian(transformation, points=None, step=1e-2):
     """spatial Jacobian dT/dx of a transformation at points (npoint x ndim x ndim, world axes): finite
     differences along the grid axes, central inside the grid and one-sided at its borders (exact for global
     transforms, O(step^2) inside for B-splines)
@@ -204,7 +287,6 @@ def spatial_jacobian(transformation, points=None, step=1e-2):
     points: world points (default: the points of the transformation's grid)
     step: finite difference step (pixels of the transformation's grid)
     """
-    transformation = as_transformation(transformation)
     geometry = transformation.geometry
     points = geometry.points if points is None else np.atleast_2d(np.asarray(points, dtype=float))
     coords = geometry.to_coords(points)
@@ -337,7 +419,9 @@ def warp_roi(roi, points, geometry):
 SLICE_REGISTRATION = {
     "transform": {"type": "bspline", "grid_spacing": 20.0, "bending": 1.0},
     "metric": "mi",
-    "optimizer": {"type": "sgd", "niter": 64},  # as good as 128 iterations on muscle MRI
+    # 2 pyramid levels, 32 iterations: as good as 4 levels and 128 iterations on muscle MRI, 0.3 s per slice pair
+    "pyramid": {"maxlevel": 1},
+    "optimizer": {"type": "sgd", "niter": 32},
 }
 
 
@@ -1045,6 +1129,15 @@ class Transformation:
         points = self.geometry.points if points is None else points
         return self.transform(self.parameters, points, center=self.center, **kwargs)
 
+    def jacobian(self, points=None):
+        """spatial Jacobian dT/dx at points (npoint x ndim x ndim, world axes; default points: the grid's)"""
+        points = self.geometry.points if points is None else np.atleast_2d(points)
+        if self.is_global:
+            return np.broadcast_to(self.affine()[0], (len(points),) + (points.shape[1],) * 2)
+        if hasattr(self.transform, "spatial_jacobian"):
+            return self.transform.spatial_jacobian(np.ravel(self.parameters), points, center=self.center)
+        return _finite_jacobian(self, points)
+
     def affine(self):
         """matrix A and vector t of a global transformation: T(x) = A @ x + t"""
         if not self.is_global:
@@ -1098,6 +1191,17 @@ class TransformationSequence:
         for trans in self.transformations:
             points = trans(points)
         return points
+
+    def jacobian(self, points=None):
+        """spatial Jacobian (chain rule): J_n(T_{n-1}(x)) ... J_1(x)"""
+        points = self.geometry.points if points is None else np.atleast_2d(points)
+        jac = None
+        for k, trans in enumerate(self.transformations):
+            current = trans.jacobian(points)
+            jac = current if jac is None else current @ jac
+            if k < len(self.transformations) - 1:
+                points = trans(points)
+        return jac
 
     def affine(self):
         A, t = np.eye(self.geometry.ndim), np.zeros(self.geometry.ndim)
@@ -1517,16 +1621,69 @@ class TransformBSpline(Transform):
         local = np.stack([(coeffs[a][flat] * weights).sum(axis=1) for a in range(len(coeffs))], axis=1)
         return local @ self.basis.T
 
+    def spatial_jacobian(self, parameters, points, chunk=2**15, **kwargs):
+        """spatial Jacobian dT/dx at points (npoint x ndim x ndim, world axes), from the derivatives of the cubic
+        B-spline weights (zero across the borders of the control grid domain, where coordinates are clipped)"""
+        ndim = points.shape[1]
+        coeffs = np.reshape(parameters, (len(self.components), -1))
+        shape = self.grid["shape"]
+        # world derivative of the grid coordinates: dc_d / dx = direction[:, d] / spacing[d]
+        dcoords = (self.grid["direction"] / self.grid["spacing"]).T  # ndim (d) x ndim (x)
+        jac = np.empty((len(points), ndim, ndim))
+        for start in range(0, len(points), chunk):
+            index = slice(start, start + chunk)
+            raw = (points[index] - self.grid["origin"]) @ self.grid["direction"] / self.grid["spacing"]
+            npoint = len(raw)
+            flat, taps = self._taps(points[index])
+            # du_local / dc_d: tap values contracted axis by axis (last first) with the weights, or their
+            # derivative along d (separable)
+            dlocal = np.empty((npoint, len(coeffs), ndim))
+            for a, c in enumerate(coeffs):
+                values = c[flat].reshape((npoint,) + (4,) * ndim)
+                for d in range(ndim):
+                    out = values
+                    for e in range(ndim - 1, -1, -1):
+                        _, w, dw = taps[e]
+                        out = np.einsum("n...k,nk->n...", out, dw if e == d else w)
+                    dlocal[:, a, d] = out
+            inside = (raw >= 1 - 1e-9) & (raw <= shape - 2 + 1e-9)  # not clipped
+            dlocal *= inside[:, np.newaxis, :]
+            # world: J = I + basis @ dlocal @ dcoords
+            jac[index] = np.eye(ndim) + np.einsum("ia,nad,dj->nij", self.basis, dlocal, dcoords)
+        return jac
+
+    def _taps(self, points):
+        """flat indices of the 4^ndim taps of the points (npoint x 4^ndim) and the per axis taps
+        (first index, weights, derivative weights)"""
+        coords = self.grid_coordinates(points)
+        npoint, ndim = coords.shape
+        shape = self.grid["shape"]
+        strides = [int(np.prod(shape[d + 1:])) for d in range(ndim)]
+        taps = [_spline_weights(coords[:, d], 3, shape[d]) for d in range(ndim)]
+        flat = np.zeros((npoint,) + (1,) * ndim, dtype=np.intp)
+        for d, (first, _, _) in enumerate(taps):
+            newshape = [npoint] + [1] * ndim
+            newshape[d + 1] = 4
+            flat = flat + ((first[:, np.newaxis].astype(np.intp) + np.arange(4)) * strides[d]).reshape(newshape)
+        return flat.reshape(npoint, -1), taps
+
     def displacement(self, parameters, points, chunk=2**15):
         """displacement u(x) at points"""
         coeffs = np.reshape(parameters, (len(self.components), -1))
         if len(points) <= chunk:
             return self._displacement(coeffs, *self.weights(points))
-        disp = np.empty(points.shape)
+        # large point sets (not cached): separable evaluation, axis by axis
+        ndim = points.shape[1]
+        local = np.empty((len(points), len(coeffs)))
         for start in range(0, len(points), chunk):
             index = slice(start, start + chunk)
-            disp[index] = self._displacement(coeffs, *self._weights_of(points[index]))
-        return disp
+            flat, taps = self._taps(points[index])
+            for a, c in enumerate(coeffs):
+                out = c[flat].reshape((len(flat),) + (4,) * ndim)
+                for e in range(ndim - 1, -1, -1):
+                    out = np.einsum("n...k,nk->n...", out, taps[e][1])
+                local[index, a] = out
+        return local @ self.basis.T
 
     def transform(self, parameters, points, jac=False, **kwargs):
         if not jac:
@@ -2030,21 +2187,31 @@ class OptimizerSGD(Optimizer):
     """Stochastic gradient descent with new samples at each iteration (as Elastix's stochastic optimizers)
 
     Iteration k moves the (scaled) parameters by -gain_k * gradient / max(|gradient|, g0), with
-    gain_k = a / (k + 1 + A)^alpha, |.| the largest component and g0 that of the first gradient: no step is larger
-    than gain_k (~ mm), and the steps shrink when the gradient becomes smaller than at the start. New samples at each iteration avoid fitting
-    the transform to a fixed set of samples (needed for transforms with many parameters, e.g. B-splines);
-    fixed number of iterations.
+    gain_k = a / (t_k + 1 + A)^alpha, |.| the largest component and g0 that of the first gradient: no step is larger
+    than gain_k (~ mm), and the steps shrink when the gradient becomes smaller than at the start. New samples at
+    each iteration avoid fitting the transform to a fixed set of samples (needed for transforms with many
+    parameters, e.g. B-splines); fixed number of iterations.
 
     niter: number of iterations (per pyramid level)
     a, A, alpha: gain sequence (A: stability constant, alpha: decay exponent; 0.602 as in Elastix)
+    adaptive: adaptive time t_k (as Elastix's AdaptiveStochasticGradientDescent, Klein et al. 2009):
+        t_{k+1} = max(0, t_k + f(-cos(g_k, g_{k-1}))), with the sigmoid f from fmin (< 0) to fmax (> 0), f(0) = 0
+        and width omega: the gain decreases when consecutive gradients oppose each other (oscillation around the
+        optimum) and increases again when they agree (still far); False: t_k = k. On the synthetic B-spline
+        benchmark (known deformation), the fixed decay is more accurate (MI 1.14 vs 1.22 mm, MSE 0.37 vs 0.52 mm)
     """
 
-    def __init__(self, niter=256, a=4.0, A=20, alpha=0.602):
+    def __init__(self, niter=256, a=4.0, A=20, alpha=0.602, adaptive=False, omega=0.1, fmax=1.0, fmin=-0.8):
         self.niter, self.a, self.A, self.alpha = niter, a, A, alpha
+        self.adaptive, self.omega, self.fmax, self.fmin = bool(adaptive), omega, fmax, fmin
+
+    def sigmoid(self, x):
+        """Klein's sigmoid: fmin at -inf, 0 at 0, fmax at +inf"""
+        return self.fmin + (self.fmax - self.fmin) / (1 - (self.fmax / self.fmin) * np.exp(-x / self.omega))
 
     def optimize(self, objective, init):
         x = np.asarray(init, dtype=float).copy()
-        cost, norm = np.nan, None
+        cost, norm, previous, time = np.nan, None, None, 0.0
         for k in range(self.niter):
             if k:
                 objective.resample()
@@ -2054,7 +2221,13 @@ class OptimizerSGD(Optimizer):
                 norm = current
             if not np.isfinite(cost) or max(current, norm) == 0:
                 break
-            x -= self.a / (k + 1 + self.A) ** self.alpha * grad / max(current, norm)
+            x -= self.a / (time + 1 + self.A) ** self.alpha * grad / max(current, norm)
+            if not self.adaptive:
+                time = k + 1.0
+            elif previous is not None:
+                cosine = grad @ previous / max(np.linalg.norm(grad) * np.linalg.norm(previous), 1e-300)
+                time = max(0.0, time + float(self.sigmoid(-cosine)))
+            previous = grad
         return x, OptimResults(fun=cost, nit=k + 1, nfev=k + 1, message="Number of iterations reached", success=True)
 
 

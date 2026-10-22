@@ -1888,3 +1888,94 @@ def test_toplevel_aliases():
     fixed, moving = shifted((24, 24), (1.0, -0.5))
     registered, trans = io.register(fixed, moving, transform="translation", return_transform=True)
     assert np.allclose(np.asarray(io.warp(trans, moving)), np.asarray(registered))
+
+
+@pytest.mark.parametrize("axis", [None, 2])
+def test_jacobian_analytic(axis):
+    """analytic spatial Jacobian (B-spline weight derivatives, chain rule) = finite differences"""
+    direction = ex.euler_to_matrix([0.1, -0.2, 0.3])
+    geometry = ex.Geometry((16, 14, 6), spacing=(1.0, 1.2, 3.0), origin=(5, -3, 2), direction=direction)
+    transform = ex.TransformBSpline(grid_spacing=6, axis=axis)
+    transform.setup(geometry)
+    params = np.random.default_rng(0).normal(scale=1.0, size=transform.init(3).size)
+    bspline = ex.Transformation(transform, geometry, params)
+    sequence = ex.TransformationSequence([rigid_transformation(geometry), bspline])
+    for trans in [bspline, sequence]:
+        analytic = ex.spatial_jacobian(trans)
+        assert np.allclose(analytic, ex._finite_jacobian(trans, step=1e-4), atol=1e-4)
+
+
+@pytest.mark.parametrize("ndim", [2, 3])
+def test_to_sitk(ndim):
+    import SimpleITK as sitk
+
+    if ndim == 3:
+        geometry = ex.Geometry((16, 14, 6), spacing=(1.0, 1.2, 3.0), origin=(5, -3, 2), direction=ex.euler_to_matrix([0.1, -0.2, 0.3]))
+        rigid = rigid_transformation(geometry)
+    else:
+        geometry = ex.Geometry((16, 14), spacing=(1.0, 1.2), origin=(5, -3))
+        rigid = ex.Transformation("rigid", geometry, [0.1, 1.0, -2.0])
+    transform = ex.TransformBSpline(grid_spacing=6, axis=ndim - 1)
+    transform.setup(geometry)
+    params = np.random.default_rng(0).normal(scale=1.0, size=transform.init(ndim).size)
+    bspline = ex.Transformation(transform, geometry, params)
+    points = geometry.points
+    # same mapping where the B-spline input lies in its domain (outside: clipped vs extrapolated)
+    coords = geometry.to_coords(rigid(points))
+    inside = np.all((coords >= 0) & (coords <= geometry.shape - 1), axis=1)
+    assert inside.sum() > len(points) / 2
+    for trans, valid in [(rigid, None), (bspline, None), (ex.TransformationSequence([rigid, bspline]), inside)]:
+        tx = ex.to_sitk(trans)
+        moved = np.array([tx.TransformPoint([float(v) for v in p]) for p in points])
+        valid = slice(None) if valid is None else valid
+        assert np.allclose(moved[valid], trans(points)[valid], atol=1e-8)
+
+
+@pytest.mark.parametrize("method", ["linear", "nearest", "labels"])
+def test_transform_sitk_resampling(method):
+    """non-global transforms are resampled by SimpleITK: same values as the numpy interpolation"""
+    direction = ex.euler_to_matrix([0.05, -0.1, 0.2])
+    geometry = ex.Geometry((20, 18, 8), spacing=(1.0, 1.2, 2.5), origin=(1, -2, 3), direction=direction)
+    transform = ex.TransformBSpline(grid_spacing=8)
+    transform.setup(geometry)
+    params = np.random.default_rng(1).normal(scale=1.0, size=transform.init(3).size)
+    trans = ex.TransformationSequence([rigid_transformation(geometry), ex.Transformation(transform, geometry, params)])
+    if method == "labels":
+        array = (np.arange(20 * 18 * 8).reshape(20, 18, 8) // 97 % 4).astype(np.uint8)
+    else:
+        array = np.random.default_rng(2).normal(size=(20, 18, 8)) + 10
+    moving = ex.Image(array, spacing=(1.1, 1.0, 2.0), origin=(0, -1, 2), direction=direction.T)
+    result = np.asarray(ex.transform(trans, moving, method=method))
+    points = trans()
+    if method == "labels":
+        expected = ex.warp_labels(moving, points)
+    else:
+        expected = ex.InterpolatorBSpline(order=int(method == "linear"), mode="constant", cval=0)(moving, points)
+    # inside the moving image (away from its borders, where the boundary conditions differ)
+    coords = moving.geometry.to_coords(points)
+    inside = np.all((coords > 0.5) & (coords < np.array(array.shape) - 1.5), axis=1)
+    assert inside.sum() > 200
+    agree = np.isclose(result.ravel()[inside], expected[inside], atol=1e-8)
+    assert agree.mean() > (0.97 if method != "linear" else 0.9999), agree.mean()
+
+
+# adaptive stochastic gradient descent
+
+def test_sgd_adaptive_time():
+    optimizer = ex.OptimizerSGD(adaptive=True)
+    assert optimizer.sigmoid(0) == 0
+    assert np.isclose(optimizer.sigmoid(-50), optimizer.fmin) and np.isclose(optimizer.sigmoid(50), optimizer.fmax)
+    assert ex.Config(optimizer={"type": "sgd", "adaptive": True})["optimizer"]["adaptive"]
+
+
+@pytest.mark.parametrize("metric", ["mse", "mi"])
+def test_register_bspline_adaptive(metric):
+    fixed, moving, points, u = textured_pair()
+    optimizer = {**SGD, "adaptive": True}
+    _, trans = ex.register(fixed, moving, transform={"type": "bspline", "grid_spacing": 8}, metric=metric, optimizer=optimizer, return_transform=True)
+    inner = np.all((points >= 8) & (points <= 39), axis=1)
+    error = np.linalg.norm(trans(points[inner]) - points[inner] - u[inner], axis=1)
+    assert error.mean() < 0.25 * np.linalg.norm(u[inner], axis=1).mean()
+    # identical images: (almost) no deformation
+    _, trans = ex.register(fixed, fixed, transform={"type": "bspline", "grid_spacing": 8}, metric=metric, optimizer=optimizer, return_transform=True)
+    assert np.linalg.norm(trans(points) - points, axis=1).mean() < 0.1

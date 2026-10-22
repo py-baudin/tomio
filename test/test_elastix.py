@@ -1638,3 +1638,53 @@ def test_local_displacement():
     params = np.repeat([0.5, -0.5], bspline.ncontrol)
     sequence = ex.TransformationSequence([rigid, ex.Transformation(bspline, geometry, params)])
     assert np.allclose(elastix_plot.local_displacement(sequence, points), [0.5, -0.5])
+
+
+# B-spline with a fixed axis (in-plane deformation)
+
+def test_bspline_fixed_axis():
+    transform = ex.TransformBSpline(grid_spacing=10, axis=2)
+    geometry = ex.Geometry((20, 20, 6), spacing=(1, 1, 4))
+    transform.setup(geometry)
+    params = np.random.default_rng(0).normal(size=transform.init(3).size)
+    assert params.size == 2 * transform.ncontrol
+    points = geometry.points
+    moved = transform(params, points)
+    assert np.allclose(moved[:, 2], points[:, 2])  # slices stay slices
+    assert not np.allclose(moved[:, :2], points[:, :2])
+    # serialization
+    trans = ex.Transformation(transform, geometry, params)
+    trans2 = ex.as_transformation(trans.serialize())
+    assert trans2.transform.axis == 2 and np.allclose(trans2(points), trans(points))
+
+
+@pytest.mark.parametrize("metric", ["mse", "mi"])
+def test_bspline_fixed_axis_gradient(metric):
+    spacing = (1.0, 1.0, 3.0)
+    fixed, moving = shifted((16, 16, 8), (1.0, -1.0, 0.0), spacing=spacing, scale=50)
+    config = {"transform": {"type": "bspline", "grid_spacing": 6, "axis": 2}, "metric": metric}
+    objective = make_objective(fixed, moving, config, spacing=spacing)
+    objective.transform.setup(objective.fixed.geometry)
+    rng = np.random.default_rng(1)
+    params = rng.normal(scale=0.3, size=objective.transform.init(3).size)
+    _, gradient = objective(params, gradient=True)
+    for k in rng.choice(params.size, 8, replace=False):
+        delta = np.zeros(params.size)
+        delta[k] = 1e-5
+        fd = (objective(params + delta) - objective(params - delta)) / 2e-5
+        assert np.isclose(gradient[k], fd, rtol=1e-2, atol=1e-7)
+
+
+def test_register_bspline_fixed_axis():
+    """in-plane deformation only: no displacement along z"""
+    fixed, moving, u, points = None, None, None, None
+    shape, spacing = (32, 32, 6), (1.0, 1.0, 4.0)
+    points = grid_points(shape, spacing)
+    u = np.zeros_like(points)
+    u[:, :2] = smooth_displacement(points[:, :2], amplitude=1.0, period=32.0)
+    fixed = world_phantom(points + u, box=32).reshape(shape)
+    moving = world_phantom(points, box=32).reshape(shape)
+    config = {"transform": {"type": "bspline", "grid_spacing": 8, "axis": 2}, "optimizer": SGD}
+    _, trans = ex.register(ex.Image(fixed, spacing=spacing), ex.Image(moving, spacing=spacing), config, return_transform=True)
+    moved = trans(points)
+    assert np.allclose(moved[:, 2], points[:, 2])

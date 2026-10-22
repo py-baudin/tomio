@@ -18,12 +18,18 @@ Remaining work and future features. Details, measurements and history: `PLAN_ela
 - [ ] Export to `sitk.BSplineTransform` (fast resampling), `deformation_field()`, Jacobian determinant (folding check).
 - [ ] ROI warping through B-spline transforms (`warp_roi`): a z deformation spreads a labelled slice onto several
   output slices; keep the whole-slice logic of `tomio.resample(method="roi")` (one labelled slice per output slice).
+  Simple fix available: in-plane deformation only (`{"type": "bspline", "axis": 2}`); general case still to do.
 
 ### Other
 
 - [ ] Optional mask erosion by the interpolation support (as Elastix's `ErodeMask`).
 - [ ] Optional `numba` kernels (interpolation, histograms).
 - [ ] Gradient-based metrics: pull back the moving gradients through the transform (rotations).
+
+## Interpolation
+
+- [ ] Smart interpolation of sparse ROIs (labelled on some slices only), possibly guided by image cues
+  (gradients); literature search needed first (shape-based, registration-based, image-guided propagation).
 
 ## Command line interface
 

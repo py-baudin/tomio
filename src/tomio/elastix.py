@@ -1150,15 +1150,19 @@ class TransformBSpline(Transform):
     schedule: grid spacing factor at pyramid level k: schedule ** k (as Elastix's default GridSpacingSchedule);
         the displacement of each level initializes the (finer) grid of the next level; 1: same grid at all levels
     bending: weight of the bending energy penalty (smoothness regularization, relative to the metric)
+    axis: axis of the fixed image along which there is no displacement (e.g. 2: in-plane deformation only, slices
+        stay slices, as needed by ROIs drawn on some slices); None: displacement along all axes
     grid: control grid (dict: origin, spacing, shape, direction), set from the fixed image by `setup`
     init: initial parameters (displacements of the control points, mm)
 
-    parameters: displacements (ndim x number of control points), in mm
+    parameters: displacement components along the fixed image axes (number of components x number of control
+        points), in mm
     """
 
     is_global = False
 
-    def __init__(self, grid_spacing=20.0, schedule=2.0, bending=0.0, grid=None, init=None):
+    def __init__(self, grid_spacing=20.0, schedule=2.0, bending=0.0, axis=None, grid=None, init=None):
+        self.axis = None if axis is None else int(axis)
         self.grid_spacing = grid_spacing
         self.schedule = float(schedule)
         self.bending = float(bending)
@@ -1171,7 +1175,7 @@ class TransformBSpline(Transform):
         grid = None if self.grid is None else {key: _tolist(value) for key, value in self.grid.items()}
         return {
             "grid_spacing": _tolist(self.grid_spacing), "schedule": self.schedule, "bending": self.bending,
-            "grid": grid, "init": _tolist(self._init),
+            "axis": self.axis, "grid": grid, "init": _tolist(self._init),
         }
 
     def setup(self, geometry, level=0):
@@ -1191,6 +1195,16 @@ class TransformBSpline(Transform):
     def ncontrol(self):
         return int(np.prod(self.grid["shape"]))
 
+    @property
+    def components(self):
+        """fixed image axes along which there is a displacement"""
+        return [a for a in range(len(self.grid["shape"])) if a != self.axis]
+
+    @property
+    def basis(self):
+        """world directions of the displacement components (ndim x number of components)"""
+        return self.grid["direction"][:, self.components]
+
     def control_points(self):
         """world coordinates of the control points"""
         shape = self.grid["shape"]
@@ -1204,8 +1218,8 @@ class TransformBSpline(Transform):
         ):
             return parameters
         shape = tuple(self.grid["shape"])
-        disp = previous.displacement(parameters, self.control_points())
-        coeffs = [bspline_coefficients(disp[:, a].reshape(shape), 3) for a in range(len(shape))]
+        disp = previous.displacement(parameters, self.control_points()) @ self.basis
+        coeffs = [bspline_coefficients(disp[:, a].reshape(shape), 3) for a in range(disp.shape[1])]
         return np.concatenate([c.ravel() for c in coeffs])
 
     def init(self, ndim):
@@ -1213,7 +1227,7 @@ class TransformBSpline(Transform):
             raise ValueError("TransformBSpline: no control grid (call `setup` with the fixed image geometry)")
         if self._init is not None:
             return self._init
-        return np.zeros(ndim * self.ncontrol)
+        return np.zeros(len(self.components) * self.ncontrol)
 
     def grid_coordinates(self, points):
         """control grid coordinates of points (clipped: the 4 taps of each point stay in the grid)"""
@@ -1246,28 +1260,29 @@ class TransformBSpline(Transform):
             weights = weights * w.reshape(newshape)
         return flat.reshape(npoint, -1), weights.reshape(npoint, -1)
 
+    def _displacement(self, coeffs, flat, weights):
+        """world displacement from the component coefficients"""
+        local = np.stack([(coeffs[a][flat] * weights).sum(axis=1) for a in range(len(coeffs))], axis=1)
+        return local @ self.basis.T
+
     def displacement(self, parameters, points, chunk=2**15):
         """displacement u(x) at points"""
-        ndim = points.shape[1]
-        coeffs = np.reshape(parameters, (ndim, -1))
+        coeffs = np.reshape(parameters, (len(self.components), -1))
         if len(points) <= chunk:
-            flat, weights = self.weights(points)
-            return np.stack([(coeffs[a][flat] * weights).sum(axis=1) for a in range(ndim)], axis=1)
+            return self._displacement(coeffs, *self.weights(points))
         disp = np.empty(points.shape)
         for start in range(0, len(points), chunk):
             index = slice(start, start + chunk)
-            flat, weights = self._weights_of(points[index])
-            disp[index] = np.stack([(coeffs[a][flat] * weights).sum(axis=1) for a in range(ndim)], axis=1)
+            disp[index] = self._displacement(coeffs, *self._weights_of(points[index]))
         return disp
 
     def transform(self, parameters, points, jac=False, **kwargs):
         if not jac:
             return points + self.displacement(parameters, points)
-        ndim = points.shape[1]
         flat, weights = self.weights(points)
-        coeffs = np.reshape(parameters, (ndim, -1))
-        disp = np.stack([(coeffs[a][flat] * weights).sum(axis=1) for a in range(ndim)], axis=1)
-        return points + disp, SparseJacobian(flat, weights, self.ncontrol, ndim)
+        coeffs = np.reshape(parameters, (len(self.components), -1))
+        disp = self._displacement(coeffs, flat, weights)
+        return points + disp, SparseJacobian(flat, weights, self.ncontrol, self.basis)
 
     def penalty(self, parameters, gradient=False):
         """bending energy: weight x mean squared second derivatives of the displacement at the control points"""
@@ -1275,7 +1290,8 @@ class TransformBSpline(Transform):
             return (0.0, np.zeros(len(parameters))) if gradient else 0.0
         shape = tuple(self.grid["shape"])
         ndim = len(shape)
-        coeffs = np.reshape(parameters, (ndim,) + shape)
+        ncomp = len(self.components)
+        coeffs = np.reshape(parameters, (ncomp,) + shape)
         spacing = self.grid["spacing"]
         norm = self.bending / self.ncontrol
         energy = 0.0
@@ -1283,7 +1299,7 @@ class TransformBSpline(Transform):
         for i in range(ndim):
             for j in range(i, ndim):
                 factor = norm * (1 if i == j else 2) / (spacing[i] * spacing[j]) ** 2
-                for a in range(ndim):
+                for a in range(ncomp):
                     diff = _second_difference(coeffs[a], i, j)
                     if diff is None:
                         continue
@@ -1332,18 +1348,19 @@ def _second_difference_adjoint(residual, i, j, shape):
 
 
 class SparseJacobian:
-    """jacobian of the transformed points w/r to B-spline coefficients: point n, axis a depends on the
-    coefficients (a, flat[n, t]) with weights[n, t]"""
+    """jacobian of the transformed points w/r to B-spline coefficients: the displacement of point n along the
+    world direction basis[:, a] depends on the coefficients (a, flat[n, t]) with weights[n, t]"""
 
-    def __init__(self, flat, weights, ncontrol, ndim):
-        self.flat, self.weights, self.ncontrol, self.ndim = flat, weights, ncontrol, ndim
+    def __init__(self, flat, weights, ncontrol, basis):
+        self.flat, self.weights, self.ncontrol, self.basis = flat, weights, ncontrol, np.asarray(basis)
 
     def rmatvec(self, gpoints, valid=None):
         """J^T g: gpoints (nvalid x ndim) gradient w/r to the (valid) points -> gradient w/r to the parameters"""
         flat, weights = (self.flat, self.weights) if valid is None else (self.flat[valid], self.weights[valid])
+        glocal = gpoints @ self.basis
         grad = [
-            np.bincount(flat.ravel(), weights=(weights * gpoints[:, a, np.newaxis]).ravel(), minlength=self.ncontrol)
-            for a in range(self.ndim)
+            np.bincount(flat.ravel(), weights=(weights * glocal[:, a, np.newaxis]).ravel(), minlength=self.ncontrol)
+            for a in range(glocal.shape[1])
         ]
         return np.concatenate(grad)
 

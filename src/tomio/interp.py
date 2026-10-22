@@ -124,7 +124,8 @@ def interpolate_roi(ref, roi, *, disjoint=True, axis="auto", method=None, backen
 
     when downsampling: use nearest nonzero slice
     args:
-        disjoint: if upsampling, keep slices disjoint (no interpolation in the slice axis)
+        disjoint: keep slices disjoint: no interpolation in the slice axis when upsampling, and each ROI slice
+            goes to a single `ref` slice (also with tilted geometries, whose rounding would split it otherwise)
         axis: slice axis ("auto": guessed from the ROI)
         method: None: each ROI voxel is copied to the nearest `ref` voxel(s)
             interpolation method (e.g. "spline1", "spline3"): higher quality upsampling
@@ -181,8 +182,16 @@ def interpolate_roi(ref, roi, *, disjoint=True, axis="auto", method=None, backen
             [np.ravel(coords[d, :, NAX] + pix[d, NAX]) for d in range(ndim)]
         )
 
+    if disjoint:
+        # whole slices: all the voxels of a ROI slice go to the same `ref` slice (along the `ref` axis closest
+        # to the ROI slice axis): the one of their mean position
+        ref_axis = int(np.argmax(np.abs(Tref[:ndim, axis])))
+        _, inverse = np.unique(nonzero[axis], return_inverse=True)
+        coords = np.array(coords, dtype=float)
+        coords[ref_axis] = (np.bincount(inverse, weights=coords[ref_axis]) / np.bincount(inverse))[inverse]
+
     # round to nearest grid coordinates
-    indices = (coords + 0.5).astype(int)
+    indices = np.floor(coords + 0.5).astype(int)
 
     # remove indices outside volume
     valid = np.all((indices.T >= 0) & (indices.T < new.shape), axis=1)

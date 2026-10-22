@@ -43,6 +43,23 @@ def test_interpolate_roi_sparse_slices_downsampling():
     assert set(np.unique(nearest)) == {0, 2}
 
 
+def test_interpolate_roi_sparse_slices_tilted():
+    # slightly tilted target: each labelled slice must go to a single target slice (rounding alone splits it)
+    roi = Volume(np.zeros((40, 40, 24), dtype=np.uint8), spacing=[1, 1, 5])
+    for label, z in [(1, 4), (2, 8), (3, 12), (4, 16)]:
+        roi[5:35, 5:35, z] = label
+    angle = 0.03  # rad, about x
+    rotation = np.array([[1, 0, 0], [0, np.cos(angle), -np.sin(angle)], [0, np.sin(angle), np.cos(angle)]])
+    # origin: the labelled slice z = 20 mm maps across the rounding boundary between target slices 2 and 3
+    ref = Volume(np.zeros((40, 40, 13)), spacing=[1, 1, 9.6], origin=[0, 0, -4.6], transform=rotation.T)
+    out = interp.interpolate_roi(ref, roi)
+    for label in [1, 2, 3, 4]:
+        assert len(set(np.nonzero(out == label)[2])) == 1
+    # not disjoint: voxel by voxel rounding (the previous behaviour) splits some slices
+    split = interp.interpolate_roi(ref, roi, disjoint=False)
+    assert any(len(set(np.nonzero(split == label)[2])) > 1 for label in [1, 2, 3, 4])
+
+
 SHIFTED = Volume(np.zeros((10, 10, 10)), origin=(0.5, 0.3, 0))
 
 

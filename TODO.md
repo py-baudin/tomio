@@ -13,8 +13,7 @@ Remaining work and future features. Details, measurements and history: `PLAN_ela
 - [ ] NGF metric: drifts by a near-uniform translation on real data (not penalized by the bending energy);
   gradients of thick-slice images.
 - [ ] Runtime: 40–80 s for rigid + B-spline on dixon → T1 (SimpleElastix: 22 s).
-- [ ] MIND metric (Heinrich et al., Medical Image Analysis 2012): modality independent neighbourhood descriptor,
-  as a multi-channel image per pyramid level, compared by mean squared difference.
+- [x] MIND metric (Heinrich et al., Medical Image Analysis 2012): done (`"mind"`).
 - [ ] Export to `sitk.BSplineTransform` (fast resampling), `deformation_field()`, Jacobian determinant (folding check).
 - [ ] ROI warping through B-spline transforms (`warp_roi`): a z deformation spreads a labelled slice onto several
   output slices; keep the whole-slice logic of `tomio.resample(method="roi")` (one labelled slice per output slice).

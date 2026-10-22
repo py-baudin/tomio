@@ -1473,7 +1473,8 @@ def textured_pair(shape=(48, 48), amplitude=1.0, period=32.0, noise=0.02, seed=0
 
 @pytest.mark.parametrize(
     "metric, contrast, tolerance",
-    [("mse", False, 0.2), ("mi", False, 0.2), ("mi", True, 0.25), ("ngf", False, 0.25), ("ngf", True, 0.25)],
+    [("mse", False, 0.2), ("mi", False, 0.2), ("mi", True, 0.25), ("ngf", False, 0.25), ("ngf", True, 0.25),
+     ("mind", False, 0.25), ("mind", True, 0.35)],
 )
 def test_register_bspline(metric, contrast, tolerance):
     """recovery of a known small smooth deformation (images aligned beforehand, e.g. by a rigid stage)"""
@@ -1486,7 +1487,7 @@ def test_register_bspline(metric, contrast, tolerance):
     assert error.mean() < tolerance * np.linalg.norm(u[inner], axis=1).mean()
 
 
-@pytest.mark.parametrize("metric", ["mse", "mi", "ngf"])
+@pytest.mark.parametrize("metric", ["mse", "mi", "ngf", "mind"])
 def test_register_bspline_identical_textured(metric):
     """identical images: (almost) no deformation"""
     fixed, _, points, _ = textured_pair()
@@ -1703,3 +1704,57 @@ def test_warp_roi_whole_slices():
     trans = ex.Transformation("rigid", target, [0.02, 0.0, 0.0, 0.0, 0.0, 0.0])
     out = ex.warp_roi(roi, trans(), target).reshape(target.shape)
     assert len([k for k in range(4) if out[..., k].any()]) == 1
+
+
+def test_bending_grid_independent():
+    """the bending penalty of a given smooth displacement hardly depends on the grid spacing"""
+    geometry = ex.Geometry((100, 100, 40), spacing=(1, 1, 2.5))
+
+    def field(points):
+        u = np.zeros_like(points)
+        u[:, 0] = 3 * np.sin(2 * np.pi * points[:, 1] / 80)
+        u[:, 1] = 3 * np.cos(2 * np.pi * points[:, 0] / 80) * np.sin(2 * np.pi * points[:, 2] / 120)
+        return u
+
+    penalties = []
+    for spacing in [20, 10, 5]:
+        transform = ex.TransformBSpline(grid_spacing=spacing, bending=1.0)
+        transform.setup(geometry)
+        shape = tuple(transform.grid["shape"])
+        disp = field(transform.control_points())
+        coeffs = np.concatenate([ex.bspline_coefficients(disp[:, a].reshape(shape), 3).ravel() for a in range(3)])
+        penalties.append(transform.penalty(coeffs))
+    assert max(penalties) / min(penalties) < 1.5
+    # (100 mm)^2 x mean squared second derivatives: analytic ~3.5, discretization (padding) included
+    assert 2 < penalties[1] < 8
+
+
+# MIND
+
+def test_mind_descriptors():
+    fixed, moving, _, _ = textured_pair((32, 32))
+    reference = ex.mind_descriptors(fixed, (0, 1))
+    assert reference.shape == (4, 32, 32)
+    assert np.allclose(reference.max(axis=0), 1)
+    # invariant to linear intensity mappings
+    assert np.allclose(ex.mind_descriptors(3 * fixed + 2, (0, 1)), reference)
+    # other image: different descriptors
+    assert np.abs(ex.mind_descriptors(moving, (0, 1)) - reference).mean() > 0.05
+
+
+def test_mind_axes():
+    """thick axes (in either image) are excluded from the offsets"""
+    metric = ex.MetricMIND()
+    thin = ex.Image(np.zeros((8, 8, 8)), spacing=(1, 1, 1))
+    thick = ex.Image(np.zeros((8, 8, 8)), spacing=(1, 1, 5))
+    assert metric.axes(thin) == (0, 1, 2)
+    assert metric.axes(thin, thick) == (0, 1)
+
+
+@pytest.mark.parametrize("transform, params", [("translation", [0.3, -0.2]), ("rigid", [0.02, 0.3, -0.2])])
+def test_gradient_mind(transform, params):
+    fixed, moving, _, _ = textured_pair((32, 32))
+    config = {"transform": transform, "metric": "mind", "interpolator": "bspline"}
+    objective = make_objective(fixed, np.exp(-1.5 * moving), config)
+    _, gradient = objective(params, gradient=True)
+    assert np.allclose(gradient, finite_gradient(objective, params), rtol=1e-3, atol=1e-9)

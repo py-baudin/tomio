@@ -1167,7 +1167,11 @@ class TransformBSpline(Transform):
     grid_spacing: control point spacing (mm), scalar or per axis; adjusted so that the grid fits the domain
     schedule: grid spacing factor at pyramid level k: schedule ** k (as Elastix's default GridSpacingSchedule);
         the displacement of each level initializes the (finer) grid of the next level; 1: same grid at all levels
-    bending: weight of the bending energy penalty (smoothness regularization, relative to the metric)
+    bending: weight of the bending energy penalty (smoothness regularization, default 0): the penalty is
+        bending x mean squared second derivatives of the displacement x (100 mm)^2, independent of the grid
+        spacing. It scales as amplitude^2 / wavelength^4 of the deformation: e.g. 2 mm over 100 mm gives ~0.3,
+        2 mm over 30 mm ~ 30. With MI or NGF (costs of order 1), 0.1-1 regularizes smooth deformations
+        (and prevents the exploitation of the MI estimate); MSE costs depend on the intensities.
     axis: axis of the fixed image along which there is no displacement (e.g. 2: in-plane deformation only, slices
         stay slices, as needed by ROIs drawn on some slices); None: displacement along all axes
     grid: control grid (dict: origin, spacing, shape, direction), set from the fixed image by `setup`
@@ -1178,6 +1182,9 @@ class TransformBSpline(Transform):
     """
 
     is_global = False
+
+    # reference length of the bending penalty (mm): weights of order 1 for costs of order 1
+    BENDING_LENGTH = 100.0
 
     def __init__(self, grid_spacing=20.0, schedule=2.0, bending=0.0, axis=None, grid=None, init=None):
         self.axis = None if axis is None else int(axis)
@@ -1311,7 +1318,7 @@ class TransformBSpline(Transform):
         ncomp = len(self.components)
         coeffs = np.reshape(parameters, (ncomp,) + shape)
         spacing = self.grid["spacing"]
-        norm = self.bending / self.ncontrol
+        norm = self.bending * self.BENDING_LENGTH**2 / self.ncontrol
         energy = 0.0
         grad = np.zeros_like(coeffs)
         for i in range(ndim):
@@ -1634,6 +1641,10 @@ class MetricNormalizedGradientFields(Metric):
     def __init__(self, eta=0.01):
         self.eta = eta
 
+    def channel_images(self, image, objective=None):
+        """gradient images (world axes)"""
+        return image.gradient_images()
+
     def measure(self, values1, values2, gradient2=False, eps=(1.0, 1.0), **kwargs):
         """values1, values2: gradients of the fixed and moving images at the samples (nsample x ndim)"""
         r1 = np.sqrt(np.sum(values1**2, axis=1) + eps[0] ** 2)
@@ -1646,6 +1657,70 @@ class MetricNormalizedGradientFields(Metric):
         # d(dot) / d(values2) = n1 / r2 - (n1 . values2) values2 / r2^3
         ddot = n1 / r2[:, np.newaxis] - (dot / r2**2)[:, np.newaxis] * values2
         return cost, -2 / len(dot) * dot[:, np.newaxis] * ddot
+
+
+class MetricMIND(Metric):
+    """Modality independent neighbourhood descriptor (Heinrich et al., Medical Image Analysis 16(7), 2012)
+
+    For each image and each offset r = +/-1 pixel along the (non-thick) axes: patch distance
+    D_r = G_sigma * (I - I(. + r))^2, local variance V = mean_r D_r, descriptor MIND_r = exp(-D_r / V) normalized
+    to a maximum of 1 over r. Metric: mean squared difference of the descriptors (structure, not intensities:
+    for images of different contrasts). Axes thick in either image (spacing >= thick_ratio x the smallest
+    spacing) are excluded, so that both images have the same channels.
+
+    sigma: gaussian patch size (pixels)
+    """
+
+    uses_gradients = True  # multi-channel images (objective path of NGF)
+
+    def __init__(self, sigma=1.0, thick_ratio=2.0):
+        self.sigma = sigma
+        self.thick_ratio = thick_ratio
+
+    def axes(self, *images):
+        """axes used for the offsets: not thick in any image"""
+        thick = np.zeros(images[0].ndim, dtype=bool)
+        for image in images:
+            spacing = np.asarray(image.spacing, dtype=float)
+            thick |= spacing >= self.thick_ratio * spacing.min()
+            thick |= np.array(image.shape) < 3
+        return tuple(int(a) for a in np.flatnonzero(~thick))
+
+    def channel_images(self, image, objective=None):
+        axes = self.axes(objective.fixed, objective.moving) if objective is not None else self.axes(image)
+        key = ("mind", axes, self.sigma)
+        if key not in image._coefficients:
+            descriptors = mind_descriptors(np.asarray(image.array), axes, self.sigma)
+            image._coefficients[key] = [
+                Image(channel, spacing=image.spacing, origin=image.origin, direction=image.direction) for channel in descriptors
+            ]
+        return image._coefficients[key]
+
+    def measure(self, values1, values2, gradient2=False, **kwargs):
+        """values1, values2: descriptors at the samples (nsample x channels)"""
+        diff = values2 - values1
+        cost = np.mean(diff**2)
+        if not gradient2:
+            return cost
+        return cost, 2 * diff / diff.size
+
+
+def mind_descriptors(array, axes, sigma=1.0):
+    """MIND descriptors (one array per offset +/-1 along `axes`)"""
+    array = np.abs(array) if np.iscomplexobj(array) else np.asarray(array, dtype=float)
+    blur = np.zeros(array.ndim)
+    blur[list(axes)] = sigma  # patches along the offset axes only
+    distances = []
+    for axis in axes:
+        for step in (-1, 1):
+            shifted = np.take(array, np.clip(np.arange(array.shape[axis]) + step, 0, array.shape[axis] - 1), axis=axis)
+            distances.append(gaussian_filter((array - shifted) ** 2, blur))
+    distances = np.stack(distances)
+    variance = distances.mean(axis=0)
+    mean = variance.mean()
+    variance = np.clip(variance, 1e-3 * mean + 1e-12, 1e3 * mean + 1e-12)
+    # exp(-D / V) normalized to a maximum of 1: exp(-(D - min D) / V) (no underflow)
+    return np.exp(-(distances - distances.min(axis=0)) / variance)
 
 
 class MetricMutualInformation(Metric):
@@ -1796,6 +1871,7 @@ COMPONENTS = {
         "mse": MetricMeanSquares,
         "mi": MetricMutualInformation,
         "ngf": MetricNormalizedGradientFields,
+        "mind": MetricMIND,
     },
     "optimizer": {
         "auto": OptimizerAuto,
@@ -2075,22 +2151,24 @@ class Objective:
         return float(np.mean(values)) or 1.0
 
     def _call_gradients(self, parameters, gradient=False, **kwargs):
-        """objective with a metric of the image gradients (e.g. NGF)"""
+        """objective with a metric of multi-channel images derived from the images (NGF: gradients, MIND:
+        descriptors), given by `metric.channel_images(image, objective)`"""
         transform_args = {"center": self.center}
         points1, _ = self.sampler(self.fixed)
         points1_moved = self.moved_samples(points1)
         if getattr(self, "_fixed_samples", (None,))[0] is not points1:
-            # fixed gradients at the samples (unchanged until the samples change)
-            values1 = np.stack([self.interpolator(component, points1) for component in self.fixed.gradient_images()], axis=1)
+            # fixed channels at the samples (unchanged until the samples change)
+            channels = self.metric.channel_images(self.fixed, self)
+            values1 = np.stack([self.interpolator(component, points1) for component in channels], axis=1)
             eta = getattr(self.metric, "eta", 1.0)
             eps = (eta * self._edge_scale(self.fixed), eta * self._edge_scale(self.moving))
             self._fixed_samples = (points1, values1, eps)
         _, values1, eps = self._fixed_samples
         metric_args = {"eps": eps, **kwargs}
         penalty = getattr(self.transform, "penalty", None)
-        components = self.moving.gradient_images()
+        components = self.metric.channel_images(self.moving, self)
 
-        # samples outside the moving image are kept with a zero gradient (no alignment): discarding them would
+        # samples outside the moving image are kept with zero channels (e.g. no alignment for NGF): discarding them would
         # let the transform improve the cost by pushing badly aligned samples out of the image
         if not gradient:
             points2 = self.transform(parameters, points1_moved, **transform_args)

@@ -22,6 +22,8 @@
 - Changed: pyramid levels have isotropic voxels along all reduced axes.
 - Changed: faster B-spline stages (closed-form cubic weights, cached weights and moved samples).
 - Added: B-spline option `axis` (no displacement along that axis, e.g. in-plane only).
+- Changed: B-spline `bending` weight relative to (100 mm)^2 (1 = former 1e4), grid independent.
+- Added: elastix metric "mind" (modality independent neighbourhood descriptor, Heinrich 2012).
 - Fixed: `warp_roi` keeps whole slices (one output slice per labelled ROI slice).
 - Fixed: `resample(method="roi")` keeps whole slices with tilted geometries (`disjoint=True`).
 - Fixed: `resample(method="roi")` rounding of negative coordinates.

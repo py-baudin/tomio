@@ -14,7 +14,10 @@ Remaining work and future features. Details, measurements and history: `PLAN_ela
   gradients of thick-slice images.
 - [ ] Runtime: 40–80 s for rigid + B-spline on dixon → T1 (SimpleElastix: 22 s).
 - [x] MIND metric (Heinrich et al., Medical Image Analysis 2012): done (`"mind"`).
-- [ ] Export to `sitk.BSplineTransform` (fast resampling), `deformation_field()`, Jacobian determinant (folding check).
+- [x] `deformation_field()`, Jacobian determinant, `check_folding()`: done (real data, bending 1: no folding,
+  determinant 0.94–1.05).
+- [ ] Analytic B-spline spatial Jacobian (finite differences: 44 s on the 2.9 M T1 voxels).
+- [ ] Export to `sitk.BSplineTransform` (fast resampling).
 - [ ] ROI warping through B-spline transforms (`warp_roi`): a z deformation spreads a labelled slice onto several
   output slices; keep the whole-slice logic of `tomio.resample(method="roi")` (one labelled slice per output slice).
   Simple fix available: in-plane deformation only (`{"type": "bspline", "axis": 2}`); general case still to do.

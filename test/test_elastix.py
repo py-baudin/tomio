@@ -1758,3 +1758,61 @@ def test_gradient_mind(transform, params):
     objective = make_objective(fixed, np.exp(-1.5 * moving), config)
     _, gradient = objective(params, gradient=True)
     assert np.allclose(gradient, finite_gradient(objective, params), rtol=1e-3, atol=1e-9)
+
+
+# folding check (Jacobian determinant)
+
+def test_jacobian_global():
+    geometry = ex.Geometry((6, 5, 4), spacing=(1, 2, 3))
+    A = np.array([[1.1, 0.1, 0.0], [0.0, 0.9, 0.2], [0.05, 0.0, 1.2]])
+    affine = ex.Transformation("affine", geometry, np.r_[A.ravel(), [1.0, 2.0, 3.0]])
+    assert np.allclose(ex.spatial_jacobian(affine)[0], affine.affine()[0])
+    det = ex.jacobian_determinant(affine)
+    assert isinstance(det, io.Volume) and det.shape == (6, 5, 4)
+    assert np.allclose(det, np.linalg.det(A))
+    # rigid: volume preserving; sequence: product
+    rigid = rigid_transformation(geometry)
+    assert np.allclose(ex.jacobian_determinant(rigid), 1)
+    sequence = ex.TransformationSequence([rigid, affine])
+    assert np.allclose(ex.jacobian_determinant(sequence), np.linalg.det(A))
+    assert ex.check_folding(sequence).ok
+
+
+def test_jacobian_bspline():
+    geometry = ex.Geometry((20, 16), spacing=(1.0, 1.5))
+    transform = ex.TransformBSpline(grid_spacing=5)
+    transform.setup(geometry)
+    zero = ex.Transformation(transform, geometry, transform.init(2))
+    assert np.allclose(ex.jacobian_determinant(zero), 1)
+    # linear displacement u = (0.1 x, -0.2 y): reproduced by cubic B-splines, det = 1.1 x 0.8
+    control = transform.control_points()
+    params = np.r_[0.1 * control[:, 0], -0.2 * control[:, 1]]
+    linear = ex.Transformation(transform, geometry, params)
+    det = ex.jacobian_determinant(linear)
+    assert isinstance(det, ex.Image) and np.allclose(det, 1.1 * 0.8)
+    field = ex.deformation_field(linear)
+    assert field.shape == (20, 16, 2)
+    assert np.allclose(field.reshape(-1, 2), np.c_[0.1, -0.2] * geometry.points)
+
+
+def test_check_folding():
+    geometry = ex.Geometry((24, 24))
+    transform = ex.TransformBSpline(grid_spacing=4)
+    transform.setup(geometry)
+    # one control point displaced by 20 mm along x: max du/dx = 20 x max|beta3'| x beta3(0) / 4 mm = 1.67, folding
+    params = np.zeros(transform.init(2).size)
+    params[np.ravel_multi_index((4, 4), tuple(transform.grid["shape"]))] = 20.0
+    check = ex.check_folding(ex.Transformation(transform, geometry, params))
+    assert not check.ok and check.folded > 0 and check.min <= 0
+    assert np.isclose(check.fraction, check.folded / 24**2)
+    # small displacements: no folding
+    small = ex.check_folding(ex.Transformation(transform, geometry, 0.1 * params))
+    assert small.ok and 0 < small.min < 1 < small.max
+    # mask: only the masked points
+    mask = np.zeros((24, 24), dtype=bool)
+    mask[:2, :2] = True
+    masked = ex.check_folding(ex.Transformation(transform, geometry, params), mask=mask)
+    assert masked.folded <= 4
+    # other grid
+    ref = ex.Image(np.zeros((12, 12)), spacing=2.0)
+    assert ex.check_folding(ex.Transformation(transform, geometry, params), ref=ref).determinant.shape == (12, 12)

@@ -9,6 +9,7 @@ usage:
     from tomio import elastix
     registered, trans = elastix.register(fixed, moving, transform="rigid", metric="mi", return_transform=True)
     roi_registered = elastix.transform(trans, roi, ref=fixed, method="roi")
+    elastix.check_folding(trans).ok  # deformable transformations: invertible (Jacobian determinant > 0)
 
 configuration: see `Config` and `Config.describe()`
 """
@@ -178,9 +179,95 @@ def _apply(transformation, moving, *, geometry=None, method=None, label=None):
         if not np.issubdtype(moving.array.dtype, np.inexact):
             values = np.rint(values).astype(moving.array.dtype)
 
+    return _output(values, geometry, label=label)
+
+
+def _output(values, geometry, label=None):
+    """array on a grid -> tomio Volume (3d) or Image (2d)"""
     if geometry.ndim == 3:
         return _volume.Volume(values, spacing=geometry.spacing, origin=geometry.origin, transform=geometry.direction.T)
     return Image(values, spacing=geometry.spacing, origin=geometry.origin, direction=geometry.direction, label=label)
+
+
+def _output_geometry(transformation, ref=None):
+    transformation = as_transformation(transformation)
+    if ref is not None:
+        transformation = transformation.with_geometry(Image(ref, label="reference").geometry)
+    return transformation, transformation.geometry
+
+
+def spatial_jacobian(transformation, points=None, step=1e-2):
+    """spatial Jacobian dT/dx of a transformation at points (npoint x ndim x ndim, world axes): finite
+    differences along the grid axes, central inside the grid and one-sided at its borders (exact for global
+    transforms, O(step^2) inside for B-splines)
+
+    points: world points (default: the points of the transformation's grid)
+    step: finite difference step (pixels of the transformation's grid)
+    """
+    transformation = as_transformation(transformation)
+    geometry = transformation.geometry
+    points = geometry.points if points is None else np.atleast_2d(np.asarray(points, dtype=float))
+    coords = geometry.to_coords(points)
+    ndim = points.shape[1]
+    jac = np.empty((len(points), ndim, ndim))
+    for k in range(ndim):
+        upper = max(geometry.shape[k] - 1, 1)  # single-slice axes: forward differences
+        low = np.where(coords[:, k] - step >= 0, coords[:, k] - step, coords[:, k])
+        high = np.where(coords[:, k] + step <= upper, coords[:, k] + step, coords[:, k])
+        c1, c2 = coords.copy(), coords.copy()
+        c1[:, k], c2[:, k] = low, high
+        delta = transformation(geometry.to_points(c2)) - transformation(geometry.to_points(c1))
+        jac[:, :, k] = delta / (high - low)[:, np.newaxis]
+    # d/dcoords -> d/dx
+    return jac @ np.linalg.inv(geometry.matrix)
+
+
+def jacobian_determinant(transformation, ref=None, chunk=2**18):
+    """determinant of the spatial Jacobian of a transformation on its grid (or on `ref`): local volume ratio
+    (moving / fixed); <= 0 where the deformation folds (not invertible), 1 where it preserves volumes
+
+    returns: tomio Volume (3d) or Image (2d)
+    """
+    transformation, geometry = _output_geometry(transformation, ref)
+    points = geometry.points
+    det = np.empty(len(points))
+    for start in range(0, len(points), chunk):
+        index = slice(start, start + chunk)
+        det[index] = np.linalg.det(spatial_jacobian(transformation, points[index]))
+    return _output(det.reshape(tuple(geometry.shape)), geometry, label="jacobian")
+
+
+def check_folding(transformation, ref=None, mask=None):
+    """folding check of a transformation: statistics of the Jacobian determinant on its grid (or on `ref`)
+
+    mask: boolean array on the grid, points to check (default: all)
+
+    returns: namespace with `determinant` (Volume or Image), `min`, `max`, `folded` (number of points with a
+        determinant <= 0), `fraction` (folded fraction) and `ok` (no folding)
+    """
+    determinant = jacobian_determinant(transformation, ref=ref)
+    values = np.asarray(determinant)
+    if mask is not None:
+        values = values[np.asarray(mask, dtype=bool)]
+    folded = int(np.count_nonzero(values <= 0))
+    return SimpleNamespace(
+        determinant=determinant,
+        min=float(values.min()) if values.size else np.nan,
+        max=float(values.max()) if values.size else np.nan,
+        folded=folded,
+        fraction=folded / max(values.size, 1),
+        ok=folded == 0,
+    )
+
+
+def deformation_field(transformation, ref=None):
+    """displacement T(x) - x at the points of the transformation's grid (or of `ref`), world coordinates (mm)
+
+    returns: array (grid shape + (ndim,))
+    """
+    transformation, geometry = _output_geometry(transformation, ref)
+    points = geometry.points
+    return (transformation(points) - points).reshape(tuple(geometry.shape) + (geometry.ndim,))
 
 
 def warp_labels(labelmap, points):
@@ -1255,9 +1342,10 @@ class TransformBSpline(Transform):
         return np.zeros(len(self.components) * self.ncontrol)
 
     def grid_coordinates(self, points):
-        """control grid coordinates of points (clipped: the 4 taps of each point stay in the grid)"""
+        """control grid coordinates of points (clipped to the domain [1, shape - 2): the 4 taps of each point stay
+        in the grid)"""
         coords = (points - self.grid["origin"]) @ self.grid["direction"] / self.grid["spacing"]
-        return np.clip(coords, 1, self.grid["shape"] - 3)
+        return np.clip(coords, 1, np.nextafter(self.grid["shape"] - 2.0, 0))
 
     def weights(self, points):
         """flat control point indices and weights of the points (npoint x 4^ndim), cached for the last

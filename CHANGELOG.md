@@ -28,6 +28,8 @@
 - Fixed: `resample(method="roi")` keeps whole slices with tilted geometries (`disjoint=True`).
 - Fixed: `resample(method="roi")` rounding of negative coordinates.
 - Fixed: constant sample set; samples leaving the moving image are padded, no longer discarded.
+- Added: `spatial_jacobian`, `jacobian_determinant`, `check_folding` (folding check), `deformation_field`.
+- Fixed: B-spline displacement frozen in the last control cell of each axis (grid coordinates clipped too early).
 - Added: benchmarks `phantom_elastix.py`, `bench_elastix_ffd.py` (synthetic pair with known deformation).
 - Known limitation: on real data (dixon → T1), the B-spline stage does not yet improve on the rigid result
   (see `TODO.md`).

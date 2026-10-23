@@ -1,6 +1,6 @@
 # tomio
 
-I/O utilities for medical images: image volumes (thin wrapper over SimpleITK), interpolation, label files (ITK-SNAP, FreeSurfer, 3D Slicer) and config files (JSON, YAML, TOML).
+I/O utilities for medical images: image volumes (thin wrapper over SimpleITK), interpolation, registration, label files (ITK-SNAP, FreeSurfer, 3D Slicer) and config files (JSON, YAML, TOML).
 
 ## Installation
 
@@ -8,6 +8,7 @@ I/O utilities for medical images: image volumes (thin wrapper over SimpleITK), i
 pip install tomio
 pip install tomio[interp]   # optional: scipy interpolation backend
 pip install tomio[nibabel]  # optional: conversion to/from nibabel images
+pip install tomio[plot]     # optional: registration figures (matplotlib)
 ```
 
 Requires Python >= 3.10. Reading TOML files on Python 3.10 requires `tomli`.
@@ -26,7 +27,7 @@ cfg = io.read_config("config.yml")
 labels = io.read_labels("labels.txt")
 ```
 
-Modules: `io.volume`, `io.interp`, `io.labelfile`, `io.configfile`.
+Modules: `io.volume`, `io.interp`, `io.elastix` (registration), `io.labelfile`, `io.configfile`.
 
 ## Conventions
 
@@ -174,6 +175,71 @@ labels = io.labelfile.Labels.from_dict(io.read_config("config.json")["labels"]) 
 
 Labels are validated: non-negative integer indices, unique descriptions without `"` or line breaks (`allow_duplicates=True` to allow duplicates), RGB in 0..255, alpha in 0..1. Label files are UTF-8.
 
+## Registration
+
+`tomio.elastix` (aliases in `tomio`): an Elastix-like registration framework in numpy and SimpleITK. A registration
+stage combines a transform, a multi-resolution pyramid, a sampler, an interpolator, a metric and an optimizer;
+transforms map fixed image points to the moving image.
+
+```python
+import tomio as io
+from tomio import elastix
+
+# rigid, mutual information (images of different contrasts)
+registered, trans = io.register(fixed, moving, transform="rigid", metric="mi", return_transform=True)
+
+# successive stages: rigid, then free-form deformation (B-spline): T(x) = T2(T1(x))
+stages = [
+    {"transform": "rigid", "metric": "mi"},
+    {"transform": {"type": "bspline", "grid_spacing": 20, "bending": 1.0}, "metric": "mi"},
+]
+registered, trans = io.register(fixed, moving, stages, return_transform=True)
+
+# apply to other images (same grid as `moving`): images, label maps, ROIs drawn on some slices
+roi_fixed = io.warp(trans, roi, ref=fixed, method="roi")
+labels_fixed = io.warp(trans, labelmap, ref=fixed, method="labels")
+
+# save / load (YAML or JSON)
+io.write_config("transform.yml", trans.serialize())
+trans = elastix.as_transformation(io.read_config("transform.yml"))
+
+print(elastix.Config.describe())  # all components and options
+```
+
+- Sections: `transform` (`translation`, `rigid`, `affine`, `bspline`), `pyramid`, `sampler`, `interpolator`,
+  `metric` (`mse`, `mi`, `ngf`, `mind`), `optimizer` (`auto`, `lbfgs`, `sgd`), `initialize`, `resample`. Each
+  section is a type name, or a dict with `type` and options; a list of settings runs successive stages.
+- Same contrast: `mse`. Different contrasts: `mi` (mutual information), `ngf` (normalized gradient fields) or
+  `mind` (modality independent neighbourhood descriptor).
+- B-splines: `grid_spacing` (mm, final level; coarser at the coarser pyramid levels), `bending` (smoothness:
+  0.1–1 with `mi`, `ngf`, `mind`), `axis=2` for in-plane deformations only (slices stay slices, e.g. for ROIs drawn
+  on some slices). Run them after a converged rigid stage.
+- Optimizers: `auto` uses `lbfgs` for global transforms and `sgd` (new random samples every iteration, as Elastix)
+  for B-splines.
+- Masks: `register(..., fixed_mask=mask)` draws samples inside the mask only.
+
+### Deformations and sparse ROIs
+
+```python
+check = io.check_folding(trans)  # Jacobian determinant on the fixed grid
+check.ok, check.min, check.max  # no folding: determinant > 0 everywhere
+field = elastix.deformation_field(trans)  # displacement (mm), grid shape + (3,)
+itk_transform = elastix.to_sitk(trans)  # SimpleITK transform (affine, B-spline, composite)
+
+# ROI drawn on some slices -> all slices between them (labels interpolated as signed distances)
+roi_full = io.interpolate_slices(roi)
+roi_full = io.interpolate_slices(roi, image=moving, method="registration")  # guided by the image
+```
+
+`method="registration"` warps the signed distances along the image through 2D registrations of consecutive slices
+(slower, more accurate across large gaps).
+
+### Plots
+
+`tomio.elastix_plot` (requires `tomio[plot]`, matplotlib): `plot_registration(fixed, moving, trans)`: slices of the
+fixed, moving and registered images, overlays, checkerboard and, for deformations, the deformed grid;
+`plot_levels(info)`: cost per pyramid level (`info` from `elastix.Elastix(config).execute(fixed, moving)`).
+
 ## Config files
 
 ```python
@@ -195,6 +261,13 @@ tomio convert vol.mha vol.nii.gz --dtype float32 --compression-level 9
 tomio resample vol.nii.gz out.nii.gz --spacing 1 1 1    # new spacing
 tomio resample labels.nii.gz out.nii.gz --like ref.nii.gz --method labels
 tomio info vol.nii.gz --metadata                        # header: shape, pixel type, geometry
+
+# registration (output name templates: <moving>, <fixed>, <date>, <datetime>)
+tomio register-config config.yml                       # template settings (rigid, then B-spline) to edit
+tomio register t1.nii.gz dixon.nii.gz -c config.yml -o "<moving>_on_<fixed>" --save-transform --plot
+tomio register t1.nii.gz dixon.nii.gz --transform rigid --metric mi
+tomio warp transform_dixon.yml roi.nii.gz --method roi -o roi_on_t1.nii.gz
+tomio interpolate-slices roi.nii.gz roi_full.nii.gz --image dixon.nii.gz --drop-label 14
 ```
 
 Existing output files are not overwritten unless `--force` is given. See `tomio COMMAND --help`.

@@ -2,118 +2,66 @@
 
 ## Unreleased
 
-- Added `tomio.elastix`: registration framework imported from mutools (`mutools.registration.elastix`), with its test suite.
+### Added
 
-### tomio.elastix: free-form deformation (phase 5 of `PLAN_elastix.md`, in progress)
+- `elastix.Geometry.to_volume`, `from_volume`: conversion to/from `volume.Geometry`.
+- README section "Registration".
 
-- New transform `"bspline"` (`TransformBSpline`): cubic B-spline displacement on a control grid fitted to the
-  fixed image, grid spacing schedule across the pyramid levels (`schedule`), bending energy penalty (`bending`).
-- New metric `"ngf"` (normalized gradient fields), multimodal.
-- `transform(..., method="roi" | "labels")` works for any transform (`warp_roi`, `warp_labels`).
-- The cost gradient uses the image gradient at the moving points and the transposed transform Jacobian
-  (sparse for B-splines).
-- Defaults: `SamplerRandomCoordinates(order=1)`, `OptimizerLBFGS(maxiter=500)`.
-- Added: elastix optimizer "sgd" (stochastic gradient descent, new samples every iteration).
-- Added: `tomio.elastix_plot` (registration figures; optional extra `tomio[plot]`, matplotlib).
-- Added: MI option `limits` (intensity range from percentiles).
-- Added: pyramid option `downsample` (False: smoothing only, as Elastix's default pyramids).
-- Changed: default optimizer "auto" ("lbfgs" for global transforms, "sgd" for B-splines).
-- Changed: B-spline pyramid levels are not reduced below 32 voxels per axis (tiny levels diverged).
-- Changed: pyramid levels have isotropic voxels along all reduced axes.
-- Changed: faster B-spline stages (closed-form cubic weights, cached weights and moved samples).
-- Added: B-spline option `axis` (no displacement along that axis, e.g. in-plane only).
-- Changed: B-spline `bending` weight relative to (100 mm)^2 (1 = former 1e4), grid independent.
-- Added: elastix metric "mind" (modality independent neighbourhood descriptor, Heinrich 2012).
-- Fixed: `warp_roi` keeps whole slices (one output slice per labelled ROI slice).
-- Fixed: `resample(method="roi")` keeps whole slices with tilted geometries (`disjoint=True`).
-- Fixed: `resample(method="roi")` rounding of negative coordinates.
-- Fixed: constant sample set; samples leaving the moving image are padded, no longer discarded.
-- Added: `spatial_jacobian`, `jacobian_determinant`, `check_folding` (folding check), `deformation_field`.
-- Fixed: B-spline displacement frozen in the last control cell of each axis (grid coordinates clipped too early).
-- Added: `elastix.to_sitk` (SimpleITK transform: affine, B-spline, composite), `Transformation.jacobian`
-  (analytic spatial Jacobian, chain rule for sequences).
-- Changed: non-global transforms resample images and label maps with SimpleITK through a displacement field
-  (labels 7x faster on a 2.9 M voxel grid); separable B-spline evaluation of large point sets.
-- Changed: `interpolate_slices` registers slice pairs on 2 pyramid levels with 32 iterations (3x faster, same Dice).
-- Added: SGD option `adaptive` (Elastix's ASGD time adaptation, Klein et al. 2009; off: less accurate on the
-  synthetic benchmark).
-- Added: CLI commands `tomio register` (config file or --transform/--metric, name templates, --save-transform,
-  --plot, masks), `tomio warp`, `tomio interpolate-slices` (--drop-label), `tomio register-config`.
-- Added: top-level aliases `io.register`, `io.warp` (`elastix.transform`), `io.interpolate_slices`,
-  `io.check_folding`.
-- Added: `elastix.interpolate_slices` (sparse ROI slice interpolation: signed distances, optionally guided by
-  registrations of consecutive image slices).
-- Added: benchmarks `phantom_elastix.py`, `bench_elastix_ffd.py` (synthetic pair with known deformation).
-- Known limitation: on real data (dixon → T1), the B-spline stage does not yet improve on the rigid result
-  (see `TODO.md`).
+### Changed
 
-### tomio.elastix: accelerations (phase 4 of `PLAN_elastix.md`)
+- `tomio.elastix` split into a subpackage (same `from tomio import elastix` names).
 
-- Optimized parameters are scaled (rotations and matrix coefficients × the radius of the fixed image):
-  better conditioned optimization (translations were barely optimized before).
-- `lbfgs`: new `xtol` stopping criterion (default 1e-3, ≈ mm), `ftol` 1e-7: far fewer cost evaluations.
-- Mutual information by scatter-add (same result, faster).
-- Pyramid: linear downsampling by default (`order=1`), recursive gaussian smoothing.
-- `SamplerRandomCoordinates(thick_ratio=2.0)`: samples stay on the grid along thick-slice axes.
-- New `initialize` section: `None`, `"geometry"` or `"moments"` (initial translation of the first stage).
-- `Elastix.execute` returns per-level results in `info.levels`.
-- `benchmarks/bench_elastix.py`.
+## 0.2.0
 
-### tomio.elastix: no scipy (phase 3 of `PLAN_elastix.md`)
+Registration module `tomio.elastix`, imported from `mutools.registration.elastix` (not backward compatible).
 
-- scipy is no longer used: B-spline coefficients with SimpleITK (`sitk.BSplineDecomposition`, cached per image),
-  interpolation at points in numpy (values and analytic gradients), pyramid smoothing / resampling / mask
-  dilation with SimpleITK.
-- New default optimizer `"lbfgs"` (numpy L-BFGS); removed the `scipy` and `agd` optimizers.
-- Removed: `parzen1d`, `Image.summary`, `Objective.gradient`, `Objective.callback`, `Elastix.apply`
-  (use `transform`).
+### Added
 
-### tomio.elastix: configuration API (phase 2 of `PLAN_elastix.md`)
+- `tomio.elastix`: Elastix-like registration (numpy + SimpleITK), with its test suite.
+- Configuration sections (transform, pyramid, sampler, ..., resample); `Config.describe()`.
+- Successive stages (list of configs), returned as a `TransformationSequence`.
+- Transform `"bspline"` (free-form deformation): grid schedule, `bending`, `axis`.
+- Metrics `"ngf"` (normalized gradient fields) and `"mind"` (Heinrich 2012).
+- MI option `limits` (intensity range from percentiles).
+- Optimizers `"sgd"` (new samples every iteration) and `"auto"`; SGD option `adaptive`.
+- Section `initialize` (`None`, `"geometry"`, `"moments"`).
+- Pyramid option `downsample` (False: smoothing only).
+- `transform(..., method="roi" | "labels")` for any transform (`warp_roi`, `warp_labels`).
+- `interpolate_slices`: sparse ROI interpolation (shape or registration based).
+- `spatial_jacobian`, `jacobian_determinant`, `check_folding`, `deformation_field`.
+- `to_sitk`: SimpleITK equivalent of a transformation.
+- `tomio.elastix_plot` (optional extra `tomio[plot]`).
+- Top-level aliases `io.register`, `io.warp`, `io.interpolate_slices`, `io.check_folding`.
+- CLI commands `register`, `warp`, `interpolate-slices`, `register-config`.
+- Benchmarks: `bench_elastix.py`, `phantom_elastix.py`, `bench_elastix_ffd.py`.
 
-- New configuration: one section per component (`transform`, `pyramid`, `sampler`, `interpolator`, `metric`,
-  `optimizer`, `resample`), with short type names (`"rigid"`, `"mi"`, ...), options validated against the
-  components; `Config.describe()` lists the types and options; configs from YAML/JSON files.
-  Replaces the flat `{"Transform": "TransformRigid", "TransformRigid": {...}}` settings and `Config.SETTINGS`.
-- `register(fixed, moving, config=None, **sections)`: keyword sections (`transform="rigid", metric="mi"`),
-  `fixed_mask` / `moving_mask`; a list of configs runs successive stages (`TransformationSequence`).
-- `transform(transformations, moving, ref=None, method=None)`: `method` as in `tomio.resample`
-  (`'nearest'`, `'linear'`, `'spline3'`, `'roi'`, `'labels'`), replaces `interpolation_order`; global
-  transforms of 3d images are resampled with `tomio.resample`.
-- `register` and `transform` return tomio `Volume`s for 3d images (with the geometry of the fixed / reference
-  image), `Image`s for 2d images.
-- Serialized transformations: lowercase keys (`transform: {type: rigid, ...}`, `geometry`, `parameters`, `center`);
-  `Transformation(transform, geometry, parameters, center=None)` takes a transform object, name or dict.
+### Changed
 
-### tomio.elastix: fixes and changes (phase 1 of `PLAN_elastix.md`)
+- Results are tomio `Volume`s (3D) or `Image`s (2D).
+- 3D rigid transform: 6 Euler parameters, `R = Rz Rx Ry` (as ITK `Euler3DTransform`).
+- Images have a direction matrix; `Geometry.center` is the pixel grid center.
+- Rotation center fixed on the full resolution fixed image, stored in `Transformation`.
+- Parameters scaled to ~mm (rotations x image radius) for the optimizers.
+- Default optimizer `"auto"`: `lbfgs` (numpy, `xtol`) for global transforms, `sgd` otherwise.
+- Constant sample set per level; samples leaving the moving image are padded.
+- Pyramid: isotropic reduced voxels; B-spline levels >= 32 voxels per axis.
+- `SamplerRandomCoordinates`: linear order, samples on the grid along thick axes.
+- MI by scatter-add; B-spline weights in closed form, cached.
+- B-spline `bending` relative to (100 mm)^2, independent of the grid spacing.
+- Non-global transforms resampled by SimpleITK through a displacement field.
+- Serialized transformations: lowercase keys.
 
-Not backward compatible with `mutools.registration.elastix`:
+### Fixed
 
-- 3D rigid transform: 6 parameters, Euler angles and translation `(ax, ay, az, bx, by, bz)` with `R = Rz @ Rx @ Ry`
-  (as ITK's `Euler3DTransform`). The 7-parameter `(phi, n, b)` form is removed (it was not rigid for `|n| != 1`).
-- `Geometry.center` is the center of the pixel grid (`origin + (shape - 1) / 2 * spacing`), half a pixel off before.
-  The rotation center is computed once on the full resolution fixed image and stored in `Transformation`
-  (`center`, serialized as `"Center"`); `transform(ref=...)` keeps it.
-- Images have a direction matrix (`Geometry.direction`, `Image.direction`, read from `direction` or from tomio's
-  `transform`; `Image.transform` in tomio's convention); serialized geometries include `"direction"` when oblique.
-- `PyramidGaussian`: new defaults (`scale_ratio=2`, `maxlevel=3`, `minsize=8`, `sigma=None`: 0.5 × reduction factor);
-  `minsize` is now the minimum size of each reduced axis; reduced grids have the exact spacing and the same center.
-- Samples outside the moving image (pixel centers ± 0.5 pixel) are discarded instead of counting as 0;
-  `InterpolatorLinear` and `InterpolatorBSpline` extend edge values by default (`mode="nearest"`); the final
-  resampling still fills with 0.
-- `OptimizerGeneric` keeps the samples fixed during the optimization (`resample=True` for the previous behaviour).
-- `Transform.deserialize` no longer converts string settings to `None`.
+- Gradients: linear interpolation spacing, MI normalization, B-spline interpolator.
+- `register(..., reset=False)` reuses the parameters of the previous image.
+- `transform(..., ref=...)`; serialization of transforms with `init` or `axis`.
+- B-spline displacement frozen in the last control cell of each axis.
+- `warp_roi` and `resample(method="roi")` keep whole slices (tilted geometries too).
+- `resample(method="roi")` rounding of negative coordinates.
 
-Fixes:
+### Removed
 
-- `register(..., reset=False)` reuses the parameters of the previous moving image (`init` was ignored).
-- `transform(..., ref=...)` works (it raised `AttributeError`).
-- `serialize()` of rigid/affine transforms with `init`, and of translations with `axis`.
-- Gradients: linear interpolation gradient w.r.t. physical coordinates (missing `1/spacing`), MI gradient with
-  the intensity normalization, B-spline interpolator gradient (wrong shape, O(N²) memory), linear interpolation
-  gradient outside the grid.
-- `SamplerRandomCoordinates` samples the whole image (no 10 % border) and uses the mask.
-- `agd` reverts rejected steps; returns the best point.
-- `Image(image)` keeps the mask of `Image` inputs; `Image.update` no longer modifies the input array;
-  `np.asarray(image, dtype=...)` works; intensity range computed on the masked finite values.
-- MI: no masked arrays; zero-order Parzen window counts values on bin boundaries once.
-- `loglevel` applies to all the module's log messages.
+- scipy dependency; `scipy` and `agd` optimizers.
+- Flat settings (`Config.SETTINGS`), `interpolation_order`, `Elastix.apply`.
+- 7-parameter 3D rigid transform.

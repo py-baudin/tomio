@@ -1,6 +1,6 @@
 """ tests for tomio.elastix
 
-Regression tests of the bugs fixed in phase 1 are labelled with their id in PLAN_elastix.md (B1, B2...).
+Regression tests of the bugs fixed in phase 1 are labelled with their id (B1, B2...).
 """
 import numpy as np
 import pytest
@@ -282,7 +282,7 @@ def test_register_stages():
     assert np.allclose(np.asarray(ex.transform(data, moving)), np.asarray(registered))
 
 
-# regression tests (PLAN_elastix.md, phase 1)
+# regression tests (phase 1 bug fixes)
 
 # B1 (fixed): Elastix.execute ignores `init`
 def test_execute_uses_init():

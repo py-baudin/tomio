@@ -1979,3 +1979,19 @@ def test_register_bspline_adaptive(metric):
     # identical images: (almost) no deformation
     _, trans = ex.register(fixed, fixed, transform={"type": "bspline", "grid_spacing": 8}, metric=metric, optimizer=optimizer, return_transform=True)
     assert np.linalg.norm(trans(points) - points, axis=1).mean() < 0.1
+
+
+def test_geometry_volume_adapter():
+    """elastix Geometry (ITK direction, columns) <-> tomio volume.Geometry (transform, rows)"""
+    direction = ex.euler_to_matrix([0.1, -0.2, 0.3])
+    geometry = ex.Geometry((5, 6, 7), spacing=(1.0, 2.0, 3.0), origin=(4, 5, 6), direction=direction)
+    vgeo = geometry.to_volume()
+    assert isinstance(vgeo, io.Geometry)
+    assert np.allclose(vgeo.transform, direction.T)
+    back = ex.Geometry.from_volume(vgeo)
+    for key in ("shape", "spacing", "origin", "direction"):
+        assert np.allclose(getattr(back, key), getattr(geometry, key))
+    # same points as the tomio volume
+    vol = io.Volume(np.zeros((5, 6, 7)), spacing=vgeo.spacing, origin=vgeo.origin, transform=vgeo.transform)
+    assert ex.Image(vol).geometry.direction.tolist() == back.direction.tolist()
+    assert np.allclose(ex.transform_to_direction(ex.direction_to_transform(direction)), direction)

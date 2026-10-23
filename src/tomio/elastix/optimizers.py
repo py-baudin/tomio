@@ -45,34 +45,24 @@ class OptimizerLBFGS(Optimizer):
 
 
 class OptimizerSGD(Optimizer):
-    """Stochastic gradient descent with new samples at each iteration (as Elastix's stochastic optimizers)
+    """Stochastic gradient descent with new samples at each iteration
 
     Iteration k moves the (scaled) parameters by -gain_k * gradient / max(|gradient|, g0), with
-    gain_k = a / (t_k + 1 + A)^alpha, |.| the largest component and g0 that of the first gradient: no step is larger
+    gain_k = a / (k + 1 + A)^alpha, |.| the largest component and g0 that of the first gradient: no step is larger
     than gain_k (~ mm), and the steps shrink when the gradient becomes smaller than at the start. New samples at
     each iteration avoid fitting the transform to a fixed set of samples (needed for transforms with many
-    parameters, e.g. B-splines); fixed number of iterations.
+    parameters, e.g. B-splines); fixed number of iterations. See "asgd" for Elastix's optimizer.
 
     niter: number of iterations (per pyramid level)
     a, A, alpha: gain sequence (A: stability constant, alpha: decay exponent; 0.602 as in Elastix)
-    adaptive: adaptive time t_k (as Elastix's AdaptiveStochasticGradientDescent, Klein et al. 2009):
-        t_{k+1} = max(0, t_k + f(-cos(g_k, g_{k-1}))), with the sigmoid f from fmin (< 0) to fmax (> 0), f(0) = 0
-        and width omega: the gain decreases when consecutive gradients oppose each other (oscillation around the
-        optimum) and increases again when they agree (still far); False: t_k = k. On the synthetic B-spline
-        benchmark (known deformation), the fixed decay is more accurate (MI 1.14 vs 1.22 mm, MSE 0.37 vs 0.52 mm)
     """
 
-    def __init__(self, niter=256, a=4.0, A=20, alpha=0.602, adaptive=False, omega=0.1, fmax=1.0, fmin=-0.8):
+    def __init__(self, niter=256, a=4.0, A=20, alpha=0.602):
         self.niter, self.a, self.A, self.alpha = niter, a, A, alpha
-        self.adaptive, self.omega, self.fmax, self.fmin = bool(adaptive), omega, fmax, fmin
-
-    def sigmoid(self, x):
-        """Klein's sigmoid: fmin at -inf, 0 at 0, fmax at +inf"""
-        return self.fmin + (self.fmax - self.fmin) / (1 - (self.fmax / self.fmin) * np.exp(-x / self.omega))
 
     def optimize(self, objective, init):
         x = np.asarray(init, dtype=float).copy()
-        cost, norm, previous, time = np.nan, None, None, 0.0
+        cost, norm = np.nan, None
         for k in range(self.niter):
             if k:
                 objective.resample()
@@ -82,14 +72,142 @@ class OptimizerSGD(Optimizer):
                 norm = current
             if not np.isfinite(cost) or max(current, norm) == 0:
                 break
-            x -= self.a / (time + 1 + self.A) ** self.alpha * grad / max(current, norm)
-            if not self.adaptive:
-                time = k + 1.0
-            elif previous is not None:
-                cosine = grad @ previous / max(np.linalg.norm(grad) * np.linalg.norm(previous), 1e-300)
-                time = max(0.0, time + float(self.sigmoid(-cosine)))
-            previous = grad
+            x -= self.a / (k + 1 + self.A) ** self.alpha * grad / max(current, norm)
         return x, OptimResults(fun=cost, nit=k + 1, nfev=k + 1, message="Number of iterations reached", success=True)
+
+
+class OptimizerASGD(Optimizer):
+    """Adaptive stochastic gradient descent, as Elastix's AdaptiveStochasticGradientDescent with automatic
+    parameter estimation (method "Original"; Klein et al., IJCV 2009)
+
+    Iteration k: x -= a / (t_k + A + 1)^alpha * g_k (raw gradients of the cost, new samples at each iteration);
+    adaptive time t_{k+1} = max(0, t_k + f(-g_k . g_{k-1})), f a sigmoid from fmin to fmax with f(0) = 0.
+    At the start of each pyramid level, a, alpha (= 1), fmin, fmax (= 1) and the sigmoid scale omega are
+    estimated from the transform Jacobian at `njacobian` grid points and from `ngradient` pairs of gradients
+    ("exact": `nexact` grid samples; stochastic: the sampler) at random perturbations of the parameters, so that
+    the first steps move the points by about `maxstep`.
+
+    niter: number of iterations (per pyramid level; Elastix's default map: 256)
+    A: stability constant (Elastix: 20)
+    maxstep: largest expected displacement of a step (mm; Elastix's MaximumStepLength, default: mean in-plane
+        spacing of the full resolution fixed and moving images)
+    njacobian: number of Jacobian measurements (default: max(1000, number of parameters), as Elastix)
+    nexact: number of samples of the "exact" gradients (Elastix: 100000)
+    ngradient: number of gradient measurements (default: automatic, at least 2, as Elastix)
+    sigmoid_scale_factor: Elastix's SigmoidScaleFactor (0.1)
+    adaptive: adaptive time (Elastix's UseAdaptiveStepSizes, default true); False: t_k += (fmax + fmin) / 2
+    seed: seed of the parameter perturbations
+    """
+
+    def __init__(self, niter=256, A=20.0, maxstep=None, njacobian=None, nexact=100000, ngradient=None,
+                 sigmoid_scale_factor=0.1, adaptive=True, seed=0):
+        self.niter, self.A, self.maxstep = niter, float(A), maxstep
+        self.njacobian, self.nexact, self.ngradient = njacobian, nexact, ngradient
+        self.sigmoid_scale_factor, self.adaptive, self.seed = sigmoid_scale_factor, bool(adaptive), seed
+        self.default_maxstep = 1.0  # set by the pipeline: mean in-plane spacing of the images
+        self.estimates = []  # estimated settings, per pyramid level
+
+    def estimate(self, objective, x):
+        """Elastix's AutomaticParameterEstimationOriginal: a, alpha, fmin, fmax, omega"""
+        delta = self.maxstep if self.maxstep is not None else self.default_maxstep
+        njacobian = self.njacobian if self.njacobian is not None else max(1000, len(x))
+        TrC, TrCC, maxJJ, maxJCJ = jacobian_terms(objective.jacobian_samples(x, njacobian), len(x))
+        ngradient = self.ngradient
+        if ngradient is None:
+            K = 1.5
+            ngradient = int(np.ceil(8.0 * TrCC / TrC / TrC / (K - 1) / (K - 1))) if TrCC > 1e-14 and TrC > 1e-14 else 2
+            ngradient = max(2, ngradient)
+        sigma4 = delta / np.sqrt(maxJJ) if maxJJ > 1e-14 else 0.0
+        rng = np.random.default_rng(self.seed)
+        gg = ee = 0.0
+        for _ in range(ngradient):
+            perturbed = x + sigma4 * rng.normal(size=len(x))
+            exact = objective.exact_gradient(perturbed, self.nexact)
+            objective.resample()
+            _, approx = objective(perturbed, gradient=True)
+            gg += exact @ exact
+            ee += (exact - approx) @ (exact - approx)
+        gg, ee = gg / ngradient, ee / ngradient
+        sigma1 = np.sqrt(gg / TrC) if gg > 1e-14 and TrC > 1e-14 else 0.0
+        sigma3 = np.sqrt(ee / TrC) if ee > 1e-14 and TrC > 1e-14 else 0.0
+        a_max = self.A * delta / sigma1 / np.sqrt(maxJCJ) if sigma1 > 1e-14 and maxJCJ > 1e-14 else 0.0
+        noisefactor = sigma1**2 / (sigma1**2 + sigma3**2 + 1e-14)
+        estimate = {
+            "a": a_max * noisefactor, "alpha": 1.0, "fmax": 1.0, "fmin": -0.99 + 0.98 * noisefactor,
+            "omega": max(1e-14, self.sigmoid_scale_factor * sigma3**2 * np.sqrt(TrCC)),
+            "maxstep": delta, "ngradient": ngradient, "njacobian": njacobian,
+        }
+        self.estimates.append(estimate)
+        return estimate
+
+    @staticmethod
+    def sigmoid(x, fmin, fmax, omega):
+        """ITK's sigmoid with beta such that f(0) = 0"""
+        beta = omega * np.log(-fmax / fmin)
+        z = np.clip(-(x - beta) / omega, -700, 700)
+        return (fmax - fmin) / (1 + np.exp(z)) + fmin
+
+    def optimize(self, objective, init):
+        x = np.asarray(init, dtype=float).copy()
+        cost, _ = objective(x, gradient=True)  # first evaluation at the start (defines the sample overlap)
+        est = self.estimate(objective, x)
+        time, previous = 0.0, None
+        for k in range(self.niter):
+            objective.resample()
+            cost, grad = objective(x, gradient=True)
+            if not np.isfinite(cost):
+                break
+            x -= est["a"] / (time + self.A + 1.0) ** est["alpha"] * grad
+            if self.adaptive:
+                if previous is not None:
+                    time = max(0.0, time + float(self.sigmoid(-(previous @ grad), est["fmin"], est["fmax"], est["omega"])))
+                previous = grad
+            else:
+                time += (est["fmax"] + est["fmin"]) / 2.0
+        return x, OptimResults(fun=cost, nit=k + 1, nfev=k + 1, message="Number of iterations reached", success=True)
+
+
+def jacobian_terms(jacobian, nparam):
+    """Elastix's ComputeJacobianTerms: TrC, TrCC, maxJJ, maxJCJ, with C = 1/n sum_j J_j^T J_j
+
+    jacobian: array (n, ndim, nparam), or `SparseJacobian` of a B-spline transform (orthonormal basis): then
+        C = I (components) x C0, C0 = 1/n sum_j w_j w_j^T, stored by tap offsets (banded)
+    """
+    sqrt2 = np.sqrt(2.0)
+    if isinstance(jacobian, np.ndarray):
+        J = jacobian
+        n = len(J)
+        C = np.einsum("ndp,ndq->pq", J, J) / n
+        JJ = np.einsum("ndp,nep->nde", J, J)
+        JCJ = np.einsum("ndp,pq,neq->nde", J, C, J)
+        maxJJ = np.max(np.einsum("ndp,ndp->n", J, J) + 2 * sqrt2 * np.linalg.norm(JJ, axis=(1, 2)))
+        maxJCJ = np.max(np.trace(JCJ, axis1=1, axis2=2) + 2 * sqrt2 * np.linalg.norm(JCJ, axis=(1, 2)))
+        return float(np.trace(C)), float(np.sum(C**2)), float(maxJJ), float(maxJCJ)
+
+    flat, weights = jacobian.flat, jacobian.weights
+    n, ntap = weights.shape
+    ncomp = jacobian.basis.shape[1]
+    ncontrol = jacobian.ncontrol
+    # tap offsets: flat[:, t2] - flat[:, t1] is the same for all points (taps of a 4^ndim block)
+    offsets = flat[0][np.newaxis, :] - flat[0][:, np.newaxis]  # (t1, t2)
+    unique, oid = np.unique(offsets, return_inverse=True)
+    oid = oid.reshape(ntap, ntap)
+    noff = len(unique)
+    band = np.zeros(ncontrol * noff)
+    for t1 in range(ntap):
+        keys = flat[:, t1, np.newaxis] * noff + oid[t1][np.newaxis, :]
+        band += np.bincount(keys.ravel(), weights=(weights[:, t1, np.newaxis] * weights).ravel(), minlength=ncontrol * noff)
+    band /= n
+    band = band.reshape(ncontrol, noff)
+    s = np.sum(weights**2, axis=1)  # w_j . w_j
+    q = np.zeros(n)  # w_j^T C0 w_j
+    for t1 in range(ntap):
+        q += weights[:, t1] * np.sum(weights * band[flat[:, t1][:, np.newaxis], oid[t1][np.newaxis, :]], axis=1)
+    TrC = ncomp * float(np.sum(s)) / n
+    TrCC = ncomp * float(np.sum(band**2))
+    maxJJ = float(np.max(s)) * (ncomp + 2 * sqrt2 * np.sqrt(ncomp))
+    maxJCJ = float(np.max(q)) * (ncomp + 2 * sqrt2 * np.sqrt(ncomp))
+    return TrC, TrCC, maxJJ, maxJCJ
 
 
 class OptimizerAuto(Optimizer):

@@ -6,7 +6,7 @@ import SimpleITK as sitk
 from .. import volume as _volume
 from .. import interp as _interp
 from .config import make_stages
-from .image import Image, direction_to_transform
+from .image import Image, direction_to_transform, foreground_mask
 from .interpolators import InterpolatorBSpline
 from .pipeline import Elastix
 from .splines import ndspline_interpolation
@@ -38,7 +38,8 @@ def register(
         (default: start from the parameters found for the previous image)
     loglevel: logging level
     callback: function called after each pyramid level: callback(fixed, moving, parameters, config, level=level)
-    fixed_mask: samples are drawn in this mask of the fixed image
+    fixed_mask: samples are drawn in this mask of the fixed image ("foreground": `foreground_mask` of the fixed
+        image, for all stages; see also the `mask` settings)
     moving_mask: samples falling outside this mask of the moving image(s) are discarded
 
     returns: registered image(s) (tomio Volume in 3d, Image in 2d), [transformation(s)]
@@ -48,6 +49,10 @@ def register(
     moving = [moving] if single else list(moving)
     stages = make_stages(config, **sections)
 
+    if isinstance(fixed_mask, str):
+        if fixed_mask != "foreground":
+            raise ValueError(f"Unknown fixed mask: {fixed_mask!r} (expected an array or 'foreground')")
+        fixed_mask = foreground_mask(Image(fixed))
     fixed = Image(fixed, mask=fixed_mask, label="fixed")
     moving = [Image(im, mask=moving_mask, label="moving") for im in moving]
 

@@ -463,13 +463,15 @@ class TransformBSpline(Transform):
     domain (with one control point before and two after along each axis, as ITK's BSplineTransform)
 
     grid_spacing: control point spacing (mm), scalar or per axis; adjusted so that the grid fits the domain
-    schedule: grid spacing factor at pyramid level k: schedule ** k (as Elastix's default GridSpacingSchedule);
+    schedule: grid spacing factor at pyramid level k: schedule ** k (Elastix's default GridSpacingSchedule: sqrt(2));
         the displacement of each level initializes the (finer) grid of the next level; 1: same grid at all levels
-    bending: weight of the bending energy penalty (smoothness regularization, default 0): the penalty is
+    bending: weight of the bending energy penalty (smoothness regularization): the penalty is
         bending x mean squared second derivatives of the displacement x (100 mm)^2, independent of the grid
         spacing. It scales as amplitude^2 / wavelength^4 of the deformation: e.g. 2 mm over 100 mm gives ~0.3,
-        2 mm over 30 mm ~ 30. With MI or NGF (costs of order 1), 0.1-1 regularizes smooth deformations
-        (and prevents the exploitation of the MI estimate); MSE costs depend on the intensities.
+        2 mm over 30 mm ~ 30 (Elastix's TransformBendingEnergyPenalty weight w corresponds to w / 10^4).
+        None (default): set by the registration from the metric (`DEFAULT_BENDING`): 1 with MI, NGF and MIND
+        (costs of order 1; prevents the exploitation of the MI estimate), 0 with MSE (costs depend on the
+        intensities), the most accurate on the synthetic benchmark
     axis: axis of the fixed image along which there is no displacement (e.g. 2: in-plane deformation only, slices
         stay slices, as needed by ROIs drawn on some slices); None: displacement along all axes
     grid: control grid (dict: origin, spacing, shape, direction), set from the fixed image by `setup`
@@ -484,11 +486,14 @@ class TransformBSpline(Transform):
     # reference length of the bending penalty (mm): weights of order 1 for costs of order 1
     BENDING_LENGTH = 100.0
 
-    def __init__(self, grid_spacing=20.0, schedule=2.0, bending=0.0, axis=None, grid=None, init=None):
+    # default bending weight per metric (registry name), see `bending`
+    DEFAULT_BENDING = {"mse": 0.0, "mi": 1.0, "ngf": 1.0, "mind": 1.0}
+
+    def __init__(self, grid_spacing=10.0, schedule=2.0, bending=None, axis=None, grid=None, init=None):
         self.axis = None if axis is None else int(axis)
         self.grid_spacing = grid_spacing
         self.schedule = float(schedule)
-        self.bending = float(bending)
+        self.bending = None if bending is None else float(bending)
         self.grid = None if grid is None else {key: np.asarray(value, dtype=float) for key, value in grid.items()}
         if self.grid is not None:
             self.grid["shape"] = self.grid["shape"].astype(int)

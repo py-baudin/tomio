@@ -211,12 +211,15 @@ print(elastix.Config.describe())  # all components and options
   section is a type name, or a dict with `type` and options; a list of settings runs successive stages.
 - Same contrast: `mse`. Different contrasts: `mi` (mutual information), `ngf` (normalized gradient fields) or
   `mind` (modality independent neighbourhood descriptor).
-- B-splines: `grid_spacing` (mm, final level; coarser at the coarser pyramid levels), `bending` (smoothness:
-  0.1–1 with `mi`, `ngf`, `mind`), `axis=2` for in-plane deformations only (slices stay slices, e.g. for ROIs drawn
-  on some slices). Run them after a converged rigid stage.
+- B-splines: `grid_spacing` (mm, final level; coarser at the coarser pyramid levels), `bending` (smoothness;
+  default 1 with `mi`, `ngf`, `mind`, 0 with `mse`), `axis=2` for in-plane deformations only (slices stay slices,
+  e.g. for ROIs drawn on some slices). Run them after a converged rigid stage.
 - Optimizers: `auto` uses `lbfgs` for global transforms and `sgd` (new random samples every iteration, as Elastix)
   for B-splines.
-- Masks: `register(..., fixed_mask=mask)` draws samples inside the mask only.
+- Masks: `register(..., fixed_mask=mask)` draws samples inside the mask only; masks are eroded at each pyramid
+  level as in Elastix (`pyramid={"erode_mask": False}` to disable); `mask="auto"` uses a foreground mask for
+  B-spline stages.
+- Optimizers: `asgd` is Elastix's adaptive stochastic gradient descent (automatic step estimation).
 
 ### Deformations and sparse ROIs
 

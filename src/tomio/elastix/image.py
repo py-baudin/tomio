@@ -1,9 +1,10 @@
 """images and grid geometry"""
 
 import numpy as np
+import SimpleITK as sitk
 
 from .. import volume as _volume
-from .splines import bspline_coefficients
+from .splines import bspline_coefficients, gaussian_filter
 
 
 def _tolist(value):
@@ -387,3 +388,51 @@ class Image:
         if values is not None:
             im.update(values)
         return im
+
+
+def foreground_mask(image, sigma=1.0, dilation=2, min_fraction=0.1, thick_ratio=2.0):
+    """foreground of an image (e.g. the body in MRI): Otsu threshold of the smoothed magnitude, connected
+    components of at least `min_fraction` x the largest one, holes filled (in 3D and slice by slice), dilated
+
+    sigma: smoothing (pixels), not along thick axes (spacing >= thick_ratio x the smallest)
+    dilation: dilation radius (pixels), not along thick axes
+
+    returns: boolean array
+    """
+    image = image if isinstance(image, Image) else Image(image)
+    if "foreground" in image._coefficients:
+        return image._coefficients["foreground"]
+    array = np.asarray(image.array)
+    array = np.abs(array) if np.iscomplexobj(array) else np.asarray(array, dtype=float)
+    ndim = array.ndim
+    spacing = np.asarray(image.spacing, dtype=float)
+    thick = (spacing >= thick_ratio * spacing.min()) | (np.array(array.shape) < 3)
+    smooth = gaussian_filter(np.nan_to_num(array), np.where(thick, 0.0, sigma))
+
+    def to_sitk(values):
+        return sitk.GetImageFromArray(np.ascontiguousarray(values.T))
+
+    mask = sitk.OtsuThreshold(to_sitk(smooth), 0, 1)  # above the threshold: 1
+    labels = sitk.GetArrayFromImage(sitk.ConnectedComponent(mask)).T
+    sizes = np.bincount(labels.ravel())
+    sizes[0] = 0
+    if sizes.max() == 0:
+        result = np.ones(array.shape, dtype=bool)
+    else:
+        keep = np.flatnonzero(sizes >= min_fraction * sizes.max())
+        result = np.isin(labels, keep)
+        # holes: in nd, then slice by slice along the thickest axis
+        result = sitk.GetArrayFromImage(sitk.BinaryFillhole(to_sitk(result.astype(np.uint8)))).T > 0
+        if ndim == 3:
+            axis = int(np.argmax(spacing))
+            for k in range(array.shape[axis]):
+                index = (slice(None),) * axis + (k,)
+                plane = sitk.BinaryFillhole(to_sitk(result[index].astype(np.uint8)))
+                result[index] = sitk.GetArrayFromImage(plane).T > 0
+        radius = [0 if t else int(dilation) for t in thick]
+        if any(radius):
+            dilated = sitk.BinaryDilate(to_sitk(result.astype(np.uint8)), radius)
+            result = sitk.GetArrayFromImage(dilated).T > 0
+    image._coefficients["foreground"] = result
+    return result
+

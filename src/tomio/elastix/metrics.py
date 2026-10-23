@@ -28,18 +28,31 @@ class Metric(ABC):
 
 
 class MetricMeanSquares(Metric):
-    """Mean square difference cost function"""
+    """Mean square difference cost function (as Elastix's AdvancedMeanSquares)
 
-    def measure(self, values1, values2, gradient2=False, normalize=False, **kwargs):
-        # if callable(normalize):
-        # values1, values2 = normalize(values1, values2)
+    normalize: as Elastix's UseNormalization: divide by (range / 10)^2, with range the largest difference between
+        the intensities of the two images (max of fixed - min of moving and max of moving - min of fixed, inside
+        the masks), so that costs do not depend on the intensity scale; default False (as Elastix)
+    """
 
+    def __init__(self, normalize=False):
+        self.normalize = bool(normalize)
+
+    def factor(self, fixed, moving):
+        """normalization factor for a pair of images"""
+        if not self.normalize:
+            return 1.0
+        values1, values2 = np.asarray(fixed.values).real, np.asarray(moving.values).real
+        maxdiff = max(values1.max() - values2.min(), values2.max() - values1.min())
+        return 100.0 / maxdiff**2 if maxdiff > 1e-10 else 1.0
+
+    def measure(self, values1, values2, gradient2=False, factor=1.0, **kwargs):
         diff = values1 - values2
-        msd = np.mean(diff**2)
+        msd = factor * np.mean(diff**2)
         if not gradient2:
             return msd
         # jacobian
-        grad2 = (-2 * diff) / len(diff)
+        grad2 = (-2 * factor * diff) / len(diff)
         return msd, grad2
 
 

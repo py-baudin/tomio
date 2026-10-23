@@ -31,8 +31,10 @@ from .splines import (  # noqa: F401
     resample_grid,
     gaussian_filter,
     binary_dilation,
+    erode_mask,
 )
 from .image import (  # noqa: F401
+    foreground_mask,
     direction_to_transform,
     transform_to_direction,
     _tolist,
@@ -76,6 +78,7 @@ from .samplers import (  # noqa: F401
     SamplerFull,
     SamplerRandom,
     SamplerRandomCoordinates,
+    SamplerGrid,
 )
 from .interpolators import (  # noqa: F401
     Interpolator,
@@ -101,6 +104,8 @@ from .optimizers import (  # noqa: F401
     Optimizer,
     OptimizerLBFGS,
     OptimizerSGD,
+    OptimizerASGD,
+    jacobian_terms,
     OptimizerAuto,
     lbfgs,
     OptimResults,

@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 import numpy as np
 
 from .image import Image
-from .splines import binary_dilation, gaussian_filter, resample_grid
+from .splines import erode_mask, gaussian_filter, resample_grid
 
 
 class Pyramid(ABC):
@@ -25,10 +25,27 @@ class Pyramid(ABC):
         return str(type(self).__name__)
 
 
+def eroded(image, schedule, moving=False):
+    """image with its mask eroded as Elastix's ErodeMask (radius schedule + 1 voxels for the fixed mask,
+    2 schedule + 1 for the moving mask)"""
+    if image.mask is None:
+        return image
+    radius = (2.0 if moving else 1.0) * np.asarray(schedule, dtype=float) + 1.0
+    return image.copy(image.array, mask=erode_mask(image.mask, radius))
+
+
 class PyramidDummy(Pyramid):
-    """Pass-through pyramid (does nothing)"""
+    """Pass-through pyramid (single level)
+
+    erode_mask: erode the masks as Elastix's ErodeMask (default true): fixed mask by 2 voxels, moving mask by 3
+    """
+
+    def __init__(self, erode_mask=True):
+        self.erode_mask = erode_mask
 
     def pyramid(self, *images):
+        if self.erode_mask:
+            images = [eroded(im, np.ones(im.ndim), moving=i > 0) for i, im in enumerate(images)]
         return [0], [tuple(images)]
 
 
@@ -53,6 +70,10 @@ class PyramidGaussian(Pyramid):
         can diverge); with random samples, the cost of an iteration does not depend on the image size.
         None (default): set by the registration: downsampling; for non-global transforms (B-splines), no axis
         is reduced below `MINSIZE_DEFORMABLE` (32) pixels (small images: smoothing only)
+    erode_mask: erode the masks at each level, as Elastix's ErodeMask (default true): the full resolution masks
+        are eroded by the reduction factor s of each axis + 1 voxels (fixed mask; moving mask: 2 s + 1, parabolic
+        erosion as Elastix's ErodeMaskImageFilter), then reduced: samples near the mask borders, whose values
+        mix in the outside through smoothing and interpolation, are not used
     """
 
     MINSIZE_DEFORMABLE = 32
@@ -67,8 +88,10 @@ class PyramidGaussian(Pyramid):
         sigma=None,
         magnitude=True,
         downsample=None,
+        erode_mask=True,
     ):
         self.downsample = downsample
+        self.erode_mask = erode_mask
         self.maxlevel = maxlevel
         self.minlevel = minlevel
         self.scale_ratio = scale_ratio
@@ -90,9 +113,11 @@ class PyramidGaussian(Pyramid):
         newshape = np.floor((shape - 1) * image.spacing / spacing + 1e-8).astype(int) + 1
         return spacing, newshape
 
-    def reduce(self, image, spacing, shape):
-        """reduced image, with the same center"""
+    def reduce(self, image, spacing, shape, moving=False):
+        """reduced image, with the same center (mask eroded first, see `erode_mask`)"""
         ratio = spacing / image.spacing
+        if self.erode_mask:
+            image = eroded(image, ratio, moving=moving)
         # coordinates of the new grid in the original grid
         offset = ((image.geometry.shape - 1) - (shape - 1) * ratio) / 2
 
@@ -112,8 +137,7 @@ class PyramidGaussian(Pyramid):
         # mask
         mask = None
         if image.mask is not None:
-            dilated = binary_dilation(image.mask) if np.any(ratio > 1) else image.mask
-            mask = resample_grid(dilated.astype(np.uint8), offset, ratio, shape, order=0) > 0
+            mask = resample_grid(image.mask.astype(np.uint8), offset, ratio, shape, order=0) > 0
 
         origin = image.geometry.to_points(offset)
         return Image(reduced, mask=mask, spacing=spacing, origin=origin, direction=image.direction)
@@ -121,7 +145,8 @@ class PyramidGaussian(Pyramid):
     def pyramid(self, *images):
         if self.magnitude:
             images = [im.copy(np.abs(im.array)) for im in images]
-        pyramid = [tuple(images)]
+        full = tuple(eroded(im, np.ones(im.ndim), moving=i > 0) for i, im in enumerate(images)) if self.erode_mask else tuple(images)
+        pyramid = [full]
         min_spacing = np.min([im.spacing for im in images])
 
         shapes = [tuple(im.shape) for im in images]
@@ -134,7 +159,7 @@ class PyramidGaussian(Pyramid):
                 break
             shapes = newshapes
             # reduce the original images
-            pyramid.append(tuple(self.reduce(im, *grid) for im, grid in zip(images, grids)))
+            pyramid.append(tuple(self.reduce(im, *grid, moving=i > 0) for i, (im, grid) in enumerate(zip(images, grids))))
 
         # return levels and reduced images
         nlevel = len(pyramid)

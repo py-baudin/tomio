@@ -641,7 +641,7 @@ def test_pyramid_class():
     mask = np.isin(arr, [16, 17, 18])  # keep center
     im3 = elastix.Image(arr, mask=mask)
     pyr = elastix.PyramidGaussian(
-        maxlevel=1, scale_ratio=2, order=0, sigma=0, minsize=1
+        maxlevel=1, scale_ratio=2, order=0, sigma=0, minsize=1, erode_mask=False
     )
     levels, reduced = pyr(im3)
     assert levels == [1, 0]
@@ -1481,7 +1481,7 @@ def test_register_bspline(metric, contrast, tolerance):
     fixed, moving, points, u = textured_pair()
     if contrast:
         moving = np.exp(-1.5 * moving)  # other contrast (non-linear, decreasing)
-    registered, trans = ex.register(fixed, moving, transform={"type": "bspline", "grid_spacing": 8}, metric=metric, optimizer=SGD, return_transform=True)
+    registered, trans = ex.register(fixed, moving, transform={"type": "bspline", "grid_spacing": 8, "bending": 0.0}, metric=metric, optimizer=SGD, return_transform=True)
     inner = np.all((points >= 8) & (points <= 39), axis=1)
     error = np.linalg.norm(trans(points[inner]) - points[inner] - u[inner], axis=1)
     assert error.mean() < tolerance * np.linalg.norm(u[inner], axis=1).mean()
@@ -1491,14 +1491,14 @@ def test_register_bspline(metric, contrast, tolerance):
 def test_register_bspline_identical_textured(metric):
     """identical images: (almost) no deformation"""
     fixed, _, points, _ = textured_pair()
-    _, trans = ex.register(fixed, fixed, transform={"type": "bspline", "grid_spacing": 8}, metric=metric, optimizer=SGD, return_transform=True)
+    _, trans = ex.register(fixed, fixed, transform={"type": "bspline", "grid_spacing": 8, "bending": 0.0}, metric=metric, optimizer=SGD, return_transform=True)
     assert np.linalg.norm(trans(points) - points, axis=1).mean() < 0.1
 
 
 def test_register_bspline_identical():
     """identical images: no deformation (MSE)"""
     image = sample_phantom((40, 40))
-    config = {"transform": {"type": "bspline", "grid_spacing": 8}, "optimizer": "lbfgs"}  # deterministic
+    config = {"transform": {"type": "bspline", "grid_spacing": 8, "bending": 0.0}, "optimizer": "lbfgs"}  # deterministic
     _, trans = ex.register(image, image, config, return_transform=True)
     assert np.abs(trans.parameters).max() < 1e-3
 
@@ -1506,7 +1506,7 @@ def test_register_bspline_identical():
 def test_register_rigid_bspline_stages():
     fixed, moving = deformed_pair((48, 48), amplitude=1.0)
     moving = np.roll(moving, 2, axis=0)  # + global shift
-    stages = [{"transform": "rigid"}, {"transform": {"type": "bspline", "grid_spacing": 8}, "optimizer": SGD}]
+    stages = [{"transform": "rigid"}, {"transform": {"type": "bspline", "grid_spacing": 8, "bending": 0.0}, "optimizer": SGD}]
     registered, trans = ex.register(fixed, moving, stages, return_transform=True)
     assert isinstance(trans, ex.TransformationSequence)
     assert isinstance(trans[1].transform, ex.TransformBSpline)
@@ -1516,7 +1516,7 @@ def test_register_rigid_bspline_stages():
 
 def test_bspline_serialize():
     fixed, moving = deformed_pair((32, 32))
-    _, trans = ex.register(fixed, moving, transform={"type": "bspline", "grid_spacing": 8}, optimizer=SGD, return_transform=True)
+    _, trans = ex.register(fixed, moving, transform={"type": "bspline", "grid_spacing": 8, "bending": 0.0}, optimizer=SGD, return_transform=True)
     data = trans.serialize()
     assert data["transform"]["type"] == "bspline" and data["transform"]["grid"] is not None
     trans2 = ex.as_transformation(data)
@@ -1595,7 +1595,7 @@ def test_sgd_resamples():
 @pytest.mark.parametrize("metric", ["mse", "mi"])
 def test_register_bspline_sgd(metric):
     fixed, moving, points, u = textured_pair()
-    config = {"transform": {"type": "bspline", "grid_spacing": 8}, "metric": metric, "optimizer": {"type": "sgd", "niter": 64}, "pyramid": {"maxlevel": 1}}
+    config = {"transform": {"type": "bspline", "grid_spacing": 8, "bending": 0.0}, "metric": metric, "optimizer": {"type": "sgd", "niter": 64}, "pyramid": {"maxlevel": 1}}
     _, trans = ex.register(fixed, moving, config, return_transform=True)
     inner = np.all((points >= 8) & (points <= 39), axis=1)
     error = np.linalg.norm(trans(points[inner]) - points[inner] - u[inner], axis=1)
@@ -1615,7 +1615,7 @@ def test_plot_registration(tmp_path, deformable):
 
     fixed, moving = shifted((24, 24, 6), (1.0, -1.0, 0.0))
     if deformable:
-        stages = [{"transform": "translation"}, {"transform": {"type": "bspline", "grid_spacing": 8}, "optimizer": {"type": "sgd", "niter": 8}}]
+        stages = [{"transform": "translation"}, {"transform": {"type": "bspline", "grid_spacing": 8, "bending": 0.0}, "optimizer": {"type": "sgd", "niter": 8}}]
     else:
         stages = {"transform": "translation"}
     _, trans = ex.register(fixed, moving, stages, return_transform=True)
@@ -1875,7 +1875,7 @@ def test_interpolate_slices_registration():
         a, b = np.asarray(a) > 0, b > 0
         return 2 * (a & b).sum() / (a.sum() + b.sum())
 
-    config = {"transform": {"type": "bspline", "grid_spacing": 8}, "metric": "mse", "optimizer": {"type": "sgd", "niter": 64}}
+    config = {"transform": {"type": "bspline", "grid_spacing": 8, "bending": 0.0}, "metric": "mse", "optimizer": {"type": "sgd", "niter": 64}}
     shape = ex.interpolate_slices(sparse)
     registration = ex.interpolate_slices(sparse, image, method="registration", config=config)
     assert dice(np.asarray(shape)[..., 2], truth[..., 2]) < 0.3
@@ -1959,26 +1959,7 @@ def test_transform_sitk_resampling(method):
     assert agree.mean() > (0.97 if method != "linear" else 0.9999), agree.mean()
 
 
-# adaptive stochastic gradient descent
 
-def test_sgd_adaptive_time():
-    optimizer = ex.OptimizerSGD(adaptive=True)
-    assert optimizer.sigmoid(0) == 0
-    assert np.isclose(optimizer.sigmoid(-50), optimizer.fmin) and np.isclose(optimizer.sigmoid(50), optimizer.fmax)
-    assert ex.Config(optimizer={"type": "sgd", "adaptive": True})["optimizer"]["adaptive"]
-
-
-@pytest.mark.parametrize("metric", ["mse", "mi"])
-def test_register_bspline_adaptive(metric):
-    fixed, moving, points, u = textured_pair()
-    optimizer = {**SGD, "adaptive": True}
-    _, trans = ex.register(fixed, moving, transform={"type": "bspline", "grid_spacing": 8}, metric=metric, optimizer=optimizer, return_transform=True)
-    inner = np.all((points >= 8) & (points <= 39), axis=1)
-    error = np.linalg.norm(trans(points[inner]) - points[inner] - u[inner], axis=1)
-    assert error.mean() < 0.25 * np.linalg.norm(u[inner], axis=1).mean()
-    # identical images: (almost) no deformation
-    _, trans = ex.register(fixed, fixed, transform={"type": "bspline", "grid_spacing": 8}, metric=metric, optimizer=optimizer, return_transform=True)
-    assert np.linalg.norm(trans(points) - points, axis=1).mean() < 0.1
 
 
 def test_geometry_volume_adapter():
@@ -1995,3 +1976,149 @@ def test_geometry_volume_adapter():
     vol = io.Volume(np.zeros((5, 6, 7)), spacing=vgeo.spacing, origin=vgeo.origin, transform=vgeo.transform)
     assert ex.Image(vol).geometry.direction.tolist() == back.direction.tolist()
     assert np.allclose(ex.transform_to_direction(ex.direction_to_transform(direction)), direction)
+
+
+# automatic foreground mask
+
+def test_foreground_mask():
+    image = np.zeros((40, 40, 10))
+    image[10:30, 8:32, 2:8] = 100.0  # body
+    image[18:22, 18:22, 2:8] = 0.0  # dark structure inside: hole filled
+    image += np.random.default_rng(0).normal(scale=2.0, size=image.shape)
+    mask = ex.foreground_mask(ex.Image(image, spacing=(1, 1, 3)))
+    assert mask.dtype == bool and mask.shape == image.shape
+    assert mask[10:30, 8:32, 2:8].all()  # body and its hole
+    assert not mask[:5].any() and not mask[..., 0].any()  # background; not dilated along the thick axis
+    assert mask[8, 20, 4] and not mask[5, 20, 4]  # dilated by 2 pixels in-plane
+
+
+def test_config_mask_section():
+    assert ex.Config()["mask"] == {"fixed": None}
+    assert ex.Config(mask="auto")["mask"] == {"fixed": "auto"}
+    assert ex.Config(mask={"fixed": "foreground"})["mask"] == {"fixed": "foreground"}
+    with pytest.raises(ValueError, match="mask"):
+        ex.Config(mask="everything")
+    assert "mask:" in ex.Config.describe()
+
+
+@pytest.mark.parametrize("setting", [{"mask": "auto"}, {"mask": "foreground"}, {"fixed_mask": "foreground"}])
+def test_register_foreground_mask(setting):
+    """B-spline registration with the automatic mask (textured images: foreground everywhere but the borders)"""
+    fixed, moving, points, u = textured_pair()
+    fixed, moving = np.pad(fixed, 8), np.pad(moving, 8)  # background border
+    points = grid_points(fixed.shape)
+    u = np.zeros_like(points)
+    sections = {"transform": {"type": "bspline", "grid_spacing": 8, "bending": 0.0}, "metric": "mse", "optimizer": SGD}
+    kwargs = {"fixed_mask": setting["fixed_mask"]} if "fixed_mask" in setting else {}
+    stage = {**sections, **({"mask": setting["mask"]} if "mask" in setting else {})}
+    registered, trans = ex.register(fixed, moving, stage, return_transform=True, **kwargs)
+    assert np.isfinite(np.asarray(registered)).all()
+    with pytest.raises(ValueError):
+        ex.register(fixed, moving, sections, fixed_mask="everything")
+
+
+def test_sampler_seed():
+    image = ex.Image(np.random.default_rng(0).normal(size=(20, 20)))
+    for cls in (ex.SamplerRandom, ex.SamplerRandomCoordinates):
+        a, b, c = cls(maxsample=50), cls(maxsample=50), cls(maxsample=50, seed=1)
+        assert np.array_equal(a(image)[0], b(image)[0])
+        assert not np.array_equal(a(image)[0], c(image)[0])
+    assert ex.Config(sampler={"seed": 3}).setup("sampler").seed == 3
+
+
+
+
+# Elastix's adaptive stochastic gradient descent
+
+def test_jacobian_terms_sparse():
+    """B-spline Jacobian terms (banded covariance) = dense computation"""
+    geometry = ex.Geometry((12, 10, 5), spacing=(1.0, 1.2, 2.0), direction=ex.euler_to_matrix([0.1, 0.2, -0.1]))
+    for axis in (None, 2):
+        transform = ex.TransformBSpline(grid_spacing=4, axis=axis)
+        transform.setup(geometry)
+        nparam = transform.init(3).size
+        points = geometry.points[::3]
+        _, sparse = transform(np.zeros(nparam), points, jac=True)
+        dense = np.zeros((len(points), 3, nparam))
+        for a in range(sparse.basis.shape[1]):
+            for t in range(sparse.flat.shape[1]):
+                dense[np.arange(len(points)), :, a * sparse.ncontrol + sparse.flat[:, t]] += sparse.weights[:, t, None] * sparse.basis[:, a]
+        assert np.allclose(ex.jacobian_terms(sparse, nparam), ex.jacobian_terms(dense, nparam))
+
+
+def test_asgd_sigmoid():
+    f = ex.OptimizerASGD.sigmoid
+    assert np.isclose(f(0.0, -0.8, 1.0, 0.1), 0)
+    assert np.isclose(f(-100.0, -0.8, 1.0, 0.1), -0.8) and np.isclose(f(100.0, -0.8, 1.0, 0.1), 1.0)
+
+
+def test_sampler_grid():
+    image = ex.Image(np.zeros((40, 30, 10)), mask=np.ones((40, 30, 10)))
+    points, values = ex.SamplerGrid(nsample=1500)(image)
+    assert 1000 <= len(points) <= 12000 and len(values) == len(points)  # step 2
+    assert len(ex.SamplerGrid(nsample=10**6)(image)[0]) == 12000  # all pixels
+
+
+@pytest.mark.parametrize("metric", ["mse", "mi"])
+def test_register_bspline_asgd(metric):
+    fixed, moving, points, u = textured_pair()
+    config = ex.Config(transform={"type": "bspline", "grid_spacing": 8, "bending": 0.0}, metric=metric, optimizer="asgd")
+    pipeline = ex.Elastix(config)
+    trans, info = pipeline.execute(ex.Image(fixed), ex.Image(moving))
+    inner = np.all((points >= 8) & (points <= 39), axis=1)
+    error = np.linalg.norm(trans(points[inner]) - points[inner] - u[inner], axis=1)
+    assert error.mean() < 0.1 * np.linalg.norm(u[inner], axis=1).mean()
+    # identical images: no deformation
+    _, trans = ex.register(fixed, fixed, transform={"type": "bspline", "grid_spacing": 8, "bending": 0.0}, metric=metric, optimizer="asgd", return_transform=True)
+    assert np.linalg.norm(trans(points) - points, axis=1).mean() < 0.1
+
+
+def test_mse_normalization():
+    """as Elastix's UseNormalization: factor 100 / range^2"""
+    fixed = ex.Image(np.linspace(0, 200, 100).reshape(10, 10))
+    moving = ex.Image(np.linspace(10, 150, 100).reshape(10, 10))
+    assert ex.MetricMeanSquares().factor(fixed, moving) == 1.0
+    assert np.isclose(ex.MetricMeanSquares(normalize=True).factor(fixed, moving), 100 / 190**2)
+
+
+
+# mask erosion (Elastix's ErodeMask)
+
+def test_erode_mask():
+    mask = np.zeros((20, 20, 6), dtype=bool)
+    mask[5:15, 5:15, :] = True
+    eroded = ex.erode_mask(mask, (2, 2, 0))
+    assert eroded[7:13, 7:13].all() and eroded.sum() == 6 * 6 * 6  # 2 voxels in-plane, none along z
+    assert ex.erode_mask(mask, 3).sum() < eroded.sum()
+    assert np.array_equal(ex.erode_mask(np.ones((4, 4), bool), 2), np.ones((4, 4), bool))
+
+
+def test_pyramid_mask_erosion():
+    """fixed masks eroded by s + 1 voxels, moving masks by 2 s + 1 (s: reduction factor of the level)"""
+    array = np.random.default_rng(0).normal(size=(40, 40))
+    mask = np.zeros((40, 40), dtype=bool)
+    mask[10:30, 10:30] = True
+    fixed, moving = ex.Image(array, mask=mask), ex.Image(array, mask=mask)
+    levels, images = ex.PyramidGaussian(maxlevel=1, minsize=4)(fixed, moving)
+    finest_fixed, finest_moving = images[-1]
+    assert np.array_equal(finest_fixed.mask, ex.erode_mask(mask, 2))
+    assert np.array_equal(finest_moving.mask, ex.erode_mask(mask, 3))
+    coarse_fixed = images[0][0]
+    assert coarse_fixed.mask.sum() < (coarse_fixed.shape[0] * 20 / 40) ** 2  # eroded before the reduction
+    # option off: masks unchanged at the finest level
+    _, images = ex.PyramidGaussian(maxlevel=1, minsize=4, erode_mask=False)(fixed, moving)
+    assert np.array_equal(images[-1][0].mask, mask)
+    _, images = ex.PyramidDummy()(fixed, moving)
+    assert np.array_equal(images[0][1].mask, ex.erode_mask(mask, 3))
+
+
+def test_bspline_default_bending():
+    """bending set from the metric: 1 with MI/NGF/MIND, 0 with MSE"""
+    fixed, moving, points, u = textured_pair()
+    for metric, expected in [("mse", 0.0), ("mi", 1.0)]:
+        config = {"transform": {"type": "bspline", "grid_spacing": 8}, "metric": metric, "optimizer": {**SGD, "niter": 4}}
+        trans, _ = ex.Elastix(ex.Config(config)).execute(ex.Image(fixed), ex.Image(moving))
+        assert trans.transform.bending == expected
+    config["transform"]["bending"] = 0.3
+    trans, _ = ex.Elastix(ex.Config(config)).execute(ex.Image(fixed), ex.Image(moving))
+    assert trans.transform.bending == 0.3

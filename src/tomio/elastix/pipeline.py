@@ -4,11 +4,12 @@ import logging
 
 import numpy as np
 
-from .image import Image
+from .config import component_name
+from .image import Image, foreground_mask
 from .interpolators import Interpolator, InterpolatorNearestNeighbor
 from .metrics import Metric
 from .optimizers import OptimResults
-from .samplers import Sampler
+from .samplers import SamplerGrid, Sampler
 from .transforms import Transform, Transformation
 
 LOGGER = logging.getLogger("tomio.elastix")
@@ -62,6 +63,25 @@ class Objective:
         """draw new samples (stochastic optimizers)"""
         if getattr(self.sampler, "image", None) is not None:
             self.sampler.update()
+
+    def jacobian_samples(self, parameters, nsample):
+        """Jacobian of the transform w/r to the parameters at about `nsample` grid points of the fixed image
+        (inside its mask; through the initial transformation): `SparseJacobian`, or array (npoint, ndim, nparam)"""
+        points1, _ = SamplerGrid(nsample)(self.fixed)
+        if self.initial is not None:
+            points1 = self.initial(points1)
+        _, jac = self.transform(parameters, points1, jac=True, center=self.center)
+        return jac
+
+    def exact_gradient(self, parameters, nsample=100000):
+        """cost gradient with about `nsample` samples on a grid of the fixed image (Elastix's "exact" gradient)"""
+        sampler = self.sampler
+        self.sampler = SamplerGrid(nsample)
+        try:
+            _, gradient = self(parameters, gradient=True)
+        finally:
+            self.sampler = sampler
+        return gradient
 
     def overlap(self, samples, points1, parameters):
         """samples of the current set that are used: those mapped inside the moving image (pixel centers range) by
@@ -162,6 +182,10 @@ class Objective:
             return self._call_gradients(parameters, gradient=gradient, **kwargs)
         transform_args = {"center": self.center}
         metric_args = {"normalize": self.normalize, **kwargs}
+        if hasattr(self.metric, "factor"):
+            if getattr(self, "_factor", None) is None:
+                self._factor = self.metric.factor(self.fixed, self.moving)
+            metric_args["factor"] = self._factor
         points1, values1 = self.sampler(self.fixed)
         samples = points1  # identifies the sample set
         points1 = self.moved_samples(samples)
@@ -220,6 +244,17 @@ class ScaledObjective:
     def resample(self):
         self.objective.resample()
 
+    def jacobian_samples(self, x, nsample):
+        jac = self.objective.jacobian_samples(np.asarray(x) / self.scales, nsample)
+        if isinstance(jac, np.ndarray):
+            return jac / self.scales
+        if not np.allclose(self.scales, 1):
+            raise NotImplementedError("Sparse Jacobians with parameter scales")
+        return jac
+
+    def exact_gradient(self, x, nsample=100000):
+        return self.objective.exact_gradient(np.asarray(x) / self.scales, nsample) / self.scales
+
 
 class Elastix:
     """Main registration object"""
@@ -239,6 +274,11 @@ class Elastix:
         """
         LOGGER.info("Execute pipeline")
 
+        # fixed mask setting (when no mask is given)
+        mode = self.config["mask"].get("fixed")
+        if fixed.mask is None and (mode == "foreground" or (mode == "auto" and not self.config.setup("transform").is_global)):
+            fixed = Image(fixed, mask=foreground_mask(fixed))
+
         pyramid = self.config.setup("pyramid")
         if getattr(pyramid, "downsample", False) is None:
             # downsampling; for non-global transforms, not below a minimum size (tiny levels can diverge)
@@ -246,6 +286,10 @@ class Elastix:
             if not self.config.setup("transform").is_global:
                 pyramid.minsize = max(pyramid.minsize, pyramid.MINSIZE_DEFORMABLE)
         optimizer = self.config.setup("optimizer")
+        if hasattr(optimizer, "default_maxstep"):
+            # Elastix's default MaximumStepLength: mean in-plane spacing of the (full resolution) images
+            spacings = [np.asarray(image.spacing, dtype=float)[: min(image.ndim, 2)] for image in (fixed, moving)]
+            optimizer.default_maxstep = float(np.mean(np.concatenate(spacings)))
         self.logger.info(f"Using pyramid: {pyramid}")
         self.logger.info(f"Using optimizer: {optimizer}")
 
@@ -278,6 +322,8 @@ class Elastix:
             sampler = self.config.setup("sampler")
             interpolator = self.config.setup("interpolator")
             metric = self.config.setup("metric")
+            if getattr(transform, "bending", 0.0) is None:
+                transform.bending = transform.DEFAULT_BENDING.get(component_name("metric", metric), 0.0)
 
             self.logger.info(f"Using transform: {transform}")
             self.logger.info(f"Using sampler: {sampler}")

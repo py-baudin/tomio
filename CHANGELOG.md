@@ -6,10 +6,22 @@
 
 - `elastix.Geometry.to_volume`, `from_volume`: conversion to/from `volume.Geometry`.
 - README section "Registration".
+- Optimizer `"asgd"`: Elastix's adaptive SGD with automatic parameter estimation.
+- Sampler `"grid"` (as Elastix's ImageGridSampler); sampler option `seed`.
+- MSE option `normalize` (as Elastix's UseNormalization, off by default).
+- Section `mask` (`"auto"`, `"foreground"`) and `foreground_mask`; `--fixed-mask auto`.
 
 ### Changed
 
 - `tomio.elastix` split into a subpackage (same `from tomio import elastix` names).
+- Masks eroded at each pyramid level as Elastix's ErodeMask (option `erode_mask`).
+- Pyramid masks are no longer dilated when downsampling.
+- Default B-spline `bending`: 1 with MI, NGF, MIND; 0 with MSE (was 0).
+- Default B-spline `grid_spacing` 10 mm (was 20 mm, as Elastix).
+
+### Removed
+
+- SGD option `adaptive` (not Elastix's method; use `"asgd"`).
 
 ## 0.2.0
 

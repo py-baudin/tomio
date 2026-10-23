@@ -263,3 +263,9 @@ def test_interpolate_slices(tmp_path):
     assert set(np.unique(full)) == {0, 1}
     assert np.all([full[..., k].any() for k in range(9)])
     assert run("interpolate-slices", tmp_path / "roi.nii.gz", tmp_path / "full.nii.gz") == 1  # exists
+
+
+def test_register_fixed_mask_auto(tmp_path, pair_files, capsys):
+    fixed, moving = pair_files
+    assert run("register", fixed, moving, "--transform", "translation", "--fixed-mask", "foreground", "-o", tmp_path / "reg") == 0
+    assert "fixed: foreground" in capsys.readouterr().out

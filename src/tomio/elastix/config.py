@@ -9,9 +9,9 @@ import yaml
 from .. import configfile as _configfile
 from .interpolators import InterpolatorBSpline, InterpolatorLinear, InterpolatorNearestNeighbor
 from .metrics import MetricMIND, MetricMeanSquares, MetricMutualInformation, MetricNormalizedGradientFields
-from .optimizers import OptimizerAuto, OptimizerLBFGS, OptimizerSGD
+from .optimizers import OptimizerASGD, OptimizerAuto, OptimizerLBFGS, OptimizerSGD
 from .pyramid import PyramidDummy, PyramidGaussian
-from .samplers import SamplerFull, SamplerRandom, SamplerRandomCoordinates
+from .samplers import SamplerFull, SamplerGrid, SamplerRandom, SamplerRandomCoordinates
 from .transforms import TransformAffine, TransformBSpline, TransformRigid, TransformTranslation
 
 
@@ -44,6 +44,7 @@ COMPONENTS = {
         "full": SamplerFull,
         "random": SamplerRandom,
         "random_coordinates": SamplerRandomCoordinates,
+        "grid": SamplerGrid,
     },
     "interpolator": {
         "nearest": InterpolatorNearestNeighbor,
@@ -60,6 +61,7 @@ COMPONENTS = {
         "auto": OptimizerAuto,
         "lbfgs": OptimizerLBFGS,
         "sgd": OptimizerSGD,
+        "asgd": OptimizerASGD,
     },
 }
 
@@ -105,6 +107,9 @@ class Config:
         initialize: {"method": ...}, initial translation of the first stage:
             None, "geometry" (align the image centers) or "moments" (align the centers of mass)
         resample: {"method": ...}, interpolation of the registered image (see `transform`)
+        mask: {"fixed": ...}, mask of the fixed image when none is given: None (whole image), "auto" (foreground
+            for non-global transforms, e.g. B-splines; none for global transforms) or "foreground" (always);
+            the foreground is an Otsu threshold of the image (see `foreground_mask`)
 
     examples:
         Config(transform="rigid", metric="mi")
@@ -113,8 +118,14 @@ class Config:
         Config.describe()  # available types and options
     """
 
-    SECTIONS = tuple(COMPONENTS) + ("initialize", "resample")
-    INITIALIZE = (None, "geometry", "moments")
+    SECTIONS = tuple(COMPONENTS) + ("initialize", "resample", "mask")
+    # sections with a single option (a value or a dict): option name, allowed values (None: any)
+    SIMPLE = {
+        "initialize": ("method", (None, "geometry", "moments")),
+        "resample": ("method", None),
+        "mask": ("fixed", (None, "auto", "foreground")),
+    }
+    INITIALIZE = SIMPLE["initialize"][1]
 
     DEFAULTS = {
         "transform": "rigid",
@@ -125,6 +136,7 @@ class Config:
         "optimizer": "auto",
         "initialize": {"method": None},
         "resample": {"method": None},
+        "mask": {"fixed": None},
     }
 
     def __init__(self, config=None, **sections):
@@ -147,13 +159,14 @@ class Config:
     def __setitem__(self, name, value):
         if name not in self.SECTIONS:
             raise ValueError(f"Unknown section: '{name}' (expected one of: {', '.join(self.SECTIONS)})")
-        if name in ("initialize", "resample"):
-            value = {"method": value} if value is None or isinstance(value, str) else dict(value)
-            unknown = set(value) - {"method"}
+        if name in self.SIMPLE:
+            option, allowed = self.SIMPLE[name]
+            value = {option: value} if value is None or isinstance(value, str) else dict(value)
+            unknown = set(value) - {option}
             if unknown:
                 raise ValueError(f"Unknown {name} option(s): {', '.join(sorted(unknown))}")
-            if name == "initialize" and value.get("method") not in self.INITIALIZE:
-                raise ValueError(f"Unknown initialize method: {value['method']} (expected one of: {self.INITIALIZE})")
+            if allowed is not None and value.get(option) not in allowed:
+                raise ValueError(f"Unknown {name} {option}: {value[option]} (expected one of: {allowed})")
             self._sections[name] = {**self._sections.get(name, {}), **value}
             return
         if isinstance(value, str):
@@ -232,4 +245,6 @@ class Config:
         lines.append("    method = None  # None, 'geometry' (image centers) or 'moments' (centers of mass)")
         lines.append("resample:")
         lines.append("    method = None  # see `transform`")
+        lines.append("mask:")
+        lines.append("    fixed = None  # None, 'auto' (foreground for non-global transforms) or 'foreground'")
         return "\n".join(lines)

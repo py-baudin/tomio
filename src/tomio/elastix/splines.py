@@ -210,3 +210,23 @@ def binary_dilation(mask):
     image = sitk.GetImageFromArray(np.asarray(mask, dtype=np.uint8).T, isVector=False)
     dilated = sitk.BinaryDilate(image, [1] * np.ndim(mask), sitk.sitkCross)
     return sitk.GetArrayFromImage(dilated).T > 0
+
+
+def erode_mask(mask, radius):
+    """erosion of a boolean mask as Elastix's ErodeMaskImageFilter (ITK parabolic erosion, scale r^2 / 2 + 1
+    voxels^2 per axis): a voxel x is removed when a voxel y outside the mask has
+    sum_i (x_i - y_i)^2 / (2 scale_i) < 1
+
+    radius: per axis (voxels)
+    """
+    mask = np.asarray(mask, dtype=bool)
+    if mask.all() or not mask.any():
+        return mask
+    radius = np.broadcast_to(np.asarray(radius, dtype=float), (mask.ndim,))
+    scale = radius**2 / 2 + 1
+    outside = sitk.GetImageFromArray(np.ascontiguousarray((~mask).astype(np.uint8).T))
+    outside.SetSpacing([float(v) for v in 1 / np.sqrt(2 * scale)])
+    # distance (weighted) from each voxel of the mask to the nearest voxel outside
+    distance = sitk.SignedMaurerDistanceMap(outside, insideIsPositive=False, squaredDistance=False, useImageSpacing=True)
+    return mask & (sitk.GetArrayFromImage(distance).T >= 1 - 1e-9)
+

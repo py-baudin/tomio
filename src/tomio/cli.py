@@ -93,7 +93,9 @@ def get_parser():
                           help="save the transformation(s) (default template: transform_<moving>.yml)")
     register.add_argument("--plot", nargs="?", const="reg_<moving>.png", metavar="TEMPLATE",
                           help="save a figure of the result (matplotlib; default template: reg_<moving>.png)")
-    register.add_argument("--fixed-mask", help="mask of the fixed image (samples drawn inside)")
+    register.add_argument("--fixed-mask", help=(
+        "mask of the fixed image (samples drawn inside): a file, 'foreground' (automatic foreground mask, all "
+        "stages) or 'auto' (foreground for non-global stages)"))
     register.add_argument("--moving-mask", help="mask of the moving image(s) (samples mapped outside are discarded)")
     register.add_argument("--reset", action="store_true", help="several moving images: start each one from the initial parameters")
     register.add_argument("-f", "--force", action="store_true", help="overwrite the output files if they exist")
@@ -208,6 +210,11 @@ def run_register(args):
     sections = {key: getattr(args, key) for key in ("transform", "metric") if getattr(args, key)}
     config = configfile.read(args.config) if args.config else None
     stages = elastix.make_stages(config, **sections)
+    fixed_mask = args.fixed_mask
+    if fixed_mask in ("auto", "foreground"):
+        for stage in stages:
+            stage["mask"] = fixed_mask
+        fixed_mask = None
     print("Registration settings:")
     for i, stage in enumerate(stages):
         if len(stages) > 1:
@@ -215,7 +222,7 @@ def run_register(args):
         print(stage)
 
     fixed = read_image(args.fixed)
-    masks = {key: read_image(getattr(args, key)) for key in ("fixed_mask", "moving_mask") if getattr(args, key)}
+    masks = {key: read_image(file) for key, file in [("fixed_mask", fixed_mask), ("moving_mask", args.moving_mask)] if file}
     moving = [read_image(file) for file in args.moving]
     print(f"Registering {len(moving)} image(s) onto {args.fixed}")
     registered, transformations = elastix.register(
